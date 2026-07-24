@@ -25,6 +25,7 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/07-infra-and-risks.md`](docs/07-infra-and-risks.md) | Repo, infrastructure, and honest risk register |
 | [`docs/08-implementation-plan.md`](docs/08-implementation-plan.md) | Phased implementation plan |
 | [`docs/09-agentgateway-evaluation.md`](docs/09-agentgateway-evaluation.md) | DECIDED: built on agentgateway (Linux Foundation, Rust, Apache-2.0) — verified by source inspection + live functional test |
+| [`docs/plans/20260724_plan_seren_router_build.md`](docs/plans/20260724_plan_seren_router_build.md) | The build plan: zero-context, task-by-task implementation guide (M0–M6) with tests and commit points |
 
 ## Status
 
