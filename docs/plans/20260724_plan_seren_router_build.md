@@ -87,6 +87,7 @@ Locked decisions you build against:
 | D3 | Postgres for the per-request ledger (`/generation`, reconciliation) | boring, queryable, ubiquitous |
 | D4 | Gateway↔router auth = one static bearer key from env, constant-time compare | matches how the Gateway already talks to OpenRouter |
 | D5 | Throughput measurements in-memory (EWMA), lost on restart | cold-start is acceptable; persistence is YAGNI until proven otherwise |
+| D6 | Service chassis + deployment = [`serenorg/seren-template-rust`](https://github.com/serenorg/seren-template-rust) (Christian's call) | seren-router deploys like every other Seren Rust service: the template's middleware stack, Dockerfile, and k8s health probes, not bespoke scaffolding |
 
 ### Reading list (skim now, consult while working)
 
@@ -103,6 +104,8 @@ Locked decisions you build against:
 | OpenRouter provider routing | `openrouter.ai/docs/features/provider-routing` | `provider.sort`, `:nitro`, `:floor` semantics |
 | models.dev | `models.dev` | open model/pricing catalog (agentgateway's cost module syncs from it) |
 | Working eval config | this repo `examples/eval-lmstudio-failover.yaml` | a config we proved works, byte-for-byte |
+| seren-template-rust | `github.com/serenorg/seren-template-rust` (private) | the service chassis: read its README fully before M0 — middleware stack, feature flags, route registries, Dockerfile |
+| — server infrastructure | its `src/server.rs`, `src/routes.rs`, `src/db.rs` | what you get for free; don't rebuild any of it |
 
 ---
 
@@ -176,28 +179,43 @@ commit. Do them in order; later tasks assume earlier files exist.
 
 **Goal:** a cargo workspace that builds, lints, tests, and can fetch the pinned sidecar.
 
-#### M0-1: Workspace skeleton
+#### M0-1: Instantiate from seren-template-rust (D6 — do NOT `cargo init`)
 
-Files to create:
+Clone `serenorg/seren-template-rust`, copy its contents into this service's source tree
+(preserving `.github/`, `Dockerfile`, `Makefile`, `.env.example`, `migrations/`,
+`src/`), rename the crate to `seren-router` in `Cargo.toml`, and keep the template's
+module layout: `server.rs` (middleware stack — the README says don't modify unless
+extending; believe it), `routes.rs` (route registries — register ALL our routes through
+its `public_router`/`protected_router` builders, never a parallel route list), `db.rs`
+(sqlx pool helpers), `auth.rs` (Seren auth stubs — see M2-1 for what we use and don't).
 
-```
-Cargo.toml                    # [workspace] members = ["crates/seren-router"]
-crates/seren-router/Cargo.toml
-crates/seren-router/src/main.rs   # prints version and exits, for now
-rust-toolchain.toml           # pin stable (e.g. channel = "stable")
-.gitignore                    # /target, .env, *.local.yaml, sidecar/bin/
-README.md                     # extend the existing README: add "Development" section
-```
+The template requires **Rust 1.95+, edition 2024** and already carries axum 0.8, tokio,
+tower-http, sqlx 0.9 (postgres, rustls), reqwest 0.13 (rustls), serde, uuid, jiff,
+thiserror, tracing, dotenvy. Add only what seren-router needs on top:
+`serde_yaml`, `rust_decimal`, `subtle` (constant-time compare), `rand`, `futures`,
+`bytes`, and `reqwest`'s `stream` feature. Use `jiff` for time (template convention) —
+do not add `chrono`.
 
-Initial dependencies for `crates/seren-router` (add now, all used by M3):
-`tokio` (full), `axum`, `reqwest` (stream, json, rustls-tls), `serde`, `serde_json`,
-`serde_yaml`, `rust_decimal`, `sqlx` (runtime-tokio, postgres, macros, migrate),
-`tracing`, `tracing-subscriber`, `thiserror`, `subtle` (constant-time compare),
-`futures`, `bytes`.
+Three template defaults that are WRONG for this service — change them consciously, with
+a comment at each site, in this task:
 
-Test: `cargo build && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings`
+1. **30s request timeout.** LLM streams routinely run for minutes. Exempt (or raise to
+   ≥10 min on) the `/api/v1/chat/completions` and `/api/v1/completions` routes; keep the
+   default everywhere else.
+2. **`payload-limit` feature (1 MiB default).** Vision requests carry base64 images and
+   blow through 1 MiB. If the feature is enabled, set the chat routes' limit to ≥20 MiB
+   (the desktop's own frontend buffer limit is 20 MiB).
+3. **`rate-limiting` (per-IP) — leave OFF.** This service has exactly one caller (the
+   Gateway) from effectively one address; per-IP limiting adds risk, not safety.
 
-Commit: `chore: workspace skeleton`
+Feature flags: build with the template's `production` group (metrics, security-headers,
+sensitive-headers, payload-limit per note 2).
+
+Test: `make check` if the template's Makefile provides it, else
+`cargo build && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings`;
+then `cargo run` and `curl localhost:8000/readyz` → `{"status":"ok"}`.
+
+Commit: `chore: instantiate service from seren-template-rust`
 
 #### M0-2: Pinned sidecar fetch script
 
@@ -226,12 +244,13 @@ Commit: `chore: pinned agentgateway sidecar fetch with checksum verification`
 
 #### M0-3: CI
 
-File: `.github/workflows/ci.yml` — on PR and push to main: fmt check, clippy `-D
-warnings`, `cargo test`, fetch-sidecar + `--version` smoke. Add a `services: postgres`
-container (used from M3 on; harmless before). Functional gates that need a local model
-server are tagged `#[ignore]` and run only where noted (see M2-3).
+The template ships `.github/workflows/ci.yml` — **extend it, don't replace it**: add the
+fetch-sidecar + `--version` smoke step and a `services: postgres` container (used from
+M3 on; harmless before). Keep the template's existing fmt/clippy/test jobs as-is.
+Functional gates that need a local model server are tagged `#[ignore]` and run only
+where noted (see M2-3).
 
-Commit: `ci: fmt, clippy, tests, sidecar smoke`
+Commit: `ci: sidecar smoke and postgres service on template workflow`
 
 **M0 Definition of done:** fresh clone → `./scripts/fetch-sidecar.sh && cargo test` works
 on a clean machine following only README instructions.
@@ -245,7 +264,7 @@ This is pure logic — unit + golden tested, no processes.
 
 #### M1-1: Registry types
 
-File: `crates/seren-router/src/registry.rs`
+File: `src/registry.rs`
 
 ```rust
 // ABOUTME: Declarative provider registry: which inference hosts exist, how to auth,
@@ -289,7 +308,7 @@ Commit: `feat: provider registry types and validation`
 
 #### M1-2: Config compiler
 
-File: `crates/seren-router/src/sidecar_config.rs`
+File: `src/sidecar_config.rs`
 
 Compiles `Registry` → agentgateway YAML. Requirements (each traces to a verified fact in
 `docs/09` / the eval config `examples/eval-lmstudio-failover.yaml`):
@@ -337,12 +356,26 @@ start it here.
 Files:
 
 ```
-crates/seren-router/src/config.rs   # RouterConfig: listen_addr, sidecar_url, gateway_key (from env SEREN_ROUTER_GATEWAY_KEY), database_url
-crates/seren-router/src/auth.rs     # axum middleware: Authorization: Bearer <key>, subtle::ConstantTimeEq compare, 401 otherwise
+src/config.rs        # RouterConfig: sidecar_url, gateway_key (from env SEREN_ROUTER_GATEWAY_KEY), registry path
+src/gateway_auth.rs  # axum middleware: Authorization: Bearer <key>, subtle::ConstantTimeEq compare, 401 otherwise
 ```
 
+(Listen address, database URL, and dotenv loading come from the template's existing
+config/`db.rs` — don't duplicate them.)
+
+Register our routes through the template's `protected_router` builder with THIS
+middleware as the protection. **Note on the template's `auth.rs`:** its
+`SerenIdentity`/passthrough-token helpers are for publishers configured with
+`auth_type="passthrough"`. The `seren-models` publisher is `auth_type="static"` — the
+Gateway presents one static bearer key, exactly as it does to OpenRouter today, and
+cutover compatibility requires we keep that (docs/05). So for cutover we use our static
+key middleware, NOT the passthrough helpers. Leave the template's `auth.rs` in place;
+adopting identity-token verification on top is a post-cutover hardening, tracked in M7's
+open items — do not build it now (YAGNI).
+
 Auth rules: missing header → 401 `{"error":{"message":"unauthorized"}}`; wrong key →
-401; never log the presented key.
+401; never log the presented key (the template's `sensitive-headers` feature redacts
+`Authorization` from traces — keep it enabled).
 
 Unit tests: middleware with correct/missing/wrong key using `axum::body` +
 `tower::ServiceExt::oneshot` (this is in-process request construction against our own
@@ -353,7 +386,7 @@ Commit: `feat: service config and constant-time gateway auth`
 
 #### M2-2: Chat completions passthrough with SSE streaming
 
-File: `crates/seren-router/src/proxy.rs`
+File: `src/proxy.rs`
 
 `POST /api/v1/chat/completions`: read the JSON body, forward to
 `{sidecar_url}/v1/chat/completions` with `reqwest`, stream the response body back
@@ -414,7 +447,7 @@ This is the contract the Gateway bills on (`upstream_cost_response_path: usage.c
 
 #### M3-1: Price table
 
-File: `crates/seren-router/src/pricing.rs`
+File: `src/pricing.rs`
 
 `PriceTable::from_registry(&Registry)` → lookup keyed by `(provider_id, canonical_slug)`
 returning the per-mtoken Decimal prices. Cost function:
@@ -451,7 +484,7 @@ Commit: `feat: inject usage.cost into non-streaming responses`
 #### M3-3: usage.cost injection (streaming)
 
 The hard one. Wrap the SSE byte stream in a transformer
-(`crates/seren-router/src/sse.rs`) that: passes chunks through untouched, watches for the
+(`src/sse.rs`) that: passes chunks through untouched, watches for the
 final usage-bearing chunk (`"usage":{...}` with empty `choices` — the shape we observed),
 rewrites that one chunk to include `usage.cost`, then passes `data: [DONE]`.
 
@@ -477,7 +510,7 @@ Files:
 
 ```
 migrations/0001_generations.sql
-crates/seren-router/src/ledger.rs
+src/ledger.rs
 ```
 
 ```sql
@@ -520,7 +553,7 @@ seren-desktop#3291).
 
 #### M4-1: Catalog assembly from the registry
 
-File: `crates/seren-router/src/catalog.rs`
+File: `src/catalog.rs`
 
 `GET /api/v1/models` → `{ "data": [ { id, name, context_length, pricing: { prompt, completion }, ... } ] }`
 — match OpenRouter's `/models` field names (the desktop already parses `id`, `name`,
@@ -557,7 +590,7 @@ the sidecar executes.
 
 #### M5-1: Preference parsing
 
-File: `crates/seren-router/src/policy/preference.rs`
+File: `src/policy/preference.rs`
 
 From the request: model suffix `:nitro` → Throughput, `:floor` → Price (strip the suffix
 before route lookup); body `provider.sort` = `"price" | "throughput" | "latency"`
@@ -572,7 +605,7 @@ Commit: `feat: routing preference parsing (:nitro, :floor, provider.sort)`
 
 #### M5-2: Measurements
 
-File: `crates/seren-router/src/policy/measurements.rs`
+File: `src/policy/measurements.rs`
 
 Per `(provider_id, slug)`: EWMA of tokens/sec (completion_tokens ÷ stream duration) and
 time-to-first-token, updated after each request from data the proxy already has. Injected
@@ -587,7 +620,7 @@ Commit: `feat: EWMA throughput and latency measurements`
 
 #### M5-3: The selector
 
-File: `crates/seren-router/src/policy/select.rs`
+File: `src/policy/select.rs`
 
 One pure function — this is the heart of docs/02, implement it exactly:
 
@@ -674,13 +707,40 @@ keys are his open items; do not improvise them.
 
 ---
 
-### M7 — Not in this plan (deliberately)
+### M7 — Deployment (strategy decided: seren-template-rust conventions; specifics gated)
 
-Deployment/infra (blocked on the infra decision), the Gateway cutover itself
-(one `update_publisher` call, done WITH Taariq per docs/05), direct-provider onboarding
-beyond the registry mechanics (blocked on keys + ToS vetting), live catalog sync,
-and the seren-desktop client changes (gated: docs/08 Phase 5, seren-desktop#3291).
-When you think you need any of these early, reread docs/05 and stop.
+The deployment strategy is D6: seren-router ships exactly like every other Seren Rust
+service built on the template — its multi-stage `Dockerfile` (already includes a health
+check), `/livez`/`/readyz` probes, JSON logging in k8s, graceful SIGTERM shutdown, and
+`/metrics` (enable the `metrics` feature in the production build).
+
+What is specific to this service:
+
+- **Pod layout: two containers.** The app container (template Dockerfile) and the
+  agentgateway sidecar as a SECOND container in the same pod, sharing localhost.
+  Verify at implementation whether the project publishes an official container image
+  for the pinned version; if not, build a thin image that copies the checksummed binary
+  from `scripts/fetch-sidecar.sh` onto a distroless base. The sidecar config is rendered
+  by our M1 compiler at startup (init container or entrypoint step) from the registry
+  file mounted via ConfigMap.
+- **Readiness must be composite.** The app's `/readyz` should also probe the sidecar's
+  readiness address (`127.0.0.1:19001`) — a pod whose sidecar is down must not receive
+  Gateway traffic.
+- **Secrets:** provider keys (`SEREN_ROUTER_KEY_*`) and `SEREN_ROUTER_GATEWAY_KEY` enter
+  as k8s Secrets → env vars, matching the registry's `secret_env` names. Never in the
+  ConfigMap, never in the image.
+- **Streaming vs. ingress:** whatever ingress/load balancer fronts the pod must allow
+  long-lived streaming responses (≥10 min idle timeout on the chat routes) — same trap
+  as the template's 30s timeout (M0-1 note 1), one layer up.
+
+Still gated on Taariq/Christian — do not improvise: which cluster/environment, DNS name,
+Postgres provisioning, secrets-manager binding, and the canary mechanics (docs/08
+Phase 2). Also deliberately NOT in this plan: the Gateway cutover itself (one
+`update_publisher` call, done WITH Taariq per docs/05), direct-provider onboarding
+beyond registry mechanics (blocked on keys + ToS vetting), live catalog sync, the
+seren-desktop client changes (gated: docs/08 Phase 5, seren-desktop#3291), and
+identity-token auth hardening (M2-1 note). When you think you need any of these early,
+reread docs/05 and stop.
 
 ---
 
