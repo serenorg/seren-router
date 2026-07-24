@@ -16,7 +16,17 @@ Seren diverges from OpenRouter here, on purpose. OpenRouter's default optimizes 
 3. Among those, **load-balance weighted toward measured throughput** (fastest-for-price), rather than weighted toward inverse-square-price.
 4. Remaining providers act as fallbacks.
 
-Crucially, this is **not** a naive `sort: throughput`. That mode disables load balancing and routes sequentially to the single fastest provider — at our scale that concentrates all traffic onto one host, which then slows under load and hits rate limits. We keep load-balancing and diversification; we just bias the weighting toward speed within a price bound.
+Crucially, this is **not** a naive `sort: throughput`. That mode disables load balancing and routes sequentially to the single fastest provider — concentrating all traffic onto one host, which then slows under load and hits rate limits. We keep load-balancing and diversification; we just bias the weighting toward speed within a price bound.
+
+### Stability requirements for throughput weighting
+
+Throughput differs from price in one way that matters for control: price is exogenous (it does not change based on how much traffic we send), but measured tokens/sec is **endogenous** — the more traffic we route to the fastest host, the slower it measures. That feedback is negative, so the system self-corrects rather than herding, but an undamped negative feedback loop oscillates: traffic flaps between hosts as measurements chase load. The default weighting therefore REQUIRES three stabilizers:
+
+1. **Smoothed measurements.** Weight on a rolling-average throughput (e.g. EWMA over a multi-minute window), never on instantaneous readings.
+2. **Hysteresis.** A provider must be meaningfully faster (configurable threshold) before weight shifts toward it, and shifts are rate-limited. No flapping on noise.
+3. **Max-share cap.** No provider receives more than a configured share of a model's traffic (e.g. 60%), regardless of how fast it measures. Diversification is structurally guaranteed, not emergent.
+
+Scale note, honestly: at Seren's current volume our traffic cannot meaningfully load any major host — these stabilizers are for the scale we are building toward. They are cheap to build in from day one, so they are in the MVP.
 
 ### Reference: OpenRouter's default (offered as the `balanced` mode)
 
@@ -68,5 +78,5 @@ Two paths, both supported:
 
 ## MVP vs later
 
-- **MVP:** 30-second outage gate, the throughput-biased price-capped default weighting, the price-weighted `balanced` weighting, the three `sort` modes, `:nitro`/`:floor` parsing, sequential failover.
+- **MVP:** 30-second outage gate, the throughput-biased price-capped default weighting **with its three stabilizers (smoothing, hysteresis, max-share cap)**, the price-weighted `balanced` weighting, the three `sort` modes, `:nitro`/`:floor` parsing, sequential failover.
 - **Later:** weighted load-balancing refinements, data-policy routing, per-request `provider` allow/deny/order block (the seam that unlocks Shape C provider pinning — honored from day one but unused by the client at first).
