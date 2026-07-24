@@ -17,7 +17,7 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | --- | --- |
 | [`docs/00-overview.md`](docs/00-overview.md) | Strategic context, the Stripe/OpenRouter trigger, and the Shape A decision |
 | [`docs/01-architecture.md`](docs/01-architecture.md) | The compatibility seam and the five internal components |
-| [`docs/02-routing.md`](docs/02-routing.md) | Routing & failover policy, mirroring OpenRouter exactly |
+| [`docs/02-routing.md`](docs/02-routing.md) | Routing & failover — fastest-for-price default (Seren's own), with OpenRouter's algorithm offered as the `balanced` mode |
 | [`docs/03-provider-registry.md`](docs/03-provider-registry.md) | Provider registry, key management, catalog sync |
 | [`docs/04-billing.md`](docs/04-billing.md) | Cost-accounting contract and where margin grows |
 | [`docs/05-migration.md`](docs/05-migration.md) | Gateway cutover and the incremental de-risked migration |

@@ -6,12 +6,14 @@ ABOUTME: Covers the stack decision, deployment shape, and the risks of owning th
 ## Repo & stack
 
 - **Repo:** `serenorg/seren-router` (private). This repo.
-- **Stack — open decision.** Candidates:
-  - **Rust** — matches Seren core; best for a money-path streaming proxy; high throughput; strong cost-accuracy guarantees. *Current lean*, because seren-router fronts all model traffic and cost correctness matters.
-  - **TypeScript/Node** — fastest to parity; richest OpenAI-compatible ecosystem.
-  - **Go** — proxy-shaped, good streaming.
+- **Stack — DECIDED: Rust.** Rationale:
+  - **Team expertise.** The team already knows Rust, which neutralizes Node's main advantage (time-to-parity) — our ramp cost is low.
+  - **Integrates with the rest of the stack.** The Seren core, Gateway, and orchestrator are Rust; shared crates, types, and tooling carry over.
+  - **Fewer bugs — of the categories that matter here.** For a high-concurrency, money-path streaming proxy, Rust's ownership model and type system eliminate whole classes of defect (data races, use-after-free, null derefs). It does *not* prevent logic / billing / routing bugs — those still need tests — but it removes exactly the concurrency and memory failures that are hardest to reproduce under streaming load.
 
-  Decide deliberately before implementation starts. The lean is Rust for the hot path; Node is a legitimate "get to working router sooner" choice.
+  Accepted tradeoff: slower to a first working version than Node, offset by team familiarity.
+
+  Rejected: **TypeScript/Node** (fastest to parity and richest OpenAI-compat ecosystem, but a separate runtime from our core with weaker concurrency guarantees) and **Go** (proxy-shaped, but no ecosystem/integration advantage over Rust for us).
 
 ## Infrastructure shape
 
