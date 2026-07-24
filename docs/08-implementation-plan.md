@@ -7,15 +7,18 @@ Phased so each step is independently shippable and reversible. The guiding princ
 
 ## Phase 0 — Decisions & scaffolding
 
-- [ ] Lock the stack decision (Rust vs Node vs Go) — see `docs/07`.
+- [x] Lock the stack decision — **Rust** (`docs/07`, 2026-07-24).
+- [x] Foundation evaluation — **build on agentgateway** (`docs/09`, 2026-07-24: source-verified + live functional test).
+- [ ] Pin an agentgateway revision (vet the alpha channel; pick release/commit).
 - [ ] Create infra skeleton: service, secrets manager, datastore, scheduler, observability.
-- [ ] Define the canonical slug schema and the provider-registry schema (`docs/03`).
+- [ ] Define the canonical slug schema and the provider-registry schema (`docs/03`) + the registry→agentgateway-config compiler design.
 - [ ] Confirm cost-parity measurement method against OpenRouter.
 
-## Phase 1 — Compatibility skeleton (OpenRouter passthrough)
+## Phase 1 — Compatibility skeleton (OpenRouter passthrough on agentgateway)
 
-- [ ] Implement the OpenRouter-compatible API surface (`docs/01`): `/chat/completions` (streaming + tools + vision), `/models`, `/completions`, `/generation`, `/models/{model}/endpoints`, stub `/auth/key` + `/credits`.
-- [ ] Register **OpenRouter as the sole provider** in the registry (fallback role).
+- [ ] Stand up agentgateway with **OpenRouter as the sole provider** (fallback role) via generated config.
+- [ ] Build the seren-router layer: OpenRouter-compatible surface (`docs/01`) — `usage.cost` injection, `/generation`, aggregated `/models` with pricing, `provider.sort` / `:nitro` / `:floor`, `reasoning.effort` passthrough, stub `/auth/key` + `/credits`.
+- [ ] Attach the retry route policy for **same-request failover** and `health.eviction` on every target (docs/09 sharp edges 1–2); functionally test both against a real dead upstream.
 - [ ] Validate the static bearer key the Gateway forwards.
 - [ ] Verify byte-compatible responses incl. `usage.cost` and the final streaming usage chunk (`docs/04`).
 - [ ] **Gate:** a request through seren-router → OpenRouter is indistinguishable from today.

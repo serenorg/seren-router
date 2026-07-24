@@ -30,6 +30,10 @@ seren-router exposes:
 
 Auth: seren-router validates the single static bearer key the Gateway forwards (the same header position OpenRouter used, `Authorization`).
 
+## Foundation: agentgateway
+
+seren-router is built on **agentgateway** (Linux Foundation, Rust, Apache-2.0) rather than from scratch — see `docs/09` for the verified evaluation. agentgateway supplies the streaming proxy, provider adapters (native + any OpenAI-compatible `baseUrl`), priority-tier failover with health eviction, P2C load balancing, retry policies, and a models.dev-synced pricing catalog. seren-router's own code is the thin layer that makes it OpenRouter-compatible and Seren-priced: the API surface below, the routing policies (`docs/02`), the registry compiler (`docs/03`), and `usage.cost` billing (`docs/04`).
+
 ## Internal components
 
 1. **Model catalog + normalization** — the source of truth for which `vendor/model` slugs exist, their context window, capabilities, price, and *which providers serve each slug*. Replaces the `openrouter.ai/api/v1/models` feed. Backs `GET /api/v1/models`.

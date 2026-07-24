@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+config:
+  readinessAddr: 127.0.0.1:19001
+  statsAddr: 127.0.0.1:19002
+
+llm:
+  port: 4000
+  models:
+  # Route local/* to the real LM Studio server (OpenAI-compatible)
+  - name: local/*
+    provider: openAI
+    params:
+      baseUrl: http://127.0.0.1:1234/v1
+    transformation:
+      model: llmRequest.model.stripPrefix("local/")
+  # A deliberately dead upstream: nothing listens on this port.
+  - name: dead-model
+    provider: openAI
+    params:
+      model: does-not-exist
+      baseUrl: http://127.0.0.1:59999/v1
+    health:
+      eviction:
+        consecutiveFailures: 1
+        duration: 60s
+  virtualModels:
+  # Failover proof: primary is the dead upstream, fallback is the real local model.
+  - name: resilient
+    routing:
+      failover:
+        targets:
+        - model: dead-model
+          priority: 0
+        - model: local/gemma-3-1b-it-glm-4.7-flash-heretic-uncensored-thinking_gguf
+          priority: 1

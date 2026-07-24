@@ -24,7 +24,8 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/06-desktop-changes.md`](docs/06-desktop-changes.md) | The (small) seren-desktop client footprint |
 | [`docs/07-infra-and-risks.md`](docs/07-infra-and-risks.md) | Repo, infrastructure, and honest risk register |
 | [`docs/08-implementation-plan.md`](docs/08-implementation-plan.md) | Phased implementation plan |
+| [`docs/09-agentgateway-evaluation.md`](docs/09-agentgateway-evaluation.md) | DECIDED: built on agentgateway (Linux Foundation, Rust, Apache-2.0) — verified by source inspection + live functional test |
 
 ## Status
 
-Design phase. No implementation yet. These docs are the agreed design; the implementation plan in `docs/08` is the next actionable step.
+Design approved; foundation decided. seren-router is built as a **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the verified evaluation). The implementation plan in `docs/08` is the next actionable step.

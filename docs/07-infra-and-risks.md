@@ -13,6 +13,8 @@ ABOUTME: Covers the stack decision, deployment shape, and the risks of owning th
 
   Accepted tradeoff: slower to a first working version than Node, offset by team familiarity.
 
+- **Foundation — DECIDED: agentgateway** (2026-07-24, see `docs/09`). We do not hand-write the streaming proxy, provider adapters, failover, or load balancer; we build a thin OpenRouter-compat + pricing + cost layer on agentgateway's Apache-2.0 Rust core. Verified by source inspection and a live functional test (real local model; failover proven with `health.eviction`). New risk to track: upstream coupling to an alpha-channel project — pin a vetted revision; LF governance + Apache-2.0 make forking a real escape hatch.
+
   Rejected: **TypeScript/Node** (fastest to parity and richest OpenAI-compat ecosystem, but a separate runtime from our core with weaker concurrency guarantees) and **Go** (proxy-shaped, but no ecosystem/integration advantage over Rust for us).
 
 ## Infrastructure shape
