@@ -49,7 +49,9 @@ Phased so each step is independently shippable and reversible. The guiding princ
 - [ ] Remove `openrouter.ai` from the allowlist/CSP.
 - [ ] Re-own slug-format comments.
 - [ ] Ship the Fastest / Balanced / Cheapest toggle + thread `sort` through the orchestrator.
-- [ ] (These can land in parallel with Phase 4; they do not block cutover.)
+- [ ] **Sequencing: Phase 5 lands only AFTER the Phase 3 cutover is stable.** Repointing the client catalog before seren-router exists does not remove the OpenRouter dependency (the publisher endpoint proxies OpenRouter today) — it adds a Gateway hop and auth requirement to a previously public path. A premature attempt (seren-desktop PR #3292) was reverted (#3294) for exactly this; tracked in seren-desktop #3291.
+- [ ] Preserve signed-out catalog behavior at implementation: the old openrouter.ai fetch was unauthenticated; the publisher path is authed, so signed-out users would silently drop to the hardcoded fallback list. Decide explicitly (public router `/models`, cached catalog, or accept the fallback) before shipping.
+- [ ] Client repoint ships with its own canary/staged rollout per the docs/05 discipline — it is a customer-facing change of the same migration family.
 
 ## Phase 6 — Remove OpenRouter
 

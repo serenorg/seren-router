@@ -5,6 +5,8 @@ ABOUTME: Cutting the last direct openrouter.ai dependency plus the one new routi
 
 Even in an invisible swap, the desktop client has one real dependency on OpenRouter that is **not** the Gateway: it fetches its model catalog directly from `openrouter.ai`. That must go. Four changes total, only one of which is a feature.
 
+**Sequencing (hard rule).** None of these changes ship before the Gateway cutover (docs/05 Phase 3) is stable. Until seren-router is live, the publisher `/models` endpoint proxies OpenRouter — repointing the client early does not remove the dependency; it adds a Gateway hop, an auth requirement on a previously public path (signed-out users silently degrade to the fallback list), and Gateway egress, with no offsetting benefit. A premature implementation (PR #3292) was reverted (#3294); seren-desktop issue #3291 tracks the work for Phase 5.
+
 ## 1. Repoint the catalog fetch
 
 - **Where:** `src/services/models.ts:23` — `OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"`.
