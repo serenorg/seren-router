@@ -46,14 +46,13 @@ cargo clippy --all-targets --features production -- -D warnings
 cargo test --features production
 ```
 
-Run the chassis locally with the template's temporary header-auth fallback:
+Run the chassis locally:
 
 ```bash
-SEREN_ROUTER_ALLOW_INSECURE_HEADER_AUTH=true cargo run --features production
+cargo run --features production
 curl http://127.0.0.1:8000/readyz
 # {"status":"ok"}
 ```
 
-The fallback protects only the copied template route while the router is being built.
-The Gateway-facing static bearer authentication replaces it in the compatibility-layer
-milestone. Never use the insecure header fallback in production.
+The protected route registry exposes no handlers until the compatibility-layer
+milestone adds the Gateway-facing static bearer authentication.

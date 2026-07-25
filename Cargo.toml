@@ -49,12 +49,6 @@ dotenvy = "0.15"
 utoipa = { version = "5", features = ["axum_extras", "uuid", "jiff_0_2"] }
 utoipa-axum = "0.2"
 
-# Inbound SerenCore identity-token verification, shared across internal
-# publishers. See `crate::auth` for the production token-verifying middleware
-# and the local/rollout header fallback.
-seren-service-identity = { git = "https://github.com/serenorg/seren-service.git" }
-seren-service-database = { git = "https://github.com/serenorg/seren-service.git", optional = true }
-
 # --- Feature-gated middleware dependencies ---
 axum-prometheus = { version = "0.10", optional = true }
 prometheus = { version = "0.14", optional = true }
@@ -74,9 +68,8 @@ tower_governor = { version = "0.8", optional = true }
 # url = "2"
 # percent-encoding = "2"
 
-# Auth (inbound SerenCore identity-token verification is provided by the
-# seren-service-identity dependency above + crate::auth; add these only for
-# additional, bespoke auth needs)
+# Additional auth mechanisms are unnecessary. `crate::auth` owns the static
+# Gateway bearer middleware added in M2.
 # jsonwebtoken = "10"
 # oauth2 = "5.0"
 
@@ -90,6 +83,5 @@ sensitive-headers = ["tower-http/sensitive-headers"]
 cors = ["tower-http/cors"]
 rate-limiting = ["dep:tower_governor"]
 concurrency-limit = ["tower/limit"]
-service-database = ["dep:seren-service-database"]
 production = ["metrics", "security-headers", "payload-limit", "sensitive-headers"]
 full = ["production", "cors", "compression", "rate-limiting", "concurrency-limit"]

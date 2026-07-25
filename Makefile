@@ -18,8 +18,6 @@ DOCKER_BUILDKIT ?= 1
 BUILDKIT_PROGRESS ?= plain
 DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
 BUILDX_BUILDER ?= multiplatform
-COMMA := ,
-GITHUB_SECRET_ARG := $(if $(GITHUB_TOKEN),--secret id=github_token$(COMMA)env=GITHUB_TOKEN,)
 
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),arm64)
@@ -37,7 +35,7 @@ LOCAL_TAG ?= latest-$(LOCAL_ARCH)
 docker-build:
 	DOCKER_BUILDKIT=$(DOCKER_BUILDKIT) docker build \
 		--progress=$(BUILDKIT_PROGRESS) \
-		--build-arg CARGO_FEATURES="$(CARGO_FEATURES)" $(GITHUB_SECRET_ARG) \
+		--build-arg CARGO_FEATURES="$(CARGO_FEATURES)" \
 		-t $(GHCR_IMAGE):$(BUILD_TIMESTAMP)-$(LOCAL_ARCH) \
 		-t $(GHCR_IMAGE):$(LOCAL_TAG) \
 		.
@@ -93,7 +91,7 @@ docker-buildx-setup:
 docker-build-multiplatform-ghcr: docker-buildx-setup
 	DOCKER_BUILDKIT=$(DOCKER_BUILDKIT) docker buildx build \
 		--progress=$(BUILDKIT_PROGRESS) \
-		--build-arg CARGO_FEATURES="$(CARGO_FEATURES)" $(GITHUB_SECRET_ARG) \
+		--build-arg CARGO_FEATURES="$(CARGO_FEATURES)" \
 		--platform $(DOCKER_PLATFORMS) \
 		-t $(GHCR_IMAGE):$(BUILD_TIMESTAMP) \
 		-t $(GHCR_IMAGE):$(VERSION) \
