@@ -1,0 +1,18 @@
+# Provider credentials are environment-variable names only. M6 owns enabling
+# OpenRouter and adding production model coverage after Taariq approves live spend.
+providers:
+  - id: openrouter
+    display_name: OpenRouter
+    base_url: https://openrouter.ai/api/v1
+    secret_env: SEREN_ROUTER_KEY_OPENROUTER
+    enabled: false
+    priority: 255
+    models: []
+
+  - id: fireworks
+    display_name: Fireworks AI
+    base_url: https://api.fireworks.ai/inference/v1
+    secret_env: SEREN_ROUTER_KEY_FIREWORKS
+    enabled: false
+    priority: 0
+    models: []
