@@ -270,6 +270,49 @@ impl FunctionalHarness {
             .unwrap()
     }
 
+    async fn auth_key(&self) -> Response {
+        self.authenticated_get("/api/v1/auth/key").await
+    }
+
+    async fn credits(&self) -> Response {
+        self.authenticated_get("/api/v1/credits").await
+    }
+
+    async fn model_endpoints(&self, model: &str) -> Response {
+        self.authenticated_get(&format!("/api/v1/models/{model}/endpoints"))
+            .await
+    }
+
+    async fn unauthenticated_auth_key(&self) -> Response {
+        self.unauthenticated_get("/api/v1/auth/key").await
+    }
+
+    async fn unauthenticated_credits(&self) -> Response {
+        self.unauthenticated_get("/api/v1/credits").await
+    }
+
+    async fn unauthenticated_model_endpoints(&self) -> Response {
+        self.unauthenticated_get(&format!("/api/v1/models/{VIRTUAL_MODEL}/endpoints"))
+            .await
+    }
+
+    async fn authenticated_get(&self, path: &str) -> Response {
+        self.client
+            .get(format!("{}{path}", self.router_base_url))
+            .bearer_auth(GATEWAY_KEY)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn unauthenticated_get(&self, path: &str) -> Response {
+        self.client
+            .get(format!("{}{path}", self.router_base_url))
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn generation(&self, id: &str) -> Response {
         let mut url = Url::parse(&format!("{}/api/v1/generation", self.router_base_url)).unwrap();
         url.query_pairs_mut().append_pair("id", id);
@@ -525,6 +568,75 @@ async fn functional_chat_completion() {
 
 #[tokio::test]
 #[ignore = "functional"]
+async fn functional_compatibility_metadata() {
+    let harness = FunctionalHarness::start().await;
+    let sidecar_requests = harness.sidecar_request_count();
+
+    let auth_key = harness.auth_key().await;
+    assert_eq!(auth_key.status(), StatusCode::OK);
+    assert_eq!(
+        auth_key.json::<Value>().await.unwrap(),
+        json!({"data": {"label": "seren-router", "limit": null}})
+    );
+
+    let credits = harness.credits().await;
+    assert_eq!(credits.status(), StatusCode::OK);
+    assert_eq!(
+        credits.json::<Value>().await.unwrap(),
+        json!({"data": {"total_credits": 0, "total_usage": 0}})
+    );
+
+    let endpoints = harness.model_endpoints(VIRTUAL_MODEL).await;
+    assert_eq!(endpoints.status(), StatusCode::OK);
+    assert_eq!(
+        endpoints.json::<Value>().await.unwrap(),
+        json!({
+            "data": {
+                "id": VIRTUAL_MODEL,
+                "name": "Functional Model",
+                "endpoints": [
+                    {
+                        "name": "Functional dead: Functional Model",
+                        "model_id": VIRTUAL_MODEL,
+                        "model_name": "Functional Model",
+                        "context_length": 131072,
+                        "pricing": {
+                            "prompt": "0.000009",
+                            "completion": "0.000009"
+                        },
+                        "provider_name": "Functional dead",
+                        "tag": "dead"
+                    },
+                    {
+                        "name": "Functional local: Functional Model",
+                        "model_id": VIRTUAL_MODEL,
+                        "model_name": "Functional Model",
+                        "context_length": 131072,
+                        "pricing": {
+                            "prompt": "0.0000004",
+                            "completion": "0.0000008"
+                        },
+                        "provider_name": "Functional local",
+                        "tag": "local"
+                    }
+                ]
+            }
+        })
+    );
+
+    let unknown = harness.model_endpoints("unknown%2Fmodel").await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        unknown.json::<Value>().await.unwrap(),
+        json!({"error": {"code": 404, "message": "Not Found"}})
+    );
+    assert_eq!(harness.sidecar_request_count(), sidecar_requests);
+
+    harness.shutdown_and_assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "functional"]
 async fn functional_streaming() {
     let harness = FunctionalHarness::start().await;
     let response = harness.chat(LOCAL_MODEL, true).await;
@@ -597,6 +709,19 @@ async fn functional_auth_rejected() {
         harness.unauthenticated_models().await.status(),
         StatusCode::UNAUTHORIZED
     );
+    assert_eq!(
+        harness.unauthenticated_auth_key().await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        harness.unauthenticated_credits().await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        harness.unauthenticated_model_endpoints().await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(harness.sidecar_request_count(), 0);
 
     harness.shutdown_and_assert_clean().await;
 }
