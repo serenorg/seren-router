@@ -3,3 +3,4 @@ pub mod db;
 pub mod registry;
 pub mod routes;
 pub mod server;
+pub mod sidecar_config;
