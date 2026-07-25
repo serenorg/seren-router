@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use seren_router::attribution::SERVED_PROVIDER_HEADER;
 use seren_router::gateway_auth::GatewayAuth;
+use seren_router::pricing::{PriceTable, Usage, cost_usd};
 use seren_router::proxy::ProxyState;
 use seren_router::registry::{ModelMapping, Provider, Registry};
 use seren_router::routes;
@@ -182,7 +183,7 @@ impl FunctionalHarness {
         ports.router_listener.set_nonblocking(true).unwrap();
         let router_listener = tokio::net::TcpListener::from_std(ports.router_listener).unwrap();
         let sidecar_url = format!("http://127.0.0.1:{}", ports.llm);
-        let app = router_app(&sidecar_url);
+        let app = router_app(&sidecar_url, &registry);
         let (router_shutdown, shutdown) = oneshot::channel();
         let router_task = tokio::spawn(async move {
             axum::serve(router_listener, app)
@@ -296,9 +297,9 @@ impl Drop for FunctionalHarness {
     }
 }
 
-fn router_app(sidecar_url: &str) -> Router {
+fn router_app(sidecar_url: &str, registry: &Registry) -> Router {
     let auth = GatewayAuth::new(GATEWAY_KEY.as_bytes());
-    let proxy = ProxyState::new(sidecar_url).unwrap();
+    let proxy = ProxyState::new(sidecar_url, PriceTable::from_registry(registry).unwrap()).unwrap();
     routes::public_router().merge(routes::protected_router(auth, proxy))
 }
 
@@ -311,6 +312,8 @@ fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Regis
                 "SEREN_TEST_KEY_DEAD",
                 0,
                 model,
+                "9.00",
+                "9.00",
             ),
             functional_provider(
                 "local",
@@ -318,6 +321,8 @@ fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Regis
                 "SEREN_TEST_KEY_LOCAL",
                 1,
                 model,
+                "0.40",
+                "0.80",
             ),
         ],
     }
@@ -329,6 +334,8 @@ fn functional_provider(
     secret_env: &str,
     priority: u8,
     model: &str,
+    input_price_per_mtok: &str,
+    output_price_per_mtok: &str,
 ) -> Provider {
     Provider {
         id: id.to_owned(),
@@ -340,8 +347,8 @@ fn functional_provider(
         models: vec![ModelMapping {
             slug: VIRTUAL_MODEL.to_owned(),
             provider_model_id: model.to_owned(),
-            input_price_per_mtok: Decimal::ZERO,
-            output_price_per_mtok: Decimal::ZERO,
+            input_price_per_mtok: input_price_per_mtok.parse().unwrap(),
+            output_price_per_mtok: output_price_per_mtok.parse().unwrap(),
         }],
     }
 }
@@ -428,6 +435,7 @@ async fn functional_chat_completion() {
             .is_some_and(|content| !content.is_empty())
     );
     assert!(body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) > 0);
+    assert_local_usage_cost(&body);
 
     harness.shutdown_and_assert_clean().await;
 }
@@ -510,6 +518,7 @@ async fn functional_failover() {
             .as_str()
             .is_some_and(|content| !content.is_empty())
     );
+    assert_local_usage_cost(&body);
 
     let attributed = harness.sidecar_chat(VIRTUAL_MODEL).await;
     assert_eq!(attributed.status(), StatusCode::OK);
@@ -519,4 +528,26 @@ async fn functional_failover() {
     );
 
     harness.shutdown_and_assert_clean().await;
+}
+
+fn assert_local_usage_cost(body: &Value) {
+    let usage = Usage {
+        prompt_tokens: body["usage"]["prompt_tokens"].as_u64().unwrap(),
+        completion_tokens: body["usage"]["completion_tokens"].as_u64().unwrap(),
+    };
+    let expected = cost_usd(
+        &seren_router::pricing::ModelPrices {
+            input_price_per_mtok: "0.40".parse().unwrap(),
+            output_price_per_mtok: "0.80".parse().unwrap(),
+        },
+        &usage,
+    );
+    let actual: Decimal = body["usage"]["cost"]
+        .as_number()
+        .expect("non-streaming usage.cost must be a JSON number")
+        .to_string()
+        .parse()
+        .unwrap();
+
+    assert_eq!(actual, expected);
 }
