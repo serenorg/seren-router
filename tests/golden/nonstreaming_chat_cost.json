@@ -1,0 +1,30 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "pong.",
+        "reasoning_content": "",
+        "role": "assistant",
+        "tool_calls": []
+      }
+    }
+  ],
+  "created": 1784984187,
+  "id": "chatcmpl-lk0p4fm7w70wido9snoqp",
+  "model": "seren-functional",
+  "object": "chat.completion",
+  "stats": {},
+  "system_fingerprint": "seren-functional",
+  "usage": {
+    "completion_tokens": 3,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "cost": 0.0000088000,
+    "prompt_tokens": 16,
+    "total_tokens": 19
+  }
+}

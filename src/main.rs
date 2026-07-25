@@ -1,6 +1,7 @@
 use anyhow::Context;
 use seren_router::{
-    config::RouterConfig, db, gateway_auth::GatewayAuth, proxy::ProxyState, routes, server,
+    config::RouterConfig, db, gateway_auth::GatewayAuth, pricing::PriceTable, proxy::ProxyState,
+    registry::Registry, routes, server,
 };
 
 #[tokio::main]
@@ -19,8 +20,25 @@ async fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let config = RouterConfig::from_env().context("invalid router configuration")?;
     let auth = GatewayAuth::new(config.gateway_key());
-    let proxy =
-        ProxyState::new(config.sidecar_url()).context("invalid sidecar proxy configuration")?;
+    let registry_bytes = std::fs::read(config.registry_path()).with_context(|| {
+        format!(
+            "failed to read provider registry {}",
+            config.registry_path().display()
+        )
+    })?;
+    let registry: Registry = serde_yaml::from_slice(&registry_bytes).with_context(|| {
+        format!(
+            "failed to parse provider registry {}",
+            config.registry_path().display()
+        )
+    })?;
+    registry
+        .validate()
+        .context("provider registry validation failed")?;
+    let price_table =
+        PriceTable::from_registry(&registry).context("provider registry pricing is invalid")?;
+    let proxy = ProxyState::new(config.sidecar_url(), price_table)
+        .context("invalid sidecar proxy configuration")?;
     let app = routes::public_router().merge(routes::protected_router(auth, proxy));
     let db = match std::env::var("DATABASE_URL") {
         Ok(raw) => {

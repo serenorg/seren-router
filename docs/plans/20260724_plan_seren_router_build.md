@@ -470,9 +470,10 @@ Commit: `feat: decimal price table and cost computation`
 In `proxy.rs`: for non-streaming responses, parse the sidecar's JSON, read
 `usage.prompt_tokens`/`completion_tokens`, look up the price for the route that served it
 (the layer chose the route in M2/M5, so it knows provider + slug), insert
-`usage.cost` (JSON number, USD) and a top-level `provider` field naming the provider id
-(OpenRouter does this; the desktop reads `provider_name` from error metadata — match
-OpenRouter's field name from its API reference), and return the modified body.
+`usage.cost` (JSON number, USD), and return the modified body. Do not add a default
+top-level provider field: the current OpenRouter success schema exposes routing details
+only when the client opts into `openrouter_metadata`; `provider_name` remains
+error-metadata behavior and is not part of this success-path milestone.
 
 Golden test: fixture sidecar response JSON (captured from a real M2-3 run, checked in) →
 expected output JSON with cost. One golden for the happy path; unit tests for: missing
