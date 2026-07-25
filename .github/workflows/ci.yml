@@ -30,6 +30,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Fetch pinned agentgateway
+        run: ./scripts/fetch-sidecar.sh
+
+      - name: Verify pinned agentgateway
+        shell: bash
+        run: |
+          pinned_version="$(sed -n '1p' sidecar/PINNED_VERSION)"
+          expected_version="${pinned_version#v}"
+          version_json="$(./sidecar/bin/agentgateway --version)"
+          actual_version="$(
+            sed -n \
+              's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*,[[:space:]]*$/\1/p' \
+              <<<"$version_json"
+          )"
+
+          printf '%s\n' "$version_json"
+          test -n "$expected_version"
+          test "$actual_version" = "$expected_version"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
