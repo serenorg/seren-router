@@ -12,6 +12,7 @@ use axum::Router;
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use seren_router::attribution::SERVED_PROVIDER_HEADER;
 use seren_router::gateway_auth::GatewayAuth;
 use seren_router::proxy::ProxyState;
 use seren_router::registry::{ModelMapping, Provider, Registry};
@@ -129,6 +130,7 @@ impl Drop for OwnedChild {
 struct FunctionalHarness {
     client: Client,
     router_base_url: String,
+    sidecar_base_url: String,
     sidecar: OwnedChild,
     router_shutdown: Option<oneshot::Sender<()>>,
     router_task: Option<JoinHandle<std::io::Result<()>>>,
@@ -195,6 +197,7 @@ impl FunctionalHarness {
         Self {
             client,
             router_base_url,
+            sidecar_base_url: sidecar_url,
             sidecar,
             router_shutdown: Some(router_shutdown),
             router_task: Some(router_task),
@@ -231,6 +234,20 @@ impl FunctionalHarness {
                 "model": LOCAL_MODEL,
                 "messages": [{"role": "user", "content": "pong"}],
                 "max_tokens": 4
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn sidecar_chat(&self, model: &str) -> Response {
+        self.client
+            .post(format!("{}/v1/chat/completions", self.sidecar_base_url))
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply only with the word pong."}],
+                "temperature": 0,
+                "max_tokens": 16
             }))
             .send()
             .await
@@ -486,11 +503,19 @@ async fn functional_failover() {
     );
     let second = harness.chat(VIRTUAL_MODEL, false).await;
     assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.headers().get(SERVED_PROVIDER_HEADER), None);
     let body: Value = second.json().await.unwrap();
     assert!(
         body["choices"][0]["message"]["content"]
             .as_str()
             .is_some_and(|content| !content.is_empty())
+    );
+
+    let attributed = harness.sidecar_chat(VIRTUAL_MODEL).await;
+    assert_eq!(attributed.status(), StatusCode::OK);
+    assert_eq!(
+        attributed.headers().get(SERVED_PROVIDER_HEADER).unwrap(),
+        "local"
     );
 
     harness.shutdown_and_assert_clean().await;

@@ -9,6 +9,8 @@ use axum::response::{IntoResponse, Response};
 use reqwest::{Client, Url};
 use thiserror::Error;
 
+use crate::attribution::ServedProvider;
+
 const CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
 const LEGACY_COMPLETIONS_PATH: &str = "v1/completions";
 
@@ -88,15 +90,27 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
 
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let served_provider = ServedProvider::from_headers(response.headers());
+    if status.is_success() && served_provider.is_none() {
+        tracing::warn!(
+            endpoint = url.path(),
+            "successful sidecar response omitted served-provider attribution"
+        );
+    }
     let stream = response.bytes_stream();
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(CONTENT_TYPE, content_type);
     }
 
-    builder
+    let mut downstream = builder
         .body(Body::from_stream(stream))
-        .expect("status and content-type from reqwest are valid")
+        .expect("status and content-type from reqwest are valid");
+    if let Some(served_provider) = served_provider {
+        downstream.extensions_mut().insert(served_provider);
+    }
+
+    downstream
 }
 
 fn upstream_unavailable() -> Response {

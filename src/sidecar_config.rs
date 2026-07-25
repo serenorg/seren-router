@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::attribution::SERVED_PROVIDER_HEADER;
 use crate::registry::{ModelMapping, Provider, Registry, RegistryValidationError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,10 +128,12 @@ struct LlmConfig {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ModelRoute {
     name: String,
     provider: &'static str,
     params: ModelParams,
+    response_headers: HeaderModifier,
     health: Health,
 }
 
@@ -144,6 +147,9 @@ impl ModelRoute {
                 model: mapping.provider_model_id.clone(),
                 api_key: format!("${}", provider.secret_env),
             },
+            response_headers: HeaderModifier {
+                set: BTreeMap::from([(SERVED_PROVIDER_HEADER.to_owned(), provider.id.clone())]),
+            },
             health: Health {
                 eviction: Eviction {
                     consecutive_failures: 1,
@@ -152,6 +158,11 @@ impl ModelRoute {
             },
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct HeaderModifier {
+    set: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
