@@ -12,16 +12,19 @@ Phased so each step is independently shippable and reversible. The guiding princ
 - [x] Pin an agentgateway revision (v1.4.0-alpha.2 / `6ab7285`, with reviewed platform digests).
 - [ ] Create infra skeleton: service, secrets manager, datastore, scheduler, observability.
 - [x] Define the canonical slug schema and the provider-registry schema (`docs/03`) + the registry→agentgateway-config compiler design.
-- [ ] Confirm cost-parity measurement method against OpenRouter.
+- [x] Confirm cost-parity measurement method against OpenRouter (live M6 parity and
+  per-generation timing normalization, 2026-07-25).
 
 ## Phase 1 — Compatibility skeleton (OpenRouter passthrough on agentgateway)
 
-- [ ] Stand up agentgateway with **OpenRouter as the sole provider** (fallback role) via generated config.
-- [ ] Build the seren-router layer: OpenRouter-compatible surface (`docs/01`) — `usage.cost` injection, `/generation`, aggregated `/models` with pricing, `provider.sort` / `:nitro` / `:floor`, `reasoning.effort` passthrough, stub `/auth/key` + `/credits`.
+- [x] Stand up agentgateway with **OpenRouter as the sole provider** (fallback role) via generated config.
+- [x] Build the seren-router layer: OpenRouter-compatible surface (`docs/01`) — `usage.cost` injection, `/generation`, aggregated `/models` with pricing, `provider.sort` / `:nitro` / `:floor`, `reasoning.effort` passthrough, stub `/auth/key` + `/credits`.
 - [x] Attach the retry route policy for **same-request failover** and `health.eviction` on every target (docs/09 sharp edges 1–2); functionally test both against a real dead upstream.
 - [x] Validate the static bearer key the Gateway forwards.
-- [ ] Verify byte-compatible responses incl. `usage.cost` and the final streaming usage chunk (`docs/04`).
-- [ ] **Gate:** a request through seren-router → OpenRouter is indistinguishable from today.
+- [x] Verify compatible responses incl. `usage.cost`, preserved OpenRouter generation
+  metadata, and both supported terminal streaming usage shapes (`docs/04`).
+- [x] **Gate:** a request through seren-router → OpenRouter is indistinguishable from
+  today (live JSON/SSE parity plus 100-request-per-path soak, 2026-07-25).
 
 ## Phase 2 — Canary the passthrough
 

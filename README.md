@@ -29,10 +29,12 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 
 ## Status
 
-Implementation is underway. The service uses the standard Seren Rust chassis and is
-built as a **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
+The Phase 1 compatibility skeleton and live M6 OpenRouter parity/soak gate are complete
+as of 2026-07-25. The service uses the standard Seren Rust chassis and is built as a
+**thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
-verified evaluation).
+verified evaluation). Deployment, canary, and publisher cutover remain separate
+operations work in Phases 2–3.
 
 ## Service development
 

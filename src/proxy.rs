@@ -26,6 +26,7 @@ use crate::usage_cost::{CostedUsage, inject_usage_cost, prices_for_request};
 
 const CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
 const LEGACY_COMPLETIONS_PATH: &str = "v1/completions";
+const GENERATION_ID_HEADER: &str = "x-generation-id";
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -137,6 +138,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
 
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let generation_id = response.headers().get(GENERATION_ID_HEADER).cloned();
     let is_event_stream = content_type
         .as_ref()
         .and_then(|value| value.to_str().ok())
@@ -154,6 +156,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
         return downstream_response(
             status,
             content_type,
+            generation_id,
             Body::from_stream(response.bytes_stream()),
             served_provider,
         );
@@ -200,7 +203,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
             (true, None) => Body::from_stream(response.bytes_stream()),
         };
 
-        return downstream_response(status, content_type, body, served_provider);
+        return downstream_response(status, content_type, generation_id, body, served_provider);
     }
 
     let upstream_body = match response.bytes().await {
@@ -256,6 +259,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
     downstream_response(
         status,
         content_type,
+        generation_id,
         Body::from(downstream_body),
         served_provider,
     )
@@ -322,12 +326,16 @@ fn retryable_status(status: StatusCode) -> bool {
 fn downstream_response(
     status: StatusCode,
     content_type: Option<axum::http::HeaderValue>,
+    generation_id: Option<axum::http::HeaderValue>,
     body: Body,
     served_provider: Option<ServedProvider>,
 ) -> Response {
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    if let Some(generation_id) = generation_id {
+        builder = builder.header(GENERATION_ID_HEADER, generation_id);
     }
 
     let mut downstream = builder
@@ -687,5 +695,18 @@ mod tests {
             provider.parse().unwrap(),
         );
         ServedProvider::from_headers(&headers).unwrap()
+    }
+
+    #[test]
+    fn generation_identifier_is_preserved_for_downstream_metadata_lookups() {
+        let response = downstream_response(
+            StatusCode::OK,
+            None,
+            Some(axum::http::HeaderValue::from_static("gen-test")),
+            Body::empty(),
+            None,
+        );
+
+        assert_eq!(response.headers()[GENERATION_ID_HEADER], "gen-test");
     }
 }

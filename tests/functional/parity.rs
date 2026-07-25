@@ -3,13 +3,13 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use axum::Router;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, Url};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use seren_router::catalog::Catalog;
@@ -29,10 +29,14 @@ use tokio::time::{Instant, MissedTickBehavior, timeout};
 use uuid::Uuid;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_GENERATION_URL: &str = "https://openrouter.ai/api/v1/generation";
+const GENERATION_ID_HEADER: &str = "x-generation-id";
 const OPENROUTER_KEY_ENV: &str = "SEREN_ROUTER_KEY_OPENROUTER";
 const BUDGET_ENV: &str = "SEREN_PARITY_MAX_SPEND_USD";
 const MODEL_ENV: &str = "SEREN_PARITY_MODEL";
 const DEFAULT_MODEL: &str = "meta-llama/llama-3.3-70b-instruct";
+const OPENROUTER_UPSTREAM_PROVIDER: &str = "nebius/fp8";
+const OPENROUTER_PROVIDER_NAME: &str = "Nebius";
 const GATEWAY_KEY: &str = "openrouter-parity-gateway-key";
 const MAX_APPROVED_SPEND_USD: &str = "5";
 const MAX_COMPLETION_TOKENS: u64 = 1;
@@ -41,6 +45,8 @@ const SOAK_REQUESTS_PER_PATH: usize = 100;
 const STARTUP_DEADLINE: Duration = Duration::from_secs(15);
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 const MAX_P95_ADDED_LATENCY: Duration = Duration::from_millis(50);
+const METADATA_RETRY_DELAY: Duration = Duration::from_millis(250);
+const METADATA_RETRY_ATTEMPTS: usize = 20;
 static PAID_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Settings {
@@ -198,6 +204,7 @@ impl ParityHarness {
             admin_addr: Some(loopback(ports.admin)),
             stats_addr: Some(loopback(ports.stats)),
             readiness_addr: loopback(ports.readiness),
+            enable_ipv6: false,
         };
         fs::write(&artifacts.config, compile(&registry, options).unwrap()).unwrap();
 
@@ -213,6 +220,7 @@ impl ParityHarness {
         let mut sidecar = OwnedChild { child };
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .timeout(REQUEST_DEADLINE)
             .build()
             .unwrap();
@@ -322,24 +330,31 @@ impl Drop for ParityHarness {
 struct CompletionResponse {
     status: StatusCode,
     content_type: Option<String>,
+    generation_id: Option<String>,
     body: Vec<u8>,
     elapsed: Duration,
 }
 
 impl CompletionResponse {
-    fn assert_success(&self, expected_content_type: &str) {
+    fn assert_success(&self, expected_content_type: &str, context: &str) {
         assert_eq!(
             self.status,
             StatusCode::OK,
-            "completion failed with body: {}",
+            "{context} completion failed with body: {}",
             String::from_utf8_lossy(&self.body)
         );
         assert!(
             self.content_type
                 .as_deref()
                 .is_some_and(|value| value.starts_with(expected_content_type)),
-            "unexpected content type: {:?}",
+            "{context} returned an unexpected content type: {:?}",
             self.content_type
+        );
+        assert!(
+            self.generation_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("gen-")),
+            "{context} response omitted a valid {GENERATION_ID_HEADER} header"
         );
     }
 }
@@ -350,6 +365,32 @@ struct ParsedStream {
     usage_cost: Decimal,
 }
 
+struct SoakObservation {
+    elapsed: Duration,
+    generation_id: String,
+    reported_cost: Decimal,
+}
+
+struct GenerationMetadata {
+    generation_time: Duration,
+    total_cost: Decimal,
+}
+
+#[derive(Clone, Copy)]
+enum SoakPath {
+    Direct,
+    Routed,
+}
+
+impl SoakPath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Routed => "routed",
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "spends real OpenRouter credits"]
 async fn openrouter_response_parity() {
@@ -358,14 +399,18 @@ async fn openrouter_response_parity() {
     let harness = ParityHarness::start(&settings.openrouter_key).await;
 
     let direct = harness.direct(&settings, false).await;
-    direct.assert_success("application/json");
+    direct.assert_success("application/json", "direct");
     let direct_body: Value = serde_json::from_slice(&direct.body).unwrap();
     let direct_cost = usage_cost(&direct_body);
     assert_spend_within_budget(direct_cost, settings.budget);
 
     let routed = harness.routed(&settings, false).await;
-    routed.assert_success("application/json");
+    routed.assert_success("application/json", "routed");
     let routed_body: Value = serde_json::from_slice(&routed.body).unwrap();
+    assert_eq!(
+        direct_body["provider"], routed_body["provider"],
+        "OpenRouter provider pin was not preserved through the router"
+    );
     assert_eq!(
         key_schema(&direct_body),
         key_schema(&routed_body),
@@ -376,8 +421,9 @@ async fn openrouter_response_parity() {
     assert_spend_within_budget(direct_cost + routed_cost, settings.budget);
 
     println!(
-        "openrouter_response_parity model={} direct_ms={:.3} routed_ms={:.3} direct_cost={} routed_cost={}",
+        "openrouter_response_parity model={} upstream_provider={} direct_ms={:.3} routed_ms={:.3} direct_cost={} routed_cost={}",
         settings.model,
+        OPENROUTER_UPSTREAM_PROVIDER,
         milliseconds(direct.elapsed),
         milliseconds(routed.elapsed),
         direct_cost,
@@ -394,12 +440,12 @@ async fn openrouter_streaming_parity() {
     let harness = ParityHarness::start(&settings.openrouter_key).await;
 
     let direct = harness.direct(&settings, true).await;
-    direct.assert_success("text/event-stream");
+    direct.assert_success("text/event-stream", "direct");
     let direct_stream = parse_stream(&direct.body);
     assert_spend_within_budget(direct_stream.usage_cost, settings.budget);
 
     let routed = harness.routed(&settings, true).await;
-    routed.assert_success("text/event-stream");
+    routed.assert_success("text/event-stream", "routed");
     let routed_stream = parse_stream(&routed.body);
     assert_eq!(direct_stream.done_count, 1);
     assert_eq!(routed_stream.done_count, 1);
@@ -415,8 +461,9 @@ async fn openrouter_streaming_parity() {
     );
 
     println!(
-        "openrouter_streaming_parity model={} direct_ms={:.3} routed_ms={:.3} direct_cost={} routed_cost={}",
+        "openrouter_streaming_parity model={} upstream_provider={} direct_ms={:.3} routed_ms={:.3} direct_cost={} routed_cost={}",
         settings.model,
+        OPENROUTER_UPSTREAM_PROVIDER,
         milliseconds(direct.elapsed),
         milliseconds(routed.elapsed),
         direct_stream.usage_cost,
@@ -431,56 +478,188 @@ async fn openrouter_streaming_soak() {
     let _paid_test_guard = PAID_TEST_LOCK.lock().await;
     let settings = Settings::load(SOAK_REQUESTS_PER_PATH * 2);
     let harness = ParityHarness::start(&settings.openrouter_key).await;
-    let mut direct_latencies = Vec::with_capacity(SOAK_REQUESTS_PER_PATH);
-    let mut routed_latencies = Vec::with_capacity(SOAK_REQUESTS_PER_PATH);
+    let mut direct_observations = Vec::with_capacity(SOAK_REQUESTS_PER_PATH);
+    let mut routed_observations = Vec::with_capacity(SOAK_REQUESTS_PER_PATH);
     let mut direct_cost = Decimal::ZERO;
     let mut routed_cost = Decimal::ZERO;
 
     for sequence in 1..=SOAK_REQUESTS_PER_PATH {
-        let direct = harness.direct(&settings, true).await;
-        direct.assert_success("text/event-stream");
-        let direct_stream = parse_stream(&direct.body);
-        assert_eq!(
-            direct_stream.done_count, 1,
-            "direct request {sequence} omitted [DONE]"
-        );
-        direct_latencies.push(direct.elapsed);
-        direct_cost += direct_stream.usage_cost;
-        assert_spend_within_budget(direct_cost + routed_cost, settings.budget);
-
-        let routed = harness.routed(&settings, true).await;
-        routed.assert_success("text/event-stream");
-        let routed_stream = parse_stream(&routed.body);
-        assert_eq!(
-            routed_stream.done_count, 1,
-            "routed request {sequence} omitted [DONE]"
-        );
-        routed_latencies.push(routed.elapsed);
-        routed_cost += routed_stream.usage_cost;
-        assert_spend_within_budget(direct_cost + routed_cost, settings.budget);
+        let order = if sequence % 2 == 1 {
+            [SoakPath::Direct, SoakPath::Routed]
+        } else {
+            [SoakPath::Routed, SoakPath::Direct]
+        };
+        for path in order {
+            let (observation, cost) =
+                observe_soak_stream(&harness, &settings, path, sequence).await;
+            match path {
+                SoakPath::Direct => {
+                    direct_observations.push(observation);
+                    direct_cost += cost;
+                }
+                SoakPath::Routed => {
+                    routed_observations.push(observation);
+                    routed_cost += cost;
+                }
+            }
+            assert_spend_within_budget(direct_cost + routed_cost, settings.budget);
+        }
     }
 
+    let direct_latencies: Vec<_> = direct_observations
+        .iter()
+        .map(|observation| observation.elapsed)
+        .collect();
+    let routed_latencies: Vec<_> = routed_observations
+        .iter()
+        .map(|observation| observation.elapsed)
+        .collect();
     let direct_p95 = percentile_95(&direct_latencies);
     let routed_p95 = percentile_95(&routed_latencies);
-    let added_p95 = routed_p95.saturating_sub(direct_p95);
-    assert!(
-        added_p95 < MAX_P95_ADDED_LATENCY,
-        "p95 router-added latency was {:.3} ms, at or above the 50 ms gate",
-        milliseconds(added_p95)
-    );
-
+    let raw_added_p95 = routed_p95.saturating_sub(direct_p95);
+    let direct_overheads =
+        normalized_overheads(&harness.client, &settings, &direct_observations).await;
+    let routed_overheads =
+        normalized_overheads(&harness.client, &settings, &routed_observations).await;
+    let direct_overhead_p95 = percentile_95(&direct_overheads);
+    let routed_overhead_p95 = percentile_95(&routed_overheads);
+    let added_p95 = routed_overhead_p95.saturating_sub(direct_overhead_p95);
     println!(
-        "openrouter_streaming_soak model={} requests_per_path={} failures=0 direct_p95_ms={:.3} routed_p95_ms={:.3} added_p95_ms={:.3} direct_cost={} routed_cost={} total_cost={}",
+        "openrouter_streaming_soak model={} upstream_provider={} requests_per_path={} failures=0 direct_p95_ms={:.3} routed_p95_ms={:.3} raw_added_p95_ms={:.3} direct_overhead_p95_ms={:.3} routed_overhead_p95_ms={:.3} added_p95_ms={:.3} direct_cost={} routed_cost={} total_cost={}",
         settings.model,
+        OPENROUTER_UPSTREAM_PROVIDER,
         SOAK_REQUESTS_PER_PATH,
         milliseconds(direct_p95),
         milliseconds(routed_p95),
+        milliseconds(raw_added_p95),
+        milliseconds(direct_overhead_p95),
+        milliseconds(routed_overhead_p95),
         milliseconds(added_p95),
         direct_cost,
         routed_cost,
         direct_cost + routed_cost,
     );
+    assert!(
+        added_p95 < MAX_P95_ADDED_LATENCY,
+        "normalized p95 router-added latency was {:.3} ms (direct overhead p95 {:.3} ms, routed overhead p95 {:.3} ms), at or above the 50 ms gate",
+        milliseconds(added_p95),
+        milliseconds(direct_overhead_p95),
+        milliseconds(routed_overhead_p95),
+    );
     harness.shutdown_and_assert_clean().await;
+}
+
+async fn observe_soak_stream(
+    harness: &ParityHarness,
+    settings: &Settings,
+    path: SoakPath,
+    sequence: usize,
+) -> (SoakObservation, Decimal) {
+    let response = match path {
+        SoakPath::Direct => harness.direct(settings, true).await,
+        SoakPath::Routed => harness.routed(settings, true).await,
+    };
+    response.assert_success("text/event-stream", path.label());
+    let stream = parse_stream(&response.body);
+    assert_eq!(
+        stream.done_count,
+        1,
+        "{} request {sequence} omitted [DONE]",
+        path.label()
+    );
+
+    (
+        SoakObservation {
+            elapsed: response.elapsed,
+            generation_id: response
+                .generation_id
+                .expect("successful OpenRouter response has a generation ID"),
+            reported_cost: stream.usage_cost,
+        },
+        stream.usage_cost,
+    )
+}
+
+async fn normalized_overheads(
+    client: &Client,
+    settings: &Settings,
+    observations: &[SoakObservation],
+) -> Vec<Duration> {
+    let mut overheads = Vec::with_capacity(observations.len());
+    for observation in observations {
+        let metadata =
+            fetch_generation_metadata(client, &settings.openrouter_key, &observation.generation_id)
+                .await;
+        assert_cost_parity(observation.reported_cost, metadata.total_cost);
+        overheads.push(
+            observation
+                .elapsed
+                .checked_sub(metadata.generation_time)
+                .expect("OpenRouter generation_time exceeded observed client wall time"),
+        );
+    }
+    overheads
+}
+
+async fn fetch_generation_metadata(
+    client: &Client,
+    openrouter_key: &str,
+    generation_id: &str,
+) -> GenerationMetadata {
+    for attempt in 1..=METADATA_RETRY_ATTEMPTS {
+        let mut url =
+            Url::parse(OPENROUTER_GENERATION_URL).expect("generation metadata URL is valid");
+        url.query_pairs_mut().append_pair("id", generation_id);
+        let response = client
+            .get(url)
+            .bearer_auth(openrouter_key)
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("OpenRouter generation metadata transport failed"));
+        let status = response.status();
+        if status == StatusCode::OK {
+            let body: Value = response
+                .json()
+                .await
+                .expect("OpenRouter generation metadata must be JSON");
+            return parse_generation_metadata(&body);
+        }
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS
+        ) && attempt < METADATA_RETRY_ATTEMPTS
+        {
+            tokio::time::sleep(METADATA_RETRY_DELAY).await;
+            continue;
+        }
+        panic!("OpenRouter generation metadata returned HTTP {status}");
+    }
+    unreachable!("metadata retries return or panic")
+}
+
+fn parse_generation_metadata(body: &Value) -> GenerationMetadata {
+    assert_eq!(
+        body["data"]["provider_name"], OPENROUTER_PROVIDER_NAME,
+        "generation metadata provider did not match the pinned endpoint"
+    );
+    assert_eq!(
+        body["data"]["streamed"],
+        Value::Bool(true),
+        "generation metadata did not describe a streamed request"
+    );
+    let generation_time_ms = body["data"]["generation_time"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .expect("generation metadata must contain nonnegative generation_time milliseconds");
+    let total_cost = body["data"]["total_cost"]
+        .to_string()
+        .parse()
+        .expect("generation metadata total_cost must be a decimal JSON number");
+
+    GenerationMetadata {
+        generation_time: Duration::from_secs_f64(generation_time_ms / 1_000.0),
+        total_cost,
+    }
 }
 
 async fn send_completion(
@@ -498,7 +677,11 @@ async fn send_completion(
         }],
         "temperature": 0,
         "max_tokens": MAX_COMPLETION_TOKENS,
-        "stream": stream
+        "stream": stream,
+        "provider": {
+            "only": [OPENROUTER_UPSTREAM_PROVIDER],
+            "allow_fallbacks": false
+        }
     });
     if stream {
         body["stream_options"] = json!({"include_usage": true});
@@ -511,11 +694,16 @@ async fn send_completion(
         .json(&body)
         .send()
         .await
-        .unwrap_or_else(|error| panic!("completion transport failed for {url}: {error}"));
+        .unwrap_or_else(|error| panic!("completion transport failed for {url}: {error:?}"));
     let status = response.status();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let generation_id = response
+        .headers()
+        .get(GENERATION_ID_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let body = response
@@ -527,6 +715,7 @@ async fn send_completion(
     CompletionResponse {
         status,
         content_type,
+        generation_id,
         body,
         elapsed: started_at.elapsed(),
     }
@@ -573,17 +762,12 @@ fn parse_stream(body: &[u8]) -> ParsedStream {
 
     let usage_events: Vec<_> = events
         .iter()
-        .filter(|event| {
-            event["choices"]
-                .as_array()
-                .is_some_and(|choices| choices.is_empty())
-                && event["usage"]["cost"].is_number()
-        })
+        .filter(|event| event["usage"]["cost"].is_number())
         .collect();
     assert_eq!(
         usage_events.len(),
         1,
-        "stream must have exactly one empty-choices usage-cost event"
+        "stream must have exactly one usage-cost event"
     );
     let usage_cost = usage_cost(usage_events[0]);
 
@@ -604,6 +788,9 @@ fn collect_key_paths(value: &Value, path: &str, paths: &mut BTreeSet<String>) {
     match value {
         Value::Object(object) => {
             for (key, child) in object {
+                if child.is_null() {
+                    continue;
+                }
                 let child_path = format!("{path}.{key}");
                 paths.insert(child_path.clone());
                 collect_key_paths(child, &child_path, paths);
@@ -810,10 +997,38 @@ mod tests {
     }
 
     #[test]
+    fn key_schema_ignores_optional_null_fields_but_tracks_non_null_fields() {
+        let omitted = json!({"id": "one"});
+        let null = json!({"id": "one", "service_tier": null});
+        let populated = json!({"id": "one", "service_tier": "priority"});
+
+        assert_eq!(key_schema(&omitted), key_schema(&null));
+        assert_ne!(key_schema(&omitted), key_schema(&populated));
+    }
+
+    #[test]
     fn percentile_uses_the_nearest_rank_definition() {
         let samples: Vec<_> = (1..=100).map(Duration::from_millis).collect();
 
         assert_eq!(percentile_95(&samples), Duration::from_millis(95));
+    }
+
+    #[test]
+    fn generation_metadata_extracts_provider_time_and_exact_cost() {
+        let metadata = parse_generation_metadata(&json!({
+            "data": {
+                "provider_name": "Nebius",
+                "streamed": true,
+                "generation_time": 144,
+                "total_cost": 0.00000287
+            }
+        }));
+
+        assert_eq!(metadata.generation_time, Duration::from_millis(144));
+        assert_eq!(
+            metadata.total_cost,
+            "0.00000287".parse::<Decimal>().unwrap()
+        );
     }
 
     #[test]

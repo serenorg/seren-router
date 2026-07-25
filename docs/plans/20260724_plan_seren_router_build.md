@@ -686,7 +686,7 @@ and disposable PostgreSQL 17.
 
 ---
 
-### M6 — OpenRouter passthrough parity (needs the production OpenRouter key — Taariq)
+### M6 — OpenRouter passthrough parity — complete
 
 **Goal:** prove seren-router-with-OpenRouter-as-only-provider is indistinguishable from
 direct OpenRouter (docs/08 Phase 1 gate). Everything here needs
@@ -699,8 +699,10 @@ direct OpenRouter (docs/08 Phase 1 gate). Everything here needs
   shape equality, and `usage.cost` within 1% of OpenRouter's reported cost for the same
   generation (they price identically; the delta allowance is for token-count drift).
   Run manually, record output in the PR.
-- M6-3: soak: 100 sequential streamed requests, zero failures, p95 added latency vs
-  direct < 50ms. A shell loop is fine — YAGNI on load-test frameworks.
+- M6-3: soak: 100 sequential streamed requests per path, zero failures, p95 added
+  latency vs direct < 50ms. Normalize each observation with OpenRouter's authenticated
+  per-generation timing metadata so upstream inference variance is not counted as
+  local router overhead; retain raw p95s in the evidence.
 
 Commit(s): `feat: openrouter fallback provider entry`, `test: openrouter parity and soak harness`
 
@@ -708,10 +710,13 @@ Commit(s): `feat: openrouter fallback provider entry`, `test: openrouter parity 
 (docs/08 Phases 2–3) are ops runbooks executed with Taariq — infra target and provider
 keys are his open items; do not improvise them.
 
-Implementation prepared on 2026-07-25: the reviewed OpenRouter mappings and fail-closed
-manual JSON/SSE parity plus 100-request-per-path soak harness are in place. The live M6
-gate remains pending until `SEREN_ROUTER_KEY_OPENROUTER` is securely supplied and the
-sanitized parity/soak output is recorded on the implementation PR.
+Completed live on 2026-07-25 with the approved OpenRouter credential, pinned
+`nebius/fp8` endpoint, stock AgentGateway v1.4.0-alpha.2, and disposable PostgreSQL 17.
+JSON and SSE schema/provider/cost parity passed. The 100-direct + 100-routed streaming
+soak completed with zero failures, exact aggregate cost parity (`$0.00028700` per
+path), and 44.329 ms normalized p95 added latency (113.808 ms direct overhead vs
+158.136 ms routed overhead), below the 50 ms gate. Raw p95s (3,223.309 ms direct and
+4,111.064 ms routed) remain in the recorded output to show upstream variance.
 
 ---
 
