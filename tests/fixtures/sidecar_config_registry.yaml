@@ -7,10 +7,14 @@ providers:
     priority: 20
     models:
       - slug: acme/shared
+        name: Acme Shared
+        context_length: 131072
         provider_model_id: slow-shared
         input_price_per_mtok: "1.25"
         output_price_per_mtok: "2.50"
       - slug: acme/exclusive
+        name: Acme Exclusive
+        context_length: 65536
         provider_model_id: slow-exclusive
         input_price_per_mtok: "0.75"
         output_price_per_mtok: "1.50"
@@ -23,6 +27,8 @@ providers:
     priority: 5
     models:
       - slug: acme/shared
+        name: Acme Shared
+        context_length: 131072
         provider_model_id: fast-shared
         input_price_per_mtok: "1.50"
         output_price_per_mtok: "3.00"
@@ -35,6 +41,8 @@ providers:
     priority: 0
     models:
       - slug: acme/shared
+        name: Acme Shared
+        context_length: 131072
         provider_model_id: disabled-shared
         input_price_per_mtok: "0.01"
         output_price_per_mtok: "0.01"

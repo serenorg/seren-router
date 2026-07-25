@@ -1,5 +1,7 @@
-# Provider credentials are environment-variable names only. M6 owns enabling
-# OpenRouter and adding production model coverage after Taariq approves live spend.
+# Provider credentials are environment-variable names only. Each model mapping
+# carries its canonical display name, context length, provider-native model id,
+# and per-million-token prices. M6 owns enabling OpenRouter and adding production
+# model coverage after Taariq approves live spend.
 providers:
   - id: openrouter
     display_name: OpenRouter

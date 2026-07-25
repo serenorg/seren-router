@@ -31,6 +31,8 @@ pub struct Provider {
 #[serde(deny_unknown_fields)]
 pub struct ModelMapping {
     pub slug: String,
+    pub name: String,
+    pub context_length: u64,
     pub provider_model_id: String,
     pub input_price_per_mtok: Decimal,
     pub output_price_per_mtok: Decimal,
@@ -40,6 +42,10 @@ pub struct ModelMapping {
 pub enum RegistryValidationError {
     #[error("duplicate provider id: {0}")]
     DuplicateProviderId(String),
+    #[error("model {slug} for provider {provider_id} has an empty display name")]
+    EmptyModelName { provider_id: String, slug: String },
+    #[error("model {slug} for provider {provider_id} has a zero context length")]
+    ZeroModelContextLength { provider_id: String, slug: String },
 }
 
 impl Registry {
@@ -51,6 +57,21 @@ impl Registry {
                 return Err(RegistryValidationError::DuplicateProviderId(
                     provider.id.clone(),
                 ));
+            }
+
+            for mapping in &provider.models {
+                if mapping.name.trim().is_empty() {
+                    return Err(RegistryValidationError::EmptyModelName {
+                        provider_id: provider.id.clone(),
+                        slug: mapping.slug.clone(),
+                    });
+                }
+                if mapping.context_length == 0 {
+                    return Err(RegistryValidationError::ZeroModelContextLength {
+                        provider_id: provider.id.clone(),
+                        slug: mapping.slug.clone(),
+                    });
+                }
             }
         }
 
@@ -72,6 +93,8 @@ providers:
     priority: 255
     models:
       - slug: meta-llama/llama-3.3-70b-instruct
+        name: Llama 3.3 70B Instruct
+        context_length: 131072
         provider_model_id: meta-llama/llama-3.3-70b-instruct
         input_price_per_mtok: "0.40"
         output_price_per_mtok: "0.40"
@@ -81,6 +104,8 @@ providers:
     secret_env: SEREN_ROUTER_KEY_FIREWORKS
     models:
       - slug: meta-llama/llama-3.3-70b-instruct
+        name: Llama 3.3 70B Instruct
+        context_length: 131072
         provider_model_id: accounts/fireworks/models/llama-v3p3-70b-instruct
         input_price_per_mtok: "0.90"
         output_price_per_mtok: "0.90"
@@ -121,6 +146,34 @@ providers:
             Err(RegistryValidationError::DuplicateProviderId(
                 "openrouter".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn blank_model_names_are_rejected() {
+        let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
+        registry.providers[0].models[0].name = " \t".to_owned();
+
+        assert_eq!(
+            registry.validate(),
+            Err(RegistryValidationError::EmptyModelName {
+                provider_id: "openrouter".to_owned(),
+                slug: "meta-llama/llama-3.3-70b-instruct".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn zero_model_context_lengths_are_rejected() {
+        let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
+        registry.providers[0].models[0].context_length = 0;
+
+        assert_eq!(
+            registry.validate(),
+            Err(RegistryValidationError::ZeroModelContextLength {
+                provider_id: "openrouter".to_owned(),
+                slug: "meta-llama/llama-3.3-70b-instruct".to_owned(),
+            })
         );
     }
 }

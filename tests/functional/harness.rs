@@ -13,6 +13,7 @@ use reqwest::{Client, Response, StatusCode, Url};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use seren_router::attribution::SERVED_PROVIDER_HEADER;
+use seren_router::catalog::Catalog;
 use seren_router::db;
 use seren_router::gateway_auth::GatewayAuth;
 use seren_router::ledger::Ledger;
@@ -252,6 +253,23 @@ impl FunctionalHarness {
             .unwrap()
     }
 
+    async fn models(&self) -> Response {
+        self.client
+            .get(format!("{}/api/v1/models", self.router_base_url))
+            .bearer_auth(GATEWAY_KEY)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn unauthenticated_models(&self) -> Response {
+        self.client
+            .get(format!("{}/api/v1/models", self.router_base_url))
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn generation(&self, id: &str) -> Response {
         let mut url = Url::parse(&format!("{}/api/v1/generation", self.router_base_url)).unwrap();
         url.query_pairs_mut().append_pair("id", id);
@@ -332,13 +350,14 @@ impl Drop for FunctionalHarness {
 
 fn router_app(sidecar_url: &str, registry: &Registry, ledger: Ledger) -> Router {
     let auth = GatewayAuth::new(GATEWAY_KEY.as_bytes());
+    let catalog = Catalog::from_registry(registry);
     let proxy = ProxyState::new(
         sidecar_url,
         PriceTable::from_registry(registry).unwrap(),
         ledger.clone(),
     )
     .unwrap();
-    routes::public_router().merge(routes::protected_router(auth, proxy, ledger))
+    routes::public_router().merge(routes::protected_router(auth, proxy, ledger, catalog))
 }
 
 fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Registry {
@@ -384,6 +403,8 @@ fn functional_provider(
         priority,
         models: vec![ModelMapping {
             slug: VIRTUAL_MODEL.to_owned(),
+            name: "Functional Model".to_owned(),
+            context_length: 131_072,
             provider_model_id: model.to_owned(),
             input_price_per_mtok: input_price_per_mtok.parse().unwrap(),
             output_price_per_mtok: output_price_per_mtok.parse().unwrap(),
@@ -463,6 +484,25 @@ fn loopback(port: u16) -> SocketAddr {
 #[ignore = "functional"]
 async fn functional_chat_completion() {
     let harness = FunctionalHarness::start().await;
+    let models = harness.models().await;
+    assert_eq!(models.status(), StatusCode::OK);
+    assert_eq!(
+        models.json::<Value>().await.unwrap(),
+        json!({
+            "data": [{
+                "id": VIRTUAL_MODEL,
+                "name": "Functional Model",
+                "context_length": 131072,
+                "pricing": {
+                    "prompt": "0.0000004",
+                    "completion": "0.0000008"
+                }
+            }],
+            "links": {"next": null},
+            "total_count": 1
+        })
+    );
+
     let response = harness.chat(LOCAL_MODEL, false).await;
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -551,6 +591,10 @@ async fn functional_auth_rejected() {
     assert_eq!(harness.sidecar_request_count(), 0);
     assert_eq!(
         harness.unauthenticated_generation().await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        harness.unauthenticated_models().await.status(),
         StatusCode::UNAUTHORIZED
     );
 
