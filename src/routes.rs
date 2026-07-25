@@ -4,20 +4,23 @@
 //! same surface. Apply authentication only to [`protected_router`].
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::gateway_auth::{self, GatewayAuth};
+use crate::proxy::{self, ProxyState};
 use crate::server::{inference_route_policies, standard_route_policies};
 
 pub fn public_router() -> Router {
     standard_route_policies(Router::new().route("/", get(hello)))
 }
 
-pub fn protected_router(auth: GatewayAuth) -> Router {
-    // M2 registers inference endpoints here and layers static Gateway bearer
-    // authentication over this shared builder. An empty router exposes nothing
-    // before that authentication boundary exists.
-    gateway_auth::protect(inference_route_policies(Router::new()), auth)
+pub fn protected_router(auth: GatewayAuth, proxy_state: ProxyState) -> Router {
+    let router = Router::new()
+        .route("/api/v1/chat/completions", post(proxy::chat_completions))
+        .route("/api/v1/completions", post(proxy::legacy_completions))
+        .with_state(proxy_state);
+
+    gateway_auth::protect(inference_route_policies(router), auth)
 }
 
 async fn hello() -> &'static str {

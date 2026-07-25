@@ -1,5 +1,7 @@
 use anyhow::Context;
-use seren_router::{config::RouterConfig, db, gateway_auth::GatewayAuth, routes, server};
+use seren_router::{
+    config::RouterConfig, db, gateway_auth::GatewayAuth, proxy::ProxyState, routes, server,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,7 +19,9 @@ async fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let config = RouterConfig::from_env().context("invalid router configuration")?;
     let auth = GatewayAuth::new(config.gateway_key());
-    let app = routes::public_router().merge(routes::protected_router(auth));
+    let proxy =
+        ProxyState::new(config.sidecar_url()).context("invalid sidecar proxy configuration")?;
+    let app = routes::public_router().merge(routes::protected_router(auth, proxy));
     let db = match std::env::var("DATABASE_URL") {
         Ok(raw) => {
             let url = raw.trim();
