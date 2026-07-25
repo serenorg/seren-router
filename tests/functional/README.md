@@ -62,3 +62,51 @@ and an expensive `expensive` provider. Their fake registry prices let the harnes
 strict price sorting and the default price ceiling without requiring a second model
 process or spending provider credits. A third route points to an unused loopback port
 to prove both sidecar first-request retry and the router's pre-commit safety-net retry.
+
+## Paid OpenRouter parity and soak
+
+`tests/functional/parity.rs` is a separate, ignored harness for the M6 compatibility
+gate. It runs the checked-in production registry with OpenRouter as its only enabled
+provider and compares direct OpenRouter requests with requests through the real pinned
+sidecar and router. It never runs in ordinary CI.
+
+Requirements:
+
+- `SEREN_ROUTER_KEY_OPENROUTER` must already be exported from an approved secret source.
+  Never put it in a command, test output, repository file, or shell history.
+- `DATABASE_URL` must point to a disposable PostgreSQL 17 database.
+- `SEREN_PARITY_MAX_SPEND_USD` is mandatory, must be greater than zero, and may not
+  exceed `5`. `0.10` is sufficient for the default model and all three gates.
+- `SEREN_PARITY_MODEL` is optional and defaults to
+  `meta-llama/llama-3.3-70b-instruct`. Any override must be an enabled mapping in
+  `registry/providers.yaml`.
+
+Fetch the pinned sidecar and run the small parity checks first:
+
+```bash
+./scripts/fetch-sidecar.sh
+SEREN_PARITY_MAX_SPEND_USD=0.10 \
+  cargo test --test openrouter_parity openrouter_response_parity \
+  -- --ignored --nocapture --test-threads=1
+SEREN_PARITY_MAX_SPEND_USD=0.10 \
+  cargo test --test openrouter_parity openrouter_streaming_parity \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Only after both parity checks pass, run the 100-request-per-path soak:
+
+```bash
+SEREN_PARITY_MAX_SPEND_USD=0.10 \
+  cargo test --test openrouter_parity openrouter_streaming_soak \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Every paid test performs a conservative preflight estimate using 512 input tokens per
+call, enforces the caller-supplied budget against observed `usage.cost`, and redacts the
+credential from sidecar startup diagnostics. The soak alternates 100 direct and 100
+routed one-token streams, requires zero failures, and reports the model, both p95
+latencies, nonnegative p95 added latency, both total costs, and combined cost. It fails
+when router p95 minus direct p95 is 50 ms or higher.
+
+The registry prices were refreshed from the live `seren-models` catalog on 2026-07-25.
+Refresh and review them before rerunning M6 after any OpenRouter price or model change.

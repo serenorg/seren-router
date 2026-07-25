@@ -708,6 +708,11 @@ Commit(s): `feat: openrouter fallback provider entry`, `test: openrouter parity 
 (docs/08 Phases 2–3) are ops runbooks executed with Taariq — infra target and provider
 keys are his open items; do not improvise them.
 
+Implementation prepared on 2026-07-25: the reviewed OpenRouter mappings and fail-closed
+manual JSON/SSE parity plus 100-request-per-path soak harness are in place. The live M6
+gate remains pending until `SEREN_ROUTER_KEY_OPENROUTER` is securely supplied and the
+sanitized parity/soak output is recorded on the implementation PR.
+
 ---
 
 ### M7 — Deployment (strategy decided: seren-template-rust conventions; specifics gated)

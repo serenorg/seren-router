@@ -69,3 +69,32 @@ fn compiled_config_validates_with_pinned_sidecar() {
         "validation success marker missing\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+#[test]
+#[ignore = "needs sidecar binary"]
+fn production_registry_validates_with_pinned_sidecar() {
+    let registry: Registry =
+        serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap();
+    let yaml = compile(&registry, SidecarConfigOptions::default()).unwrap();
+    let config = TempConfig::create(&yaml);
+    let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("sidecar/bin/agentgateway");
+
+    let output = Command::new(&binary)
+        .arg("-f")
+        .arg(config.path())
+        .arg("--validate-only")
+        .env("SEREN_ROUTER_KEY_OPENROUTER", "fixture-only-openrouter-key")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to execute {}: {error}", binary.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "agentgateway validation failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Configuration is valid!"),
+        "validation success marker missing\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
