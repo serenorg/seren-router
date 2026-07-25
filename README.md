@@ -56,3 +56,17 @@ curl http://127.0.0.1:8000/readyz
 
 The protected route registry exposes no handlers until the compatibility-layer
 milestone adds the Gateway-facing static bearer authentication.
+
+## Pinned agentgateway sidecar
+
+The stock agentgateway binary is downloaded from its official GitHub release and kept
+out of Git. The installer supports Darwin arm64, Linux amd64, and Linux arm64; it
+verifies the platform-specific SHA-256 digest before replacing an installed binary.
+
+```bash
+./scripts/fetch-sidecar.sh
+./sidecar/bin/agentgateway --version
+```
+
+The version and all supported-platform digests are reviewable in
+`sidecar/PINNED_VERSION`.
