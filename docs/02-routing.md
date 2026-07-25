@@ -16,6 +16,11 @@ Seren diverges from OpenRouter here, on purpose. OpenRouter's default optimizes 
 3. Among those, **load-balance weighted toward measured throughput** (fastest-for-price), rather than weighted toward inverse-square-price.
 4. Remaining providers act as fallbacks.
 
+For routing comparisons, one provider/model's price is its exact input-plus-output
+per-million-token rate. This is the same coherent price pair used by the model catalog;
+the request ledger still calculates actual cost from the observed prompt/completion
+token mix.
+
 Crucially, this is **not** a naive `provider.sort: throughput`. That mode disables load
 balancing and routes sequentially to the single fastest provider — concentrating all
 traffic onto one host, which then slows under load and hits rate limits. We keep
@@ -29,6 +34,15 @@ Throughput differs from price in one way that matters for control: price is exog
 1. **Smoothed measurements.** Weight on a rolling-average throughput (e.g. EWMA over a multi-minute window), never on instantaneous readings.
 2. **Hysteresis.** A provider must be meaningfully faster (configurable threshold) before weight shifts toward it, and shifts are rate-limited. No flapping on noise.
 3. **Max-share cap.** No provider receives more than a configured share of a model's traffic (e.g. 60%), regardless of how fast it measures. Diversification is structurally guaranteed, not emergent.
+
+The incumbent for hysteresis is the provider with the largest count in the rolling
+per-model traffic window (a tie goes to the most recently selected tied provider). A
+challenger inside the hysteresis threshold receives the incumbent's throughput weight,
+so noise does not move traffic; a materially faster challenger keeps its higher weight.
+The max-share limit is a discrete rolling-window quota:
+`ceil(max_share × window_length)`. During initial window warm-up that rounding is
+unavoidable; once the window is full, the configured share is exact whenever the
+window size makes it representable.
 
 Scale note, honestly: at Seren's current volume our traffic cannot meaningfully load any major host — these stabilizers are for the scale we are building toward. They are cheap to build in from day one, so they are in the MVP.
 
