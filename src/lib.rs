@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod gateway_auth;
+pub mod ledger;
 pub mod pricing;
 pub mod proxy;
 pub mod registry;

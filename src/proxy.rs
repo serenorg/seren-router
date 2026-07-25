@@ -2,6 +2,7 @@
 // ABOUTME: Adds exact provider cost to non-streaming JSON and terminal SSE usage events.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -14,9 +15,10 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::attribution::ServedProvider;
+use crate::ledger::{GenerationWrite, Ledger};
 use crate::pricing::PriceTable;
 use crate::sse::UsageCostTransformer;
-use crate::usage_cost::{inject_usage_cost, prices_for_request};
+use crate::usage_cost::{CostedUsage, canonical_slug, inject_usage_cost, prices_for_request};
 
 const CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
 const LEGACY_COMPLETIONS_PATH: &str = "v1/completions";
@@ -27,10 +29,15 @@ pub struct ProxyState {
     chat_completions_url: Url,
     legacy_completions_url: Url,
     price_table: Arc<PriceTable>,
+    ledger: Ledger,
 }
 
 impl ProxyState {
-    pub fn new(sidecar_url: &str, price_table: PriceTable) -> Result<Self, ProxyConfigError> {
+    pub fn new(
+        sidecar_url: &str,
+        price_table: PriceTable,
+        ledger: Ledger,
+    ) -> Result<Self, ProxyConfigError> {
         let normalized = format!("{}/", sidecar_url.trim_end_matches('/'));
         let base_url = Url::parse(&normalized).map_err(|_| ProxyConfigError)?;
         if !matches!(base_url.scheme(), "http" | "https")
@@ -51,6 +58,7 @@ impl ProxyState {
                 .join(LEGACY_COMPLETIONS_PATH)
                 .expect("constant legacy-completions path is valid"),
             price_table: Arc::new(price_table),
+            ledger,
         })
     }
 }
@@ -81,6 +89,7 @@ struct CompletionRequestMetadata {
 }
 
 async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -> Response {
+    let started_at = Instant::now();
     let request = serde_json::from_slice::<CompletionRequestMetadata>(&body).unwrap_or_default();
     let url = match endpoint {
         CompletionEndpoint::Chat => &proxy.chat_completions_url,
@@ -134,10 +143,20 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
             (false, _, _) => Body::from_stream(response.bytes_stream()),
             (true, Some(requested_model), Some(served_provider)) => {
                 match prices_for_request(requested_model, served_provider, &proxy.price_table) {
-                    Ok(prices) => Body::from_stream(stream_with_usage_cost(
-                        response.bytes_stream(),
-                        UsageCostTransformer::new(prices.clone()),
-                    )),
+                    Ok(prices) => {
+                        let generation = GenerationContext::new(
+                            proxy.ledger.clone(),
+                            requested_model,
+                            served_provider,
+                            status,
+                            started_at,
+                        );
+                        Body::from_stream(stream_with_usage_cost(
+                            response.bytes_stream(),
+                            UsageCostTransformer::new(prices.clone()),
+                            generation,
+                        ))
+                    }
                     Err(reason) => {
                         tracing::warn!(
                             reason = %reason,
@@ -178,7 +197,17 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                 served_provider,
                 &proxy.price_table,
             ) {
-                Ok(body) => Bytes::from(body),
+                Ok(costed) => {
+                    GenerationContext::new(
+                        proxy.ledger.clone(),
+                        requested_model,
+                        served_provider,
+                        status,
+                        started_at,
+                    )
+                    .record(costed.usage);
+                    Bytes::from(costed.body)
+                }
                 Err(reason) => {
                     tracing::warn!(
                         reason = %reason,
@@ -229,13 +258,14 @@ fn downstream_response(
 fn stream_with_usage_cost<S>(
     input: S,
     transformer: UsageCostTransformer,
+    generation: GenerationContext,
 ) -> impl Stream<Item = Result<Bytes, reqwest::Error>>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     stream::unfold(
-        (Box::pin(input), Some(transformer)),
-        |(mut input, mut transformer)| async move {
+        (Box::pin(input), Some(transformer), Some(generation)),
+        |(mut input, mut transformer, mut generation)| async move {
             transformer.as_ref()?;
             loop {
                 match input.next().await {
@@ -243,27 +273,122 @@ where
                         let current = transformer
                             .take()
                             .expect("transformer is present until the source ends");
-                        let (next, output) = current.transform(&chunk);
+                        let (next, output, completed) = current.transform(&chunk);
                         transformer = Some(next);
+                        if let Some(completed) = completed
+                            && let Some(generation) = generation.take()
+                        {
+                            generation.record(completed);
+                        }
                         if !output.is_empty() {
-                            return Some((Ok(Bytes::from(output)), (input, transformer)));
+                            return Some((
+                                Ok(Bytes::from(output)),
+                                (input, transformer, generation),
+                            ));
                         }
                     }
                     Some(Err(error)) => {
-                        return Some((Err(error), (input, None)));
+                        if let Some(generation) = generation.take() {
+                            generation.warn_incomplete("upstream stream returned an error");
+                        }
+                        return Some((Err(error), (input, None, generation)));
                     }
                     None => {
-                        let output = transformer
+                        let (output, completed) = transformer
                             .take()
                             .expect("transformer is present until the source ends")
                             .finish();
+                        if let Some(completed) = completed
+                            && let Some(generation) = generation.take()
+                        {
+                            generation.record(completed);
+                        }
+                        if let Some(generation) = generation.take() {
+                            generation.warn_incomplete(
+                                "stream ended before a costed usage event and [DONE]",
+                            );
+                        }
                         return (!output.is_empty())
-                            .then(|| (Ok(Bytes::from(output)), (input, None)));
+                            .then(|| (Ok(Bytes::from(output)), (input, None, generation)));
                     }
                 }
             }
         },
     )
+}
+
+struct GenerationContext {
+    ledger: Ledger,
+    canonical_slug: String,
+    provider_id: String,
+    status: StatusCode,
+    started_at: Instant,
+}
+
+impl GenerationContext {
+    fn new(
+        ledger: Ledger,
+        requested_model: &str,
+        served_provider: &ServedProvider,
+        status: StatusCode,
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            ledger,
+            canonical_slug: canonical_slug(requested_model, served_provider.as_str()).to_owned(),
+            provider_id: served_provider.as_str().to_owned(),
+            status,
+            started_at,
+        }
+    }
+
+    fn record(self, costed: CostedUsage) {
+        let Some(id) = costed.response_id else {
+            self.warn_incomplete("costed response omitted a provider response id");
+            return;
+        };
+        let Ok(prompt_tokens) = i64::try_from(costed.usage.prompt_tokens) else {
+            self.warn_incomplete("prompt token count exceeds the ledger BIGINT");
+            return;
+        };
+        let Ok(completion_tokens) = i64::try_from(costed.usage.completion_tokens) else {
+            self.warn_incomplete("completion token count exceeds the ledger BIGINT");
+            return;
+        };
+        let latency_ms = i64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let generation = GenerationWrite {
+            id,
+            canonical_slug: self.canonical_slug,
+            provider_id: self.provider_id,
+            prompt_tokens,
+            completion_tokens,
+            cost_usd: costed.cost_usd,
+            latency_ms,
+            status: i16::try_from(self.status.as_u16()).expect("HTTP status fits in SMALLINT"),
+        };
+        let ledger = self.ledger;
+
+        tokio::spawn(async move {
+            if let Err(error) = ledger.insert(&generation).await {
+                tracing::error!(
+                    error = %error,
+                    generation_id = generation.id,
+                    provider_id = generation.provider_id,
+                    canonical_slug = generation.canonical_slug,
+                    "generation ledger insert failed"
+                );
+            }
+        });
+    }
+
+    fn warn_incomplete(&self, reason: &'static str) {
+        tracing::warn!(
+            reason,
+            provider_id = self.provider_id,
+            canonical_slug = self.canonical_slug,
+            "generation ledger record was omitted"
+        );
+    }
 }
 
 fn upstream_unavailable() -> Response {
@@ -306,8 +431,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            serde_json::from_slice::<Value>(&transformed).unwrap(),
+            serde_json::from_slice::<Value>(&transformed.body).unwrap(),
             expected
+        );
+        assert_eq!(
+            transformed.usage,
+            CostedUsage {
+                response_id: Some("chatcmpl-lk0p4fm7w70wido9snoqp".to_owned()),
+                usage: crate::pricing::Usage {
+                    prompt_tokens: 16,
+                    completion_tokens: 3,
+                },
+                cost_usd: "0.0000088000".parse().unwrap(),
+            }
         );
         assert!(expected.get("provider").is_none());
     }
@@ -333,8 +469,8 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                inject_usage_cost(candidate, model, &served_provider, &price_table),
-                Err(expected),
+                inject_usage_cost(candidate, model, &served_provider, &price_table).err(),
+                Some(expected),
                 "{name}"
             );
         }

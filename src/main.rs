@@ -1,7 +1,7 @@
 use anyhow::Context;
 use seren_router::{
-    config::RouterConfig, db, gateway_auth::GatewayAuth, pricing::PriceTable, proxy::ProxyState,
-    registry::Registry, routes, server,
+    config::RouterConfig, db, gateway_auth::GatewayAuth, ledger::Ledger, pricing::PriceTable,
+    proxy::ProxyState, registry::Registry, routes, server,
 };
 
 #[tokio::main]
@@ -37,26 +37,23 @@ async fn run() -> anyhow::Result<()> {
         .context("provider registry validation failed")?;
     let price_table =
         PriceTable::from_registry(&registry).context("provider registry pricing is invalid")?;
-    let proxy = ProxyState::new(config.sidecar_url(), price_table)
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    if database_url.trim().is_empty() {
+        anyhow::bail!("DATABASE_URL must not be empty");
+    }
+    let pool = db::connect(database_url.trim())
+        .await
+        .context("failed to connect to database")?;
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .context("failed to migrate database")?;
+    let ledger = Ledger::new(pool.clone());
+    let proxy = ProxyState::new(config.sidecar_url(), price_table, ledger.clone())
         .context("invalid sidecar proxy configuration")?;
-    let app = routes::public_router().merge(routes::protected_router(auth, proxy));
-    let db = match std::env::var("DATABASE_URL") {
-        Ok(raw) => {
-            let url = raw.trim();
-            if url.is_empty() {
-                None
-            } else {
-                tracing::info!(
-                    "database URL configured; readiness will check database connectivity"
-                );
-                Some(db::connect_lazy(url).context("invalid DATABASE_URL")?)
-            }
-        }
-        Err(std::env::VarError::NotPresent) => None,
-        Err(error) => return Err(anyhow::Error::new(error).context("failed to read DATABASE_URL")),
-    };
+    let app = routes::public_router().merge(routes::protected_router(auth, proxy, ledger));
 
-    server::serve(app, db)
+    server::serve(app, Some(pool))
         .await
         .context("HTTP server exited with error")
 }

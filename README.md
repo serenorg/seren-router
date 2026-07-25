@@ -36,9 +36,10 @@ verified evaluation).
 
 ## Service development
 
-Rust 1.95 or newer is required. The production feature group enables metrics, security
-headers, sensitive-header redaction, and payload limits; it deliberately excludes the
-template's per-IP rate limiter because the Gateway is this service's single caller.
+Rust 1.95 or newer and PostgreSQL 17 are required. The production feature group enables
+metrics, security headers, sensitive-header redaction, and payload limits; it
+deliberately excludes the template's per-IP rate limiter because the Gateway is this
+service's single caller. `DATABASE_URL` is required for tests and runtime startup.
 
 ```bash
 cargo fmt --all -- --check
@@ -49,23 +50,28 @@ cargo test --features production
 Run the chassis locally:
 
 ```bash
-SEREN_ROUTER_GATEWAY_KEY=local-development-only cargo run --features production
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/seren_router \
+SEREN_ROUTER_GATEWAY_KEY=local-development-only \
+cargo run --features production
 curl http://127.0.0.1:8000/readyz
 # {"status":"ok"}
 ```
 
-\`SEREN_ROUTER_GATEWAY_KEY\` is required. The sidecar URL defaults to
-\`http://127.0.0.1:4000\`, and the provider registry path defaults to
-\`registry/providers.yaml\`; override them with \`SEREN_ROUTER_SIDECAR_URL\` and
-\`SEREN_ROUTER_REGISTRY_PATH\`.
+`SEREN_ROUTER_GATEWAY_KEY` and `DATABASE_URL` are required. Startup connects to
+PostgreSQL and applies embedded migrations before the HTTP listener binds; `/readyz`
+continues checking that pool. The sidecar URL defaults to `http://127.0.0.1:4000`, and
+the provider registry path defaults to `registry/providers.yaml`; override them with
+`SEREN_ROUTER_SIDECAR_URL` and `SEREN_ROUTER_REGISTRY_PATH`.
 
-The protected route registry exposes the initial streaming compatibility paths:
+The protected route registry exposes the initial completion and generation paths:
 
 - `POST /api/v1/chat/completions`
 - `POST /api/v1/completions`
+- `GET /api/v1/generation?id=<provider-response-id>`
 
-Both require `Authorization: Bearer <SEREN_ROUTER_GATEWAY_KEY>` and stream the
-configured sidecar response without buffering.
+All require `Authorization: Bearer <SEREN_ROUTER_GATEWAY_KEY>`. Completion responses
+carry exact provider `usage.cost`; successful costed generations are persisted for
+post-hoc lookup and reconciliation.
 
 ## Pinned agentgateway sidecar
 

@@ -9,11 +9,13 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use axum::Router;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Response, StatusCode, Url};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use seren_router::attribution::SERVED_PROVIDER_HEADER;
+use seren_router::db;
 use seren_router::gateway_auth::GatewayAuth;
+use seren_router::ledger::Ledger;
 use seren_router::pricing::{PriceTable, Usage, cost_usd};
 use seren_router::proxy::ProxyState;
 use seren_router::registry::{ModelMapping, Provider, Registry};
@@ -183,7 +185,16 @@ impl FunctionalHarness {
         ports.router_listener.set_nonblocking(true).unwrap();
         let router_listener = tokio::net::TcpListener::from_std(ports.router_listener).unwrap();
         let sidecar_url = format!("http://127.0.0.1:{}", ports.llm);
-        let app = router_app(&sidecar_url, &registry);
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL is required for functional tests");
+        let pool = db::connect(&database_url)
+            .await
+            .expect("functional test database must be reachable");
+        sqlx::migrate!()
+            .run(&pool)
+            .await
+            .expect("functional test database migrations must succeed");
+        let app = router_app(&sidecar_url, &registry, Ledger::new(pool));
         let (router_shutdown, shutdown) = oneshot::channel();
         let router_task = tokio::spawn(async move {
             axum::serve(router_listener, app)
@@ -236,6 +247,17 @@ impl FunctionalHarness {
                 "messages": [{"role": "user", "content": "pong"}],
                 "max_tokens": 4
             }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn generation(&self, id: &str) -> Response {
+        let mut url = Url::parse(&format!("{}/api/v1/generation", self.router_base_url)).unwrap();
+        url.query_pairs_mut().append_pair("id", id);
+        self.client
+            .get(url)
+            .bearer_auth(GATEWAY_KEY)
             .send()
             .await
             .unwrap()
@@ -297,10 +319,15 @@ impl Drop for FunctionalHarness {
     }
 }
 
-fn router_app(sidecar_url: &str, registry: &Registry) -> Router {
+fn router_app(sidecar_url: &str, registry: &Registry, ledger: Ledger) -> Router {
     let auth = GatewayAuth::new(GATEWAY_KEY.as_bytes());
-    let proxy = ProxyState::new(sidecar_url, PriceTable::from_registry(registry).unwrap()).unwrap();
-    routes::public_router().merge(routes::protected_router(auth, proxy))
+    let proxy = ProxyState::new(
+        sidecar_url,
+        PriceTable::from_registry(registry).unwrap(),
+        ledger.clone(),
+    )
+    .unwrap();
+    routes::public_router().merge(routes::protected_router(auth, proxy, ledger))
 }
 
 fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Registry {
@@ -436,6 +463,11 @@ async fn functional_chat_completion() {
     );
     assert!(body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) > 0);
     assert_local_usage_cost(&body);
+    let generation_id = body["id"]
+        .as_str()
+        .expect("completion must include a provider response id");
+    let generation = wait_for_generation(&harness, generation_id).await;
+    assert_generation_matches(&generation, &body);
 
     harness.shutdown_and_assert_clean().await;
 }
@@ -483,6 +515,11 @@ async fn functional_streaming() {
         .expect("stream must contain a terminal usage event");
     assert_local_usage_cost(&usage_event);
     assert_eq!(data.last(), Some(&"[DONE]"));
+    let generation_id = usage_event["id"]
+        .as_str()
+        .expect("terminal usage event must include a provider response id");
+    let generation = wait_for_generation(&harness, generation_id).await;
+    assert_generation_matches(&generation, &usage_event);
 
     harness.shutdown_and_assert_clean().await;
 }
@@ -557,4 +594,44 @@ fn assert_local_usage_cost(body: &Value) {
         .unwrap();
 
     assert_eq!(actual, expected);
+}
+
+fn assert_generation_matches(generation: &Value, response: &Value) {
+    assert_eq!(generation["data"]["id"], response["id"]);
+    assert_eq!(generation["data"]["model"], VIRTUAL_MODEL);
+    assert_eq!(generation["data"]["provider_name"], "local");
+    assert_eq!(
+        generation["data"]["tokens_prompt"],
+        response["usage"]["prompt_tokens"]
+    );
+    assert_eq!(
+        generation["data"]["tokens_completion"],
+        response["usage"]["completion_tokens"]
+    );
+    assert_eq!(
+        generation["data"]["total_cost"].as_number().unwrap(),
+        response["usage"]["cost"].as_number().unwrap()
+    );
+    assert!(generation["data"]["created_at"].as_str().is_some());
+    assert!(generation["data"]["latency"].as_i64().unwrap() >= 0);
+}
+
+async fn wait_for_generation(harness: &FunctionalHarness, id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let response = harness.generation(id).await;
+        if response.status() == StatusCode::OK {
+            return response.json().await.unwrap();
+        }
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "unexpected generation lookup status"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "generation {id} was not persisted before the lookup deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
