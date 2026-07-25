@@ -80,3 +80,7 @@ verifies the platform-specific SHA-256 digest before replacing an installed bina
 
 The version and all supported-platform digests are reviewable in
 `sidecar/PINNED_VERSION`.
+
+## License
+
+seren-router is licensed under the [Apache License 2.0](LICENSE).
