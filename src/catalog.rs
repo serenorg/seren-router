@@ -1,27 +1,30 @@
-// ABOUTME: Builds the OpenRouter-shaped model catalog from enabled registry mappings.
-// ABOUTME: Serves one deterministic entry per canonical slug with exact per-token prices.
+// ABOUTME: Builds OpenRouter-shaped model and endpoint catalogs from enabled registry mappings.
+// ABOUTME: Serves deterministic startup snapshots with exact per-token prices.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use crate::registry::{ModelMapping, Registry};
+use crate::registry::{ModelMapping, Provider, Registry};
 
 const TOKENS_PER_MILLION: u64 = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub struct Catalog {
     response: Arc<ModelsResponse>,
+    endpoints_by_slug: Arc<BTreeMap<String, ModelEndpointsResponse>>,
 }
 
 impl Catalog {
     pub fn from_registry(registry: &Registry) -> Self {
         let mut cheapest_by_slug = BTreeMap::<String, CatalogCandidate<'_>>::new();
+        let mut endpoints_by_slug = BTreeMap::<String, Vec<EndpointCandidate<'_>>>::new();
 
         for provider in registry
             .providers
@@ -41,14 +44,43 @@ impl Catalog {
                         }
                     })
                     .or_insert(candidate);
+                endpoints_by_slug
+                    .entry(mapping.slug.clone())
+                    .or_default()
+                    .push(EndpointCandidate { provider, mapping });
             }
         }
 
         let data: Vec<_> = cheapest_by_slug
-            .into_values()
+            .values()
+            .copied()
             .map(CatalogCandidate::into_model)
             .collect();
         let total_count = data.len();
+        let endpoints_by_slug = endpoints_by_slug
+            .into_iter()
+            .map(|(slug, mut candidates)| {
+                candidates.sort_by_key(EndpointCandidate::sort_key);
+                let selected = cheapest_by_slug
+                    .get(&slug)
+                    .expect("every endpoint slug has a catalog candidate");
+                let endpoints = candidates
+                    .into_iter()
+                    .map(EndpointCandidate::into_endpoint)
+                    .collect();
+
+                (
+                    slug.clone(),
+                    ModelEndpointsResponse {
+                        data: ModelEndpoints {
+                            id: slug,
+                            name: selected.mapping.name.clone(),
+                            endpoints,
+                        },
+                    },
+                )
+            })
+            .collect();
 
         Self {
             response: Arc::new(ModelsResponse {
@@ -56,6 +88,23 @@ impl Catalog {
                 links: ModelsLinks { next: None },
                 total_count,
             }),
+            endpoints_by_slug: Arc::new(endpoints_by_slug),
+        }
+    }
+
+    fn endpoint_response(&self, slug: &str) -> Response {
+        match self.endpoints_by_slug.get(slug) {
+            Some(response) => Json(response.clone()).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: ErrorDetail {
+                        code: StatusCode::NOT_FOUND.as_u16(),
+                        message: "Not Found",
+                    },
+                }),
+            )
+                .into_response(),
         }
     }
 }
@@ -93,6 +142,37 @@ impl<'a> CatalogCandidate<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EndpointCandidate<'a> {
+    provider: &'a Provider,
+    mapping: &'a ModelMapping,
+}
+
+impl<'a> EndpointCandidate<'a> {
+    fn sort_key(&self) -> (u8, &'a str, &'a str) {
+        (
+            self.provider.priority,
+            self.provider.id.as_str(),
+            self.mapping.provider_model_id.as_str(),
+        )
+    }
+
+    fn into_endpoint(self) -> CatalogEndpoint {
+        CatalogEndpoint {
+            name: format!("{}: {}", self.provider.display_name, self.mapping.name),
+            model_id: self.mapping.slug.clone(),
+            model_name: self.mapping.name.clone(),
+            context_length: self.mapping.context_length,
+            pricing: CatalogPricing {
+                prompt: per_token_price(self.mapping.input_price_per_mtok),
+                completion: per_token_price(self.mapping.output_price_per_mtok),
+            },
+            provider_name: self.provider.display_name.clone(),
+            tag: self.provider.id.clone(),
+        }
+    }
+}
+
 fn per_token_price(price_per_mtok: Decimal) -> String {
     (price_per_mtok / Decimal::from(TOKENS_PER_MILLION))
         .normalize()
@@ -125,25 +205,125 @@ struct CatalogPricing {
     completion: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ModelEndpointsResponse {
+    data: ModelEndpoints,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ModelEndpoints {
+    id: String,
+    name: String,
+    endpoints: Vec<CatalogEndpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct CatalogEndpoint {
+    name: String,
+    model_id: String,
+    model_name: String,
+    context_length: u64,
+    pricing: CatalogPricing,
+    provider_name: String,
+    tag: String,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct ErrorResponse {
+    error: ErrorDetail,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct ErrorDetail {
+    code: u16,
+    message: &'static str,
+}
+
 pub async fn get_models(State(catalog): State<Catalog>) -> impl IntoResponse {
     Json(catalog.response.as_ref().clone())
 }
 
+pub async fn get_model_endpoints(
+    State(catalog): State<Catalog>,
+    Path(model): Path<String>,
+) -> Response {
+    catalog.endpoint_response(&model)
+}
+
+pub async fn get_model_endpoints_by_author(
+    State(catalog): State<Catalog>,
+    Path((author, slug)): Path<(String, String)>,
+) -> Response {
+    catalog.endpoint_response(&format!("{author}/{slug}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::*;
 
-    #[test]
-    fn registry_aggregation_matches_live_shape_golden() {
+    fn fixture_catalog() -> Catalog {
         let registry: Registry =
             serde_yaml::from_str(include_str!("../tests/fixtures/catalog_registry.yaml")).unwrap();
-        let catalog = Catalog::from_registry(&registry);
+        Catalog::from_registry(&registry)
+    }
+
+    #[test]
+    fn registry_aggregation_matches_live_shape_golden() {
+        let catalog = fixture_catalog();
         let actual = serde_json::to_value(catalog.response.as_ref()).unwrap();
         let expected: Value =
             serde_json::from_str(include_str!("../tests/golden/models_catalog.json")).unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn endpoint_catalog_includes_only_enabled_providers_in_priority_order() {
+        let catalog = fixture_catalog();
+        let actual =
+            serde_json::to_value(&catalog.endpoints_by_slug["anthropic/claude-opus-5-fast"])
+                .unwrap();
+
+        assert_eq!(
+            actual,
+            json!({
+                "data": {
+                    "id": "anthropic/claude-opus-5-fast",
+                    "name": "Claude Opus 5 (Fast)",
+                    "endpoints": [
+                        {
+                            "name": "Balanced Provider: Claude Opus 5 (Fast)",
+                            "model_id": "anthropic/claude-opus-5-fast",
+                            "model_name": "Claude Opus 5 (Fast)",
+                            "context_length": 1000000,
+                            "pricing": {
+                                "prompt": "0.00001",
+                                "completion": "0.00005"
+                            },
+                            "provider_name": "Balanced Provider",
+                            "tag": "balanced"
+                        },
+                        {
+                            "name": "Cheap Input Provider: Claude Opus 5 Fast Alternate",
+                            "model_id": "anthropic/claude-opus-5-fast",
+                            "model_name": "Claude Opus 5 Fast Alternate",
+                            "context_length": 750000,
+                            "pricing": {
+                                "prompt": "0.000005",
+                                "completion": "0.00007"
+                            },
+                            "provider_name": "Cheap Input Provider",
+                            "tag": "cheap-input"
+                        }
+                    ]
+                }
+            })
+        );
+        let serialized = actual.to_string();
+        assert!(!serialized.contains("disabled"));
+        assert!(!serialized.contains("base_url"));
+        assert!(!serialized.contains("secret_env"));
     }
 }

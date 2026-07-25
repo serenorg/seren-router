@@ -1,6 +1,7 @@
 pub mod attribution;
 pub mod auth;
 pub mod catalog;
+pub mod compatibility;
 pub mod config;
 pub mod db;
 pub mod gateway_auth;
