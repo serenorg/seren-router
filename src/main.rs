@@ -1,5 +1,5 @@
 use anyhow::Context;
-use seren_router::{db, routes, server};
+use seren_router::{config::RouterConfig, db, gateway_auth::GatewayAuth, routes, server};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,10 +15,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    // The protected registry is empty until M2 adds the Gateway's static bearer
-    // middleware and inference handlers. Keeping both builders in production
-    // composition prevents route-list drift when that surface lands.
-    let app = routes::public_router().merge(routes::protected_router());
+    let config = RouterConfig::from_env().context("invalid router configuration")?;
+    let auth = GatewayAuth::new(config.gateway_key());
+    let app = routes::public_router().merge(routes::protected_router(auth));
     let db = match std::env::var("DATABASE_URL") {
         Ok(raw) => {
             let url = raw.trim();

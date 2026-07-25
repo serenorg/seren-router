@@ -1,5 +1,7 @@
 pub mod auth;
+pub mod config;
 pub mod db;
+pub mod gateway_auth;
 pub mod registry;
 pub mod routes;
 pub mod server;
