@@ -99,6 +99,7 @@ fn build_config(
             models,
             virtual_models,
         },
+        policies: vec![TargetedRoutePolicy::llm_retry()],
     })
 }
 
@@ -106,6 +107,7 @@ fn build_config(
 struct AgentGatewayConfig {
     config: RuntimeConfig,
     llm: LlmConfig,
+    policies: Vec<TargetedRoutePolicy>,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +209,60 @@ struct VirtualTarget {
     priority: u8,
 }
 
+#[derive(Debug, Serialize)]
+struct TargetedRoutePolicy {
+    name: ResourceName,
+    target: PolicyTarget,
+    policy: RoutePolicy,
+}
+
+impl TargetedRoutePolicy {
+    fn llm_retry() -> Self {
+        Self {
+            name: ResourceName {
+                name: "llm-retry",
+                namespace: "internal",
+            },
+            target: PolicyTarget {
+                route: ResourceName {
+                    name: "llm:request",
+                    namespace: "internal",
+                },
+            },
+            policy: RoutePolicy {
+                retry: RetryPolicy {
+                    attempts: 2,
+                    codes: [429],
+                    condition: "response.code >= 500 && response.code < 600",
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceName {
+    name: &'static str,
+    namespace: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyTarget {
+    route: ResourceName,
+}
+
+#[derive(Debug, Serialize)]
+struct RoutePolicy {
+    retry: RetryPolicy,
+}
+
+#[derive(Debug, Serialize)]
+struct RetryPolicy {
+    attempts: u8,
+    codes: [u16; 1],
+    condition: &'static str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +323,23 @@ mod tests {
             route.health.eviction.consecutive_failures == 1
                 && route.health.eviction.duration == "60s"
         }));
+    }
+
+    #[test]
+    fn retry_policy_targets_the_generated_llm_route() {
+        let config = build_config(&fixture_registry(), SidecarConfigOptions::default()).unwrap();
+        let retry = &config.policies[0];
+
+        assert_eq!(retry.name.name, "llm-retry");
+        assert_eq!(retry.name.namespace, "internal");
+        assert_eq!(retry.target.route.name, "llm:request");
+        assert_eq!(retry.target.route.namespace, "internal");
+        assert_eq!(retry.policy.retry.attempts, 2);
+        assert_eq!(retry.policy.retry.codes, [429]);
+        assert_eq!(
+            retry.policy.retry.condition,
+            "response.code >= 500 && response.code < 600"
+        );
     }
 
     #[test]

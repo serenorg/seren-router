@@ -51,3 +51,17 @@ llm:
           priority: 5
         - model: slow/acme/shared
           priority: 20
+policies:
+- name:
+    name: llm-retry
+    namespace: internal
+  target:
+    route:
+      name: llm:request
+      namespace: internal
+  policy:
+    retry:
+      attempts: 2
+      codes:
+      - 429
+      condition: response.code >= 500 && response.code < 600

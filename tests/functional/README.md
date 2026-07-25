@@ -56,3 +56,9 @@ agentgateway's real `GET /healthz/ready` endpoint, and owns all child/task/temp 
 Teardown stops the router and sidecar, waits for the child, removes artifacts, and
 verifies that all runtime ports can be rebound. The deliberately dead provider also
 uses an OS-assigned unused port.
+
+The routing tests register the same real model server as both a cheap `local` provider
+and an expensive `expensive` provider. Their fake registry prices let the harness prove
+strict price sorting and the default price ceiling without requiring a second model
+process or spending provider credits. A third route points to an unused loopback port
+to prove both sidecar first-request retry and the router's pre-commit safety-net retry.

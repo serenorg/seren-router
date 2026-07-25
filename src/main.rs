@@ -1,7 +1,8 @@
 use anyhow::Context;
 use seren_router::{
     catalog::Catalog, config::RouterConfig, db, gateway_auth::GatewayAuth, ledger::Ledger,
-    pricing::PriceTable, proxy::ProxyState, registry::Registry, routes, server,
+    policy::measurements::MeasurementStore, pricing::PriceTable, proxy::ProxyState,
+    registry::Registry, routes, server,
 };
 
 #[tokio::main]
@@ -50,8 +51,15 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("failed to migrate database")?;
     let ledger = Ledger::new(pool.clone());
-    let proxy = ProxyState::new(config.sidecar_url(), price_table, ledger.clone())
-        .context("invalid sidecar proxy configuration")?;
+    let proxy = ProxyState::new(
+        config.sidecar_url(),
+        price_table,
+        ledger.clone(),
+        &registry,
+        config.routing(),
+        MeasurementStore::default(),
+    )
+    .context("invalid sidecar proxy configuration")?;
     let app = routes::public_router().merge(routes::protected_router(auth, proxy, ledger, catalog));
 
     server::serve(app, Some(pool))

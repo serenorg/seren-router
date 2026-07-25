@@ -428,9 +428,8 @@ machine with a model server):
   and the stream ends with `data: [DONE]`. (We observed exactly this shape in docs/09.)
 - `functional_auth_rejected`: no key → 401, and the sidecar saw no request.
 - `functional_failover`: request a virtual-model slug whose priority-0 target is the dead
-  port → first request may 5xx (known alpha behavior — this documents it), second
-  request succeeds via the healthy target. If a retry policy config (M5-4) later makes
-  the FIRST request succeed, tighten this test in that commit.
+  port → the first request succeeds via the healthy target. The M5-4 retry route policy
+  and the router's pre-commit bare-slug safety net both enforce this contract.
 
 Commit: `test: functional harness with real sidecar, model server, and dead-port failover`
 
@@ -681,6 +680,9 @@ Commit: `feat: policy-driven route selection with sidecar failover safety net`
 
 **M5 Gate:** distribution unit tests + `functional_failover` (first-request success) +
 `functional_sort_modes` all green.
+
+Verified locally on 2026-07-25 with the pinned stock sidecar, a real LM Studio model,
+and disposable PostgreSQL 17.
 
 ---
 

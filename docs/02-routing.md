@@ -85,7 +85,13 @@ per-`(provider, model)` throughput and price measurements power both.
 
 ## Failover
 
-On `429`, `5xx`, timeout, or a malformed stream, the router transparently retries down the ranked list (the fallback tier) before surfacing an error to the caller. "Automatic failover" is already advertised in the current `seren-models` description, so this is table stakes.
+Before response bytes are committed, a transport error, `429`, or `5xx` from the
+selected concrete route causes one retry through the bare-slug virtual model, whose
+priority tiers are owned by agentgateway. The sidecar also has a two-attempt retry
+policy on its generated LLM route so the first request survives a newly dead target.
+Once streaming bytes have been committed, neither a malformed event nor a later stream
+error is replayed: doing so could duplicate billable output or concatenate two
+providers into one response.
 
 ## Health / circuit-breaking
 
