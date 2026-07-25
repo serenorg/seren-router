@@ -158,6 +158,7 @@ impl FunctionalHarness {
             admin_addr: Some(loopback(ports.admin)),
             stats_addr: Some(loopback(ports.stats)),
             readiness_addr: loopback(ports.readiness),
+            enable_ipv6: false,
         };
         fs::write(&artifacts.config, compile(&registry, options).unwrap()).unwrap();
 

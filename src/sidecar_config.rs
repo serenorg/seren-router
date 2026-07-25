@@ -16,6 +16,7 @@ pub struct SidecarConfigOptions {
     pub admin_addr: Option<SocketAddr>,
     pub stats_addr: Option<SocketAddr>,
     pub readiness_addr: SocketAddr,
+    pub enable_ipv6: bool,
 }
 
 impl Default for SidecarConfigOptions {
@@ -25,6 +26,7 @@ impl Default for SidecarConfigOptions {
             admin_addr: None,
             stats_addr: None,
             readiness_addr: SocketAddr::from(([127, 0, 0, 1], 19001)),
+            enable_ipv6: false,
         }
     }
 }
@@ -93,6 +95,7 @@ fn build_config(
             admin_addr: options.admin_addr,
             stats_addr: options.stats_addr,
             readiness_addr: options.readiness_addr,
+            enable_ipv6: options.enable_ipv6,
         },
         llm: LlmConfig {
             port: options.llm_port,
@@ -118,6 +121,7 @@ struct RuntimeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     stats_addr: Option<SocketAddr>,
     readiness_addr: SocketAddr,
+    enable_ipv6: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,6 +139,8 @@ struct ModelRoute {
     name: String,
     provider: &'static str,
     params: ModelParams,
+    passthrough: &'static str,
+    overrides: ModelOverrides,
     response_headers: HeaderModifier,
     health: Health,
 }
@@ -148,6 +154,10 @@ impl ModelRoute {
                 base_url: provider.base_url.clone(),
                 model: mapping.provider_model_id.clone(),
                 api_key: format!("${}", provider.secret_env),
+            },
+            passthrough: "detect",
+            overrides: ModelOverrides {
+                model: mapping.provider_model_id.clone(),
             },
             response_headers: HeaderModifier {
                 set: BTreeMap::from([(SERVED_PROVIDER_HEADER.to_owned(), provider.id.clone())]),
@@ -173,6 +183,11 @@ struct ModelParams {
     base_url: String,
     model: String,
     api_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelOverrides {
+    model: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -291,6 +306,7 @@ mod tests {
             admin_addr: Some(SocketAddr::from(([127, 0, 0, 1], 41002))),
             stats_addr: Some(SocketAddr::from(([127, 0, 0, 1], 41003))),
             readiness_addr: SocketAddr::from(([127, 0, 0, 1], 41004)),
+            enable_ipv6: false,
         };
         let yaml = compile(&fixture_registry(), options).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_slice(&yaml).unwrap();
@@ -299,6 +315,14 @@ mod tests {
         assert_eq!(config["config"]["adminAddr"], "127.0.0.1:41002");
         assert_eq!(config["config"]["statsAddr"], "127.0.0.1:41003");
         assert_eq!(config["config"]["readinessAddr"], "127.0.0.1:41004");
+        assert_eq!(config["config"]["enableIpv6"], false);
+    }
+
+    #[test]
+    fn ipv6_resolution_is_disabled_by_default() {
+        let config = build_config(&fixture_registry(), SidecarConfigOptions::default()).unwrap();
+
+        assert!(!config.config.enable_ipv6);
     }
 
     #[test]
@@ -322,6 +346,15 @@ mod tests {
         assert!(config.llm.models.iter().all(|route| {
             route.health.eviction.consecutive_failures == 1
                 && route.health.eviction.duration == "60s"
+        }));
+    }
+
+    #[test]
+    fn every_route_uses_detect_passthrough_with_a_model_override() {
+        let config = build_config(&fixture_registry(), SidecarConfigOptions::default()).unwrap();
+
+        assert!(config.llm.models.iter().all(|route| {
+            route.passthrough == "detect" && route.overrides.model == route.params.model
         }));
     }
 

@@ -1,5 +1,5 @@
 // ABOUTME: Frames OpenAI-compatible server-sent events across arbitrary HTTP chunks.
-// ABOUTME: Adds exact provider cost only to a terminal empty-choices usage event.
+// ABOUTME: Adds exact provider cost to either supported terminal streaming usage shape.
 
 use serde_json::Value;
 
@@ -63,11 +63,7 @@ impl UsageCostTransformer {
         let Ok(mut value) = serde_json::from_slice::<Value>(data) else {
             return (event.to_vec(), None);
         };
-        if !value
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-        {
+        if !is_terminal_usage_event(&value) {
             return (event.to_vec(), None);
         }
         let Ok(costed_usage) = inject_usage_cost_value(&mut value, &self.prices) else {
@@ -85,6 +81,18 @@ impl UsageCostTransformer {
         transformed.extend_from_slice(separator);
         (transformed, None)
     }
+}
+
+fn is_terminal_usage_event(value: &Value) -> bool {
+    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        return false;
+    };
+    choices.is_empty()
+        || choices.iter().any(|choice| {
+            choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+        })
 }
 
 fn next_event_end(bytes: &[u8]) -> Option<usize> {
@@ -148,6 +156,31 @@ mod tests {
         let malformed =
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"invalid\"}}\n\ndata: [DONE]\n\n";
         assert_every_boundary(malformed, malformed, None);
+    }
+
+    #[test]
+    fn usage_attached_to_the_final_choice_is_transformed_across_every_boundary() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl-final\",\"choices\":[{\"delta\":{},",
+            "\"finish_reason\":\"stop\",\"index\":0}],\"usage\":",
+            "{\"prompt_tokens\":16,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],",
+            "\"id\":\"chatcmpl-final\",\"usage\":{\"completion_tokens\":3,",
+            "\"cost\":0.0000088000,\"prompt_tokens\":16}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary(
+            input.as_bytes(),
+            expected.as_bytes(),
+            Some(CostedUsage {
+                response_id: Some("chatcmpl-final".to_owned()),
+                ..test_usage()
+            }),
+        );
     }
 
     fn assert_every_boundary(input: &[u8], expected: &[u8], expected_usage: Option<CostedUsage>) {

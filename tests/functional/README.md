@@ -62,3 +62,68 @@ and an expensive `expensive` provider. Their fake registry prices let the harnes
 strict price sorting and the default price ceiling without requiring a second model
 process or spending provider credits. A third route points to an unused loopback port
 to prove both sidecar first-request retry and the router's pre-commit safety-net retry.
+
+## Paid OpenRouter parity and soak
+
+`tests/functional/parity.rs` is a separate, ignored harness for the M6 compatibility
+gate. It runs the checked-in production registry with OpenRouter as its only enabled
+provider and compares direct OpenRouter requests with requests through the real pinned
+sidecar and router. Generated sidecar routes use AgentGateway's `passthrough: detect`
+mode with an explicit upstream-model override, avoiding a redundant response
+translation while preserving provider selection and attribution. IPv6 resolution is
+disabled by default because the runtime addresses and validated deployment path are
+IPv4. The paid tests never run in ordinary CI.
+
+Requirements:
+
+- `SEREN_ROUTER_KEY_OPENROUTER` must already be exported from an approved secret source.
+  Never put it in a command, test output, repository file, or shell history.
+- `DATABASE_URL` must point to a disposable PostgreSQL 17 database.
+- `SEREN_PARITY_MAX_SPEND_USD` is mandatory, must be greater than zero, and may not
+  exceed `5`. `0.10` is sufficient for the default model and all three gates.
+- `SEREN_PARITY_MODEL` is optional and defaults to
+  `meta-llama/llama-3.3-70b-instruct`. Any override must be an enabled mapping in
+  `registry/providers.yaml`.
+- Both paths are pinned to OpenRouter endpoint `nebius/fp8`, with OpenRouter fallbacks
+  disabled. Its reviewed input/output prices match the default model mapping, keeping
+  schema and `usage.cost` comparisons independent of OpenRouter's dynamic provider
+  load balancing. Refresh the pin and registry prices together.
+
+Fetch the pinned sidecar and run the small parity checks first:
+
+```bash
+./scripts/fetch-sidecar.sh
+SEREN_PARITY_MAX_SPEND_USD=0.10 \
+  cargo test --test openrouter_parity openrouter_response_parity \
+  -- --ignored --nocapture --test-threads=1
+SEREN_PARITY_MAX_SPEND_USD=0.10 \
+  cargo test --test openrouter_parity openrouter_streaming_parity \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Only after both parity checks pass, run the 100-request-per-path soak:
+
+```bash
+SEREN_PARITY_MAX_SPEND_USD=0.10 \
+  cargo test --test openrouter_parity openrouter_streaming_soak \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Every paid test performs a conservative preflight estimate using 512 input tokens per
+call, enforces the caller-supplied budget against observed `usage.cost`, and redacts the
+credential from sidecar startup diagnostics. Schema comparisons ignore only keys whose
+value is JSON `null`, because optional nullable OpenAI fields may be omitted by a
+compatible intermediary; any non-null field loss still fails. The soak interleaves 100
+direct and 100 routed one-token streams, alternating which path runs first in each pair
+to balance upstream time drift while keeping every call sequential. It requires zero
+failures and reports the model, pinned upstream provider, both raw p95 latencies, both
+p95 client/network overheads, nonnegative p95 added latency, both total costs, and
+combined cost. After all streams finish, the harness uses each preserved
+`X-Generation-Id` to read OpenRouter's authenticated per-generation metadata and
+subtract its reported `generation_time` from that exact client observation. This
+prevents volatile provider inference time from being misclassified as local router
+overhead. It fails when routed overhead p95 minus direct overhead p95 is 50 ms or
+higher; the unnormalized raw p95 difference remains in the report for auditability.
+
+The registry prices were refreshed from the live `seren-models` catalog on 2026-07-25.
+Refresh and review them before rerunning M6 after any OpenRouter price or model change.

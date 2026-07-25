@@ -29,10 +29,12 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 
 ## Status
 
-Implementation is underway. The service uses the standard Seren Rust chassis and is
-built as a **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
+The Phase 1 compatibility skeleton and live M6 OpenRouter parity/soak gate are complete
+as of 2026-07-25. The service uses the standard Seren Rust chassis and is built as a
+**thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
-verified evaluation).
+verified evaluation). Deployment, canary, and publisher cutover remain separate
+operations work in Phases 2–3.
 
 ## Service development
 
@@ -52,6 +54,7 @@ Run the chassis locally:
 ```bash
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/seren_router \
 SEREN_ROUTER_GATEWAY_KEY=local-development-only \
+SEREN_ROUTER_KEY_OPENROUTER=<from-secret-manager> \
 SEREN_ROUTER_COMBINED_PRICE_CEILING_PER_MTOK=<reviewed-combined-price-ceiling> \
 SEREN_ROUTER_HYSTERESIS_FRACTION=<reviewed-fraction> \
 SEREN_ROUTER_MAX_SHARE=<reviewed-fraction> \
@@ -64,6 +67,9 @@ curl http://127.0.0.1:8000/readyz
 `SEREN_ROUTER_GATEWAY_KEY`, `DATABASE_URL`, and the four routing-policy variables shown
 above are required. The router deliberately has no unreviewed production defaults for
 the price ceiling, hysteresis, provider max share, or rolling share-window size.
+`SEREN_ROUTER_KEY_OPENROUTER` is also required while the checked-in OpenRouter fallback
+provider is enabled; inject it from the deployment secret manager and never store it in
+the registry or rendered configuration.
 Startup connects to
 PostgreSQL and applies embedded migrations before the HTTP listener binds; `/readyz`
 continues checking that pool. The sidecar URL defaults to `http://127.0.0.1:4000`, and
@@ -89,6 +95,10 @@ startup from enabled provider mappings and report exact per-token prices as deci
 strings. Endpoint responses expose registry metadata only; they never expose provider
 URLs or secret names. The key and credit responses are fixed compatibility metadata
 because account billing remains owned by the Gateway.
+
+The paid OpenRouter parity and 100-request soak gates are manual and opt-in. Their
+credential, explicit spend ceiling, commands, metrics, and cleanup contract are
+documented in [`tests/functional/README.md`](tests/functional/README.md).
 
 ## Pinned agentgateway sidecar
 

@@ -70,7 +70,10 @@ jobs:
         run: cargo test
 
       - name: Validate compiled sidecar config
-        run: >-
-          cargo test --test sidecar_config_validation
-          compiled_config_validates_with_pinned_sidecar
-          -- --ignored --exact
+        run: |
+          cargo test --test sidecar_config_validation \
+            compiled_config_validates_with_pinned_sidecar \
+            -- --ignored --exact
+          cargo test --test sidecar_config_validation \
+            production_registry_validates_with_pinned_sidecar \
+            -- --ignored --exact
