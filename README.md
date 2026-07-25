@@ -59,8 +59,13 @@ curl http://127.0.0.1:8000/readyz
 \`registry/providers.yaml\`; override them with \`SEREN_ROUTER_SIDECAR_URL\` and
 \`SEREN_ROUTER_REGISTRY_PATH\`.
 
-The protected route registry has the Gateway-facing static bearer boundary but
-exposes no handlers until the compatibility-layer milestone adds inference routes.
+The protected route registry exposes the initial streaming compatibility paths:
+
+- `POST /api/v1/chat/completions`
+- `POST /api/v1/completions`
+
+Both require `Authorization: Bearer <SEREN_ROUTER_GATEWAY_KEY>` and stream the
+configured sidecar response without buffering.
 
 ## Pinned agentgateway sidecar
 
