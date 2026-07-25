@@ -36,6 +36,27 @@ pub enum PriceTableError {
         provider_id: String,
         canonical_slug: String,
     },
+    #[error("negative {price_side} price for provider {provider_id} and model {canonical_slug}")]
+    NegativePrice {
+        provider_id: String,
+        canonical_slug: String,
+        price_side: PriceSide,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriceSide {
+    Input,
+    Output,
+}
+
+impl std::fmt::Display for PriceSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input => formatter.write_str("input"),
+            Self::Output => formatter.write_str("output"),
+        }
+    }
 }
 
 impl PriceTable {
@@ -57,6 +78,19 @@ impl PriceTable {
                 .or_insert_with(|| HashMap::with_capacity(provider.models.len()));
 
             for model in &provider.models {
+                for (price_side, price) in [
+                    (PriceSide::Input, model.input_price_per_mtok),
+                    (PriceSide::Output, model.output_price_per_mtok),
+                ] {
+                    if price < Decimal::ZERO {
+                        return Err(PriceTableError::NegativePrice {
+                            provider_id: provider.id.clone(),
+                            canonical_slug: model.slug.clone(),
+                            price_side,
+                        });
+                    }
+                }
+
                 let model_prices = ModelPrices {
                     input_price_per_mtok: model.input_price_per_mtok,
                     output_price_per_mtok: model.output_price_per_mtok,
@@ -156,6 +190,27 @@ providers:
                 canonical_slug: "canonical/model".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn negative_input_or_output_price_is_rejected() {
+        for (price_side, input_price, output_price) in [
+            (PriceSide::Input, "-0.01", "0"),
+            (PriceSide::Output, "0", "-0.01"),
+        ] {
+            let mut registry: Registry = serde_yaml::from_str(PRICE_REGISTRY).unwrap();
+            registry.providers[0].models[0].input_price_per_mtok = input_price.parse().unwrap();
+            registry.providers[0].models[0].output_price_per_mtok = output_price.parse().unwrap();
+
+            assert_eq!(
+                PriceTable::from_registry(&registry),
+                Err(PriceTableError::NegativePrice {
+                    provider_id: "enabled-provider".to_owned(),
+                    canonical_slug: "canonical/model".to_owned(),
+                    price_side,
+                })
+            );
+        }
     }
 
     #[test]
