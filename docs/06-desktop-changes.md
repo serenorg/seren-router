@@ -28,10 +28,14 @@ Even in an invisible swap, the desktop client has one real dependency on OpenRou
 ## 4. The one feature: Fastest / Balanced / Cheapest toggle
 
 - **New control** near the model picker (e.g. in `ModelSelector.tsx` or the composer).
-- **Thread the chosen `sort`** through:
+- **Thread the chosen routing preference** through:
   - `UserCapabilities` (`src-tauri/src/orchestrator/types.rs`)
   - the `chat/completions` request body in `src-tauri/src/orchestrator/chat_model_worker.rs`
-  - → seren-router, which honors `sort: price | throughput | latency`.
+  - → the nested `provider.sort` field, which seren-router honors for
+    `price | throughput | latency`.
+- Specify the server-side Balanced wire value before implementing the toggle. Omitting
+  `provider.sort` already selects Seren's Fastest default, while OpenRouter uses the
+  omission for its own balanced algorithm.
 - The `:nitro` / `:floor` slug suffixes work with **zero client change** as the power-user path.
 
 ## Footprint summary
