@@ -469,12 +469,19 @@ async fn functional_streaming() {
             })
             .is_some_and(|content| !content.is_empty())
     }));
-    assert!(data.iter().any(|event| {
-        serde_json::from_str::<Value>(event)
-            .ok()
-            .and_then(|value| value["usage"]["prompt_tokens"].as_u64())
-            .is_some_and(|tokens| tokens > 0)
-    }));
+    let usage_event = data
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(event).ok())
+        .find(|value| {
+            value["choices"]
+                .as_array()
+                .is_some_and(|choices| choices.is_empty())
+                && value["usage"]["prompt_tokens"]
+                    .as_u64()
+                    .is_some_and(|tokens| tokens > 0)
+        })
+        .expect("stream must contain a terminal usage event");
+    assert_local_usage_cost(&usage_event);
     assert_eq!(data.last(), Some(&"[DONE]"));
 
     harness.shutdown_and_assert_clean().await;
@@ -544,7 +551,7 @@ fn assert_local_usage_cost(body: &Value) {
     );
     let actual: Decimal = body["usage"]["cost"]
         .as_number()
-        .expect("non-streaming usage.cost must be a JSON number")
+        .expect("usage.cost must be a JSON number")
         .to_string()
         .parse()
         .unwrap();

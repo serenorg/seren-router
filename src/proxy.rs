@@ -1,8 +1,6 @@
 // ABOUTME: Proxies authenticated completion requests through the agentgateway sidecar.
-// ABOUTME: Adds exact provider cost to non-streaming JSON while preserving SSE byte streams.
+// ABOUTME: Adds exact provider cost to non-streaming JSON and terminal SSE usage events.
 
-use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::Json;
@@ -10,13 +8,15 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
+use futures::{Stream, StreamExt, stream};
 use reqwest::{Client, Url};
 use serde::Deserialize;
-use serde_json::{Number, Value};
 use thiserror::Error;
 
 use crate::attribution::ServedProvider;
-use crate::pricing::{PriceTable, Usage, cost_usd};
+use crate::pricing::PriceTable;
+use crate::sse::UsageCostTransformer;
+use crate::usage_cost::{inject_usage_cost, prices_for_request};
 
 const CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
 const LEGACY_COMPLETIONS_PATH: &str = "v1/completions";
@@ -107,6 +107,11 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
 
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let is_event_stream = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim() == "text/event-stream");
     let served_provider = ServedProvider::from_headers(response.headers());
     if status.is_success() && served_provider.is_none() {
         tracing::warn!(
@@ -115,13 +120,43 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
         );
     }
 
-    if request.stream || !status.is_success() {
+    if !status.is_success() {
         return downstream_response(
             status,
             content_type,
             Body::from_stream(response.bytes_stream()),
             served_provider,
         );
+    }
+
+    if request.stream {
+        let body = match (is_event_stream, &request.model, &served_provider) {
+            (false, _, _) => Body::from_stream(response.bytes_stream()),
+            (true, Some(requested_model), Some(served_provider)) => {
+                match prices_for_request(requested_model, served_provider, &proxy.price_table) {
+                    Ok(prices) => Body::from_stream(stream_with_usage_cost(
+                        response.bytes_stream(),
+                        UsageCostTransformer::new(prices.clone()),
+                    )),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            requested_model,
+                            served_provider = served_provider.as_str(),
+                            "streaming response cost was omitted"
+                        );
+                        Body::from_stream(response.bytes_stream())
+                    }
+                }
+            }
+            (true, None, _) => {
+                tracing::warn!("streaming response cost was omitted: request model is missing");
+                Body::from_stream(response.bytes_stream())
+            }
+            (true, _, None) => Body::from_stream(response.bytes_stream()),
+        };
+
+        return downstream_response(status, content_type, body, served_provider);
     }
 
     let upstream_body = match response.bytes().await {
@@ -191,65 +226,44 @@ fn downstream_response(
     downstream
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CostOmission {
-    InvalidJson,
-    MissingUsage,
-    InvalidUsage,
-    UnknownPrice,
-}
-
-impl fmt::Display for CostOmission {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidJson => formatter.write_str("response is not valid JSON"),
-            Self::MissingUsage => formatter.write_str("response usage object is missing"),
-            Self::InvalidUsage => formatter.write_str("response token usage is invalid"),
-            Self::UnknownPrice => formatter.write_str("provider/model price is unknown"),
-        }
-    }
-}
-
-fn inject_usage_cost(
-    body: &[u8],
-    requested_model: &str,
-    served_provider: &ServedProvider,
-    price_table: &PriceTable,
-) -> Result<Vec<u8>, CostOmission> {
-    let mut response: Value =
-        serde_json::from_slice(body).map_err(|_| CostOmission::InvalidJson)?;
-    let usage = response
-        .get_mut("usage")
-        .and_then(Value::as_object_mut)
-        .ok_or(CostOmission::MissingUsage)?;
-    let token_usage = Usage {
-        prompt_tokens: usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .ok_or(CostOmission::InvalidUsage)?,
-        completion_tokens: usage
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .ok_or(CostOmission::InvalidUsage)?,
-    };
-    let canonical_slug = canonical_slug(requested_model, served_provider.as_str());
-    let prices = price_table
-        .get(served_provider.as_str(), canonical_slug)
-        .ok_or(CostOmission::UnknownPrice)?;
-    let cost = cost_usd(prices, &token_usage);
-    let cost_number =
-        Number::from_str(&cost.to_string()).expect("Decimal always serializes as a JSON number");
-    usage.insert("cost".to_owned(), Value::Number(cost_number));
-
-    serde_json::to_vec(&response).map_err(|_| CostOmission::InvalidJson)
-}
-
-fn canonical_slug<'a>(requested_model: &'a str, served_provider: &str) -> &'a str {
-    requested_model
-        .strip_prefix(served_provider)
-        .and_then(|suffix| suffix.strip_prefix('/'))
-        .filter(|slug| !slug.is_empty())
-        .unwrap_or(requested_model)
+fn stream_with_usage_cost<S>(
+    input: S,
+    transformer: UsageCostTransformer,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    stream::unfold(
+        (Box::pin(input), Some(transformer)),
+        |(mut input, mut transformer)| async move {
+            transformer.as_ref()?;
+            loop {
+                match input.next().await {
+                    Some(Ok(chunk)) => {
+                        let current = transformer
+                            .take()
+                            .expect("transformer is present until the source ends");
+                        let (next, output) = current.transform(&chunk);
+                        transformer = Some(next);
+                        if !output.is_empty() {
+                            return Some((Ok(Bytes::from(output)), (input, transformer)));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        return Some((Err(error), (input, None)));
+                    }
+                    None => {
+                        let output = transformer
+                            .take()
+                            .expect("transformer is present until the source ends")
+                            .finish();
+                        return (!output.is_empty())
+                            .then(|| (Ok(Bytes::from(output)), (input, None)));
+                    }
+                }
+            }
+        },
+    )
 }
 
 fn upstream_unavailable() -> Response {
@@ -267,9 +281,11 @@ fn upstream_unavailable() -> Response {
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
+    use serde_json::Value;
 
     use super::*;
     use crate::registry::{ModelMapping, Provider, Registry};
+    use crate::usage_cost::CostOmission;
 
     #[test]
     fn real_non_streaming_response_gains_exact_usage_cost() {
