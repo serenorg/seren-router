@@ -6,17 +6,18 @@
 use axum::Router;
 use axum::routing::get;
 
+use crate::gateway_auth::{self, GatewayAuth};
 use crate::server::{inference_route_policies, standard_route_policies};
 
 pub fn public_router() -> Router {
     standard_route_policies(Router::new().route("/", get(hello)))
 }
 
-pub fn protected_router() -> Router {
+pub fn protected_router(auth: GatewayAuth) -> Router {
     // M2 registers inference endpoints here and layers static Gateway bearer
     // authentication over this shared builder. An empty router exposes nothing
     // before that authentication boundary exists.
-    inference_route_policies(Router::new())
+    gateway_auth::protect(inference_route_policies(Router::new()), auth)
 }
 
 async fn hello() -> &'static str {

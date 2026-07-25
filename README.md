@@ -49,13 +49,18 @@ cargo test --features production
 Run the chassis locally:
 
 ```bash
-cargo run --features production
+SEREN_ROUTER_GATEWAY_KEY=local-development-only cargo run --features production
 curl http://127.0.0.1:8000/readyz
 # {"status":"ok"}
 ```
 
-The protected route registry exposes no handlers until the compatibility-layer
-milestone adds the Gateway-facing static bearer authentication.
+\`SEREN_ROUTER_GATEWAY_KEY\` is required. The sidecar URL defaults to
+\`http://127.0.0.1:4000\`, and the provider registry path defaults to
+\`registry/providers.yaml\`; override them with \`SEREN_ROUTER_SIDECAR_URL\` and
+\`SEREN_ROUTER_REGISTRY_PATH\`.
+
+The protected route registry has the Gateway-facing static bearer boundary but
+exposes no handlers until the compatibility-layer milestone adds inference routes.
 
 ## Pinned agentgateway sidecar
 
