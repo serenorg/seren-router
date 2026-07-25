@@ -25,7 +25,8 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/07-infra-and-risks.md`](docs/07-infra-and-risks.md) | Repo, infrastructure, and honest risk register |
 | [`docs/08-implementation-plan.md`](docs/08-implementation-plan.md) | Phased implementation plan |
 | [`docs/09-agentgateway-evaluation.md`](docs/09-agentgateway-evaluation.md) | DECIDED: built on agentgateway (Linux Foundation, Rust, Apache-2.0) — verified by source inspection + live functional test |
-| [`docs/plans/20260724_plan_seren_router_build.md`](docs/plans/20260724_plan_seren_router_build.md) | The build plan: zero-context, task-by-task implementation guide (M0–M6) with tests and commit points |
+| [`docs/10-deployment.md`](docs/10-deployment.md) | Validated two-container pod boundary, image pin, probes, and local production smoke |
+| [`docs/plans/20260724_plan_seren_router_build.md`](docs/plans/20260724_plan_seren_router_build.md) | The build plan: zero-context, task-by-task implementation guide (M0–M7) with tests and commit points |
 
 ## Status
 
@@ -34,7 +35,8 @@ as of 2026-07-25. The service uses the standard Seren Rust chassis and is built 
 **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
 verified evaluation). Deployment, canary, and publisher cutover remain separate
-operations work in Phases 2–3.
+operations work in Phases 2–3. The repository-owned two-container packaging and local
+production smoke are complete; no production environment has been selected or changed.
 
 ## Service development
 
@@ -52,9 +54,16 @@ cargo test --features production
 Run the chassis locally:
 
 ```bash
+# Terminal 1: render and start the pinned sidecar.
+./scripts/fetch-sidecar.sh
+cargo run --features production -- \
+  render-sidecar-config /tmp/seren-router-agentgateway.yaml
+SEREN_ROUTER_KEY_OPENROUTER=<from-secret-manager> \
+  ./sidecar/bin/agentgateway -f /tmp/seren-router-agentgateway.yaml
+
+# Terminal 2: start the app and query composite readiness.
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/seren_router \
 SEREN_ROUTER_GATEWAY_KEY=local-development-only \
-SEREN_ROUTER_KEY_OPENROUTER=<from-secret-manager> \
 SEREN_ROUTER_COMBINED_PRICE_CEILING_PER_MTOK=<reviewed-combined-price-ceiling> \
 SEREN_ROUTER_HYSTERESIS_FRACTION=<reviewed-fraction> \
 SEREN_ROUTER_MAX_SHARE=<reviewed-fraction> \
@@ -67,14 +76,16 @@ curl http://127.0.0.1:8000/readyz
 `SEREN_ROUTER_GATEWAY_KEY`, `DATABASE_URL`, and the four routing-policy variables shown
 above are required. The router deliberately has no unreviewed production defaults for
 the price ceiling, hysteresis, provider max share, or rolling share-window size.
-`SEREN_ROUTER_KEY_OPENROUTER` is also required while the checked-in OpenRouter fallback
-provider is enabled; inject it from the deployment secret manager and never store it in
-the registry or rendered configuration.
+The AgentGateway sidecar also requires `SEREN_ROUTER_KEY_OPENROUTER` while the
+checked-in OpenRouter fallback provider is enabled; inject it from the deployment
+secret manager and never store it in the registry or rendered configuration.
 Startup connects to
 PostgreSQL and applies embedded migrations before the HTTP listener binds; `/readyz`
-continues checking that pool. The sidecar URL defaults to `http://127.0.0.1:4000`, and
-the provider registry path defaults to `registry/providers.yaml`; override them with
-`SEREN_ROUTER_SIDECAR_URL` and `SEREN_ROUTER_REGISTRY_PATH`.
+continues checking that pool and also requires AgentGateway readiness. `/livez` remains
+dependency-free. The sidecar URLs default to `http://127.0.0.1:4000` and
+`http://127.0.0.1:19001/healthz/ready`; the provider registry path defaults to
+`registry/providers.yaml`. Override them with `SEREN_ROUTER_SIDECAR_URL`,
+`SEREN_ROUTER_SIDECAR_READINESS_URL`, and `SEREN_ROUTER_REGISTRY_PATH`.
 
 The protected route registry exposes completion, generation, catalog, and compatibility
 paths:
@@ -113,6 +124,19 @@ verifies the platform-specific SHA-256 digest before replacing an installed bina
 
 The version and all supported-platform digests are reviewable in
 `sidecar/PINNED_VERSION`.
+
+Production uses the official AgentGateway image by immutable OCI index digest.
+`sidecar/PINNED_IMAGE` records the index and Linux platform manifests, and
+`./scripts/verify-sidecar-image.sh` checks them against GHCR. The app image can render
+the mounted registry for an init container without any runtime secrets:
+
+```bash
+SEREN_ROUTER_REGISTRY_PATH=registry/providers.yaml \
+  ./target/release/seren-router render-sidecar-config /config/agentgateway.yaml
+```
+
+The cluster-neutral pod boundary and local container smoke are documented in
+[`docs/10-deployment.md`](docs/10-deployment.md).
 
 ## Copyright
 

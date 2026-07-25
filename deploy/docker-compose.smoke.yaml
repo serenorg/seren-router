@@ -1,0 +1,65 @@
+# ABOUTME: Proves the production image, renderer, official sidecar, and database compose.
+# ABOUTME: Shares a network namespace to match the required Kubernetes pod boundary.
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: seren_router
+      POSTGRES_PASSWORD: deployment-smoke-only
+      POSTGRES_USER: seren_router
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seren_router -d seren_router"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  render-sidecar-config:
+    image: ${SEREN_ROUTER_SMOKE_IMAGE:?SEREN_ROUTER_SMOKE_IMAGE is required}
+    entrypoint: ["/app/seren-router"]
+    command: ["render-sidecar-config", "/config/agentgateway.yaml"]
+    environment:
+      SEREN_ROUTER_REGISTRY_PATH: /app/registry/providers.yaml
+    volumes:
+      - type: bind
+        source: ${SEREN_ROUTER_SMOKE_CONFIG_DIR:?SEREN_ROUTER_SMOKE_CONFIG_DIR is required}
+        target: /config
+
+  agentgateway:
+    image: ${SEREN_ROUTER_SIDECAR_IMAGE:?SEREN_ROUTER_SIDECAR_IMAGE is required}
+    command: ["-f", "/config/agentgateway.yaml"]
+    depends_on:
+      render-sidecar-config:
+        condition: service_completed_successfully
+    environment:
+      SEREN_ROUTER_KEY_OPENROUTER: deployment-smoke-only
+    ports:
+      - target: 8000
+        published: 0
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${SEREN_ROUTER_SMOKE_CONFIG_DIR:?SEREN_ROUTER_SMOKE_CONFIG_DIR is required}
+        target: /config
+        read_only: true
+
+  seren-router:
+    image: ${SEREN_ROUTER_SMOKE_IMAGE:?SEREN_ROUTER_SMOKE_IMAGE is required}
+    network_mode: service:agentgateway
+    depends_on:
+      agentgateway:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://seren_router:deployment-smoke-only@postgres:5432/seren_router
+      RUST_LOG: seren_router=info
+      SEREN_ROUTER_COMBINED_PRICE_CEILING_PER_MTOK: "1000"
+      SEREN_ROUTER_GATEWAY_KEY: deployment-smoke-only
+      SEREN_ROUTER_HYSTERESIS_FRACTION: "0.1"
+      SEREN_ROUTER_MAX_SHARE: "1"
+      SEREN_ROUTER_REGISTRY_PATH: /app/registry/providers.yaml
+      SEREN_ROUTER_SHARE_WINDOW: "100"
+      SEREN_ROUTER_SIDECAR_READINESS_URL: http://127.0.0.1:19001/healthz/ready
+      SEREN_ROUTER_SIDECAR_URL: http://127.0.0.1:4000

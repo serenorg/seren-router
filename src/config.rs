@@ -4,15 +4,18 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use reqwest::Url;
 use rust_decimal::Decimal;
 use thiserror::Error;
 
 use crate::policy::select::{PolicyConfig, PolicyConfigError, ShareTracker, ShareTrackerError};
 
 const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:4000";
+const DEFAULT_SIDECAR_READINESS_URL: &str = "http://127.0.0.1:19001/healthz/ready";
 const DEFAULT_REGISTRY_PATH: &str = "registry/providers.yaml";
 const GATEWAY_KEY_ENV: &str = "SEREN_ROUTER_GATEWAY_KEY";
 const REGISTRY_PATH_ENV: &str = "SEREN_ROUTER_REGISTRY_PATH";
+const SIDECAR_READINESS_URL_ENV: &str = "SEREN_ROUTER_SIDECAR_READINESS_URL";
 const SIDECAR_URL_ENV: &str = "SEREN_ROUTER_SIDECAR_URL";
 const PRICE_CEILING_ENV: &str = "SEREN_ROUTER_COMBINED_PRICE_CEILING_PER_MTOK";
 const HYSTERESIS_ENV: &str = "SEREN_ROUTER_HYSTERESIS_FRACTION";
@@ -21,6 +24,7 @@ const SHARE_WINDOW_ENV: &str = "SEREN_ROUTER_SHARE_WINDOW";
 
 pub struct RouterConfig {
     sidecar_url: String,
+    sidecar_readiness_url: Url,
     gateway_key: String,
     registry_path: PathBuf,
     routing: RoutingConfig,
@@ -30,7 +34,11 @@ impl RouterConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let gateway_key = required_env(GATEWAY_KEY_ENV)?;
         let sidecar_url = optional_env(SIDECAR_URL_ENV, DEFAULT_SIDECAR_URL)?;
-        let registry_path = optional_env(REGISTRY_PATH_ENV, DEFAULT_REGISTRY_PATH)?;
+        let sidecar_readiness_url = parse_http_url(
+            SIDECAR_READINESS_URL_ENV,
+            &optional_env(SIDECAR_READINESS_URL_ENV, DEFAULT_SIDECAR_READINESS_URL)?,
+        )?;
+        let registry_path = registry_path_from_env()?;
         let price_ceiling = required_parsed_env(PRICE_CEILING_ENV)?;
         let hysteresis = required_parsed_env(HYSTERESIS_ENV)?;
         let max_share = required_parsed_env(MAX_SHARE_ENV)?;
@@ -61,22 +69,21 @@ impl RouterConfig {
                 name: SIDECAR_URL_ENV,
             });
         }
-        if registry_path.trim().is_empty() {
-            return Err(ConfigError::Empty {
-                name: REGISTRY_PATH_ENV,
-            });
-        }
-
         Ok(Self {
             sidecar_url: sidecar_url.trim().to_owned(),
+            sidecar_readiness_url,
             gateway_key,
-            registry_path: PathBuf::from(registry_path.trim()),
+            registry_path,
             routing,
         })
     }
 
     pub fn sidecar_url(&self) -> &str {
         &self.sidecar_url
+    }
+
+    pub fn sidecar_readiness_url(&self) -> &Url {
+        &self.sidecar_readiness_url
     }
 
     pub fn gateway_key(&self) -> &[u8] {
@@ -90,6 +97,16 @@ impl RouterConfig {
     pub fn routing(&self) -> RoutingConfig {
         self.routing
     }
+}
+
+pub fn registry_path_from_env() -> Result<PathBuf, ConfigError> {
+    let registry_path = optional_env(REGISTRY_PATH_ENV, DEFAULT_REGISTRY_PATH)?;
+    if registry_path.trim().is_empty() {
+        return Err(ConfigError::Empty {
+            name: REGISTRY_PATH_ENV,
+        });
+    }
+    Ok(PathBuf::from(registry_path.trim()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +190,23 @@ where
         .map_err(|_| ConfigError::Invalid { name })
 }
 
+fn parse_http_url(name: &'static str, value: &str) -> Result<Url, ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Empty { name });
+    }
+    let url = Url::parse(value.trim()).map_err(|_| ConfigError::Invalid { name })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::Invalid { name });
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +237,29 @@ mod tests {
                 ShareTrackerError::ZeroCapacity
             ))
         ));
+    }
+
+    #[test]
+    fn sidecar_readiness_url_requires_plain_http_endpoint_without_credentials() {
+        assert!(
+            parse_http_url(
+                SIDECAR_READINESS_URL_ENV,
+                "http://127.0.0.1:19001/healthz/ready"
+            )
+            .is_ok()
+        );
+        for invalid in [
+            "",
+            "not-a-url",
+            "file:///tmp/ready",
+            "http://user:secret@127.0.0.1/ready",
+            "http://127.0.0.1/ready?token=secret",
+            "http://127.0.0.1/ready#fragment",
+        ] {
+            assert!(matches!(
+                parse_http_url(SIDECAR_READINESS_URL_ENV, invalid),
+                Err(ConfigError::Empty { .. } | ConfigError::Invalid { .. })
+            ));
+        }
     }
 }

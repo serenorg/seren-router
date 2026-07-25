@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/seren-router /app/seren-router
+COPY registry ./registry
 
 RUN useradd -r -s /bin/false appuser
 USER appuser

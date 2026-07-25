@@ -57,6 +57,10 @@ Teardown stops the router and sidecar, waits for the child, removes artifacts, a
 verifies that all runtime ports can be rebound. The deliberately dead provider also
 uses an OS-assigned unused port.
 
+The composite-readiness gate does not need a loaded model. It stops the real pinned
+sidecar, requires `/readyz` to return 503 with reason `sidecar`, and confirms
+dependency-free `/livez` remains 200.
+
 The routing tests register the same real model server as both a cheap `local` provider
 and an expensive `expensive` provider. Their fake registry prices let the harness prove
 strict price sorting and the default price ceiling without requiring a second model
