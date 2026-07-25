@@ -4,8 +4,13 @@ ABOUTME: Makes clear that these tests use real processes and never network mocks
 # Live functional tests
 
 These ignored tests run the real Rust router, the pinned stock agentgateway binary, and
-a real OpenAI-compatible model server. Ordinary `cargo test` runs do not need a model
-server.
+a real OpenAI-compatible model server against a disposable PostgreSQL 17 database.
+Ordinary `cargo test` runs need PostgreSQL for the ledger integration test but do not
+need a model server.
+
+Set `DATABASE_URL` to a disposable PostgreSQL 17 database before running either live
+walkthrough. The harness applies the repository migrations but deliberately does not
+truncate or delete caller-owned rows, so never point it at production.
 
 ## LM Studio
 
@@ -15,6 +20,7 @@ Install and start LM Studio, then load a small chat model with a stable API iden
 lms server start --port 1234 --bind 127.0.0.1
 lms load <model-key> --identifier seren-functional -y
 ./scripts/fetch-sidecar.sh
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/seren_router_functional \
 SEREN_TEST_MODEL=seren-functional \
   cargo test --test functional -- --ignored --test-threads=1
 ```
@@ -37,6 +43,7 @@ its `/v1` endpoint:
 ollama serve
 ollama pull <model>
 ./scripts/fetch-sidecar.sh
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/seren_router_functional \
 SEREN_TEST_UPSTREAM_URL=http://127.0.0.1:11434/v1 \
 SEREN_TEST_MODEL=<model> \
   cargo test --test functional -- --ignored --test-threads=1

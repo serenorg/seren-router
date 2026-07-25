@@ -17,7 +17,7 @@ tower-http = { version = "0.7", features = [
 ] }
 
 # Database
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "json", "tls-rustls", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "json", "rust_decimal", "tls-rustls", "migrate"] }
 jiff-sqlx = { version = "0.2", features = ["postgres"] }
 
 # HTTP client (rustls to avoid a system OpenSSL dependency, matching the sqlx tls-rustls backend)

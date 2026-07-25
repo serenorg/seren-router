@@ -7,6 +7,7 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use crate::gateway_auth::{self, GatewayAuth};
+use crate::ledger::{self, Ledger};
 use crate::proxy::{self, ProxyState};
 use crate::server::{inference_route_policies, standard_route_policies};
 
@@ -14,13 +15,17 @@ pub fn public_router() -> Router {
     standard_route_policies(Router::new().route("/", get(hello)))
 }
 
-pub fn protected_router(auth: GatewayAuth, proxy_state: ProxyState) -> Router {
-    let router = Router::new()
+pub fn protected_router(auth: GatewayAuth, proxy_state: ProxyState, ledger: Ledger) -> Router {
+    let inference = Router::new()
         .route("/api/v1/chat/completions", post(proxy::chat_completions))
         .route("/api/v1/completions", post(proxy::legacy_completions))
         .with_state(proxy_state);
+    let generation = Router::new()
+        .route("/api/v1/generation", get(ledger::get_generation))
+        .with_state(ledger);
+    let router = inference_route_policies(inference).merge(standard_route_policies(generation));
 
-    gateway_auth::protect(inference_route_policies(router), auth)
+    gateway_auth::protect(router, auth)
 }
 
 async fn hello() -> &'static str {

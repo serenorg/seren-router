@@ -4,11 +4,12 @@
 use serde_json::Value;
 
 use crate::pricing::ModelPrices;
-use crate::usage_cost::inject_usage_cost_value;
+use crate::usage_cost::{CostedUsage, inject_usage_cost_value};
 
 pub(crate) struct UsageCostTransformer {
     pending: Vec<u8>,
     prices: ModelPrices,
+    costed_usage: Option<CostedUsage>,
 }
 
 impl UsageCostTransformer {
@@ -16,56 +17,73 @@ impl UsageCostTransformer {
         Self {
             pending: Vec::new(),
             prices,
+            costed_usage: None,
         }
     }
 
-    pub(crate) fn transform(mut self, bytes: &[u8]) -> (Self, Vec<u8>) {
+    pub(crate) fn transform(mut self, bytes: &[u8]) -> (Self, Vec<u8>, Option<CostedUsage>) {
         self.pending.extend_from_slice(bytes);
         let mut output = Vec::with_capacity(self.pending.len());
+        let mut completed = None;
 
         while let Some(event_end) = next_event_end(&self.pending) {
             let event: Vec<_> = self.pending.drain(..event_end).collect();
-            output.extend_from_slice(&self.transform_event(&event));
+            let (transformed, event_completion) = self.transform_event(&event);
+            output.extend_from_slice(&transformed);
+            if event_completion.is_some() {
+                completed = event_completion;
+            }
         }
 
-        (self, output)
+        (self, output, completed)
     }
 
-    pub(crate) fn finish(self) -> Vec<u8> {
-        self.pending
+    pub(crate) fn finish(mut self) -> (Vec<u8>, Option<CostedUsage>) {
+        let final_line = self
+            .pending
+            .strip_suffix(b"\r\n")
+            .or_else(|| self.pending.strip_suffix(b"\n"))
+            .unwrap_or(&self.pending);
+        let completed = single_data_line(final_line)
+            .filter(|(_, data)| *data == b"[DONE]")
+            .and_then(|_| self.costed_usage.take());
+
+        (self.pending, completed)
     }
 
-    fn transform_event(&self, event: &[u8]) -> Vec<u8> {
+    fn transform_event(&mut self, event: &[u8]) -> (Vec<u8>, Option<CostedUsage>) {
         let (body, separator) = split_separator(event);
         let Some((data_prefix, data)) = single_data_line(body) else {
-            return event.to_vec();
+            return (event.to_vec(), None);
         };
         if data == b"[DONE]" {
-            return event.to_vec();
+            return (event.to_vec(), self.costed_usage.take());
         }
 
         let Ok(mut value) = serde_json::from_slice::<Value>(data) else {
-            return event.to_vec();
+            return (event.to_vec(), None);
         };
         if !value
             .get("choices")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty)
         {
-            return event.to_vec();
+            return (event.to_vec(), None);
         }
-        if inject_usage_cost_value(&mut value, &self.prices).is_err() {
-            return event.to_vec();
-        }
+        let Ok(costed_usage) = inject_usage_cost_value(&mut value, &self.prices) else {
+            return (event.to_vec(), None);
+        };
+        self.costed_usage = Some(costed_usage);
 
         let Ok(json) = serde_json::to_vec(&value) else {
-            return event.to_vec();
+            self.costed_usage = None;
+            return (event.to_vec(), None);
         };
         let mut transformed = Vec::with_capacity(data_prefix.len() + json.len() + separator.len());
         transformed.extend_from_slice(data_prefix);
         transformed.extend_from_slice(&json);
         transformed.extend_from_slice(separator);
-        transformed
+        (transformed, None)
     }
 }
 
@@ -116,43 +134,75 @@ mod tests {
     fn real_session_is_transformed_across_every_boundary() {
         let input = include_bytes!("../tests/fixtures/streaming_chat_response.sse");
         let expected = include_bytes!("../tests/golden/streaming_chat_cost.sse");
-        assert_every_boundary(input, expected);
+        let expected_usage = Some(test_usage());
+        assert_every_boundary(input, expected, expected_usage.clone());
 
         let crlf_input = String::from_utf8_lossy(input).replace('\n', "\r\n");
         let crlf_expected = String::from_utf8_lossy(expected).replace('\n', "\r\n");
-        assert_every_boundary(crlf_input.as_bytes(), crlf_expected.as_bytes());
+        assert_every_boundary(
+            crlf_input.as_bytes(),
+            crlf_expected.as_bytes(),
+            expected_usage,
+        );
 
         let malformed =
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"invalid\"}}\n\ndata: [DONE]\n\n";
-        assert_every_boundary(malformed, malformed);
+        assert_every_boundary(malformed, malformed, None);
     }
 
-    fn assert_every_boundary(input: &[u8], expected: &[u8]) {
+    fn assert_every_boundary(input: &[u8], expected: &[u8], expected_usage: Option<CostedUsage>) {
         for split in 0..=input.len() {
             let transformer = UsageCostTransformer::new(test_prices());
-            let (transformer, first) = transformer.transform(&input[..split]);
-            let (transformer, second) = transformer.transform(&input[split..]);
+            let (transformer, first, first_usage) = transformer.transform(&input[..split]);
+            let (transformer, second, second_usage) = transformer.transform(&input[split..]);
             let mut output = first;
             output.extend_from_slice(&second);
-            output.extend_from_slice(&transformer.finish());
+            let (remainder, final_usage) = transformer.finish();
+            output.extend_from_slice(&remainder);
             assert_eq!(output, expected, "split at byte {split}");
+            assert_eq!(
+                first_usage.or(second_usage).or(final_usage),
+                expected_usage,
+                "completion metadata at byte {split}"
+            );
         }
 
         let mut transformer = UsageCostTransformer::new(test_prices());
         let mut output = Vec::new();
+        let mut completed = None;
         for byte in input {
-            let (next, transformed) = transformer.transform(std::slice::from_ref(byte));
+            let (next, transformed, usage) = transformer.transform(std::slice::from_ref(byte));
             transformer = next;
             output.extend_from_slice(&transformed);
+            if usage.is_some() {
+                completed = usage;
+            }
         }
-        output.extend_from_slice(&transformer.finish());
+        let (remainder, final_usage) = transformer.finish();
+        output.extend_from_slice(&remainder);
         assert_eq!(output, expected, "one-byte chunks");
+        assert_eq!(
+            completed.or(final_usage),
+            expected_usage,
+            "one-byte completion metadata"
+        );
     }
 
     fn test_prices() -> ModelPrices {
         ModelPrices {
             input_price_per_mtok: Decimal::new(40, 2),
             output_price_per_mtok: Decimal::new(80, 2),
+        }
+    }
+
+    fn test_usage() -> CostedUsage {
+        CostedUsage {
+            response_id: Some("chatcmpl-olxkqmuioetwzpcvhdrkm".to_owned()),
+            usage: crate::pricing::Usage {
+                prompt_tokens: 16,
+                completion_tokens: 3,
+            },
+            cost_usd: "0.0000088000".parse().unwrap(),
         }
     }
 }
