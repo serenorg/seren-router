@@ -2,22 +2,29 @@
 // ABOUTME: Makes health eviction mandatory for every generated provider route.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::registry::{ModelMapping, Provider, Registry, RegistryValidationError};
 
-const READINESS_ADDR: &str = "127.0.0.1:19001";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SidecarConfigOptions {
     pub llm_port: u16,
+    pub admin_addr: Option<SocketAddr>,
+    pub stats_addr: Option<SocketAddr>,
+    pub readiness_addr: SocketAddr,
 }
 
 impl Default for SidecarConfigOptions {
     fn default() -> Self {
-        Self { llm_port: 4000 }
+        Self {
+            llm_port: 4000,
+            admin_addr: None,
+            stats_addr: None,
+            readiness_addr: SocketAddr::from(([127, 0, 0, 1], 19001)),
+        }
     }
 }
 
@@ -82,7 +89,9 @@ fn build_config(
 
     Ok(AgentGatewayConfig {
         config: RuntimeConfig {
-            readiness_addr: READINESS_ADDR,
+            admin_addr: options.admin_addr,
+            stats_addr: options.stats_addr,
+            readiness_addr: options.readiness_addr,
         },
         llm: LlmConfig {
             port: options.llm_port,
@@ -101,7 +110,11 @@ struct AgentGatewayConfig {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeConfig {
-    readiness_addr: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admin_addr: Option<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats_addr: Option<SocketAddr>,
+    readiness_addr: SocketAddr,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,6 +215,23 @@ mod tests {
             std::str::from_utf8(&yaml).unwrap(),
             include_str!("../tests/golden/sidecar_config_basic.yaml")
         );
+    }
+
+    #[test]
+    fn management_addresses_can_be_isolated_for_functional_runs() {
+        let options = SidecarConfigOptions {
+            llm_port: 41001,
+            admin_addr: Some(SocketAddr::from(([127, 0, 0, 1], 41002))),
+            stats_addr: Some(SocketAddr::from(([127, 0, 0, 1], 41003))),
+            readiness_addr: SocketAddr::from(([127, 0, 0, 1], 41004)),
+        };
+        let yaml = compile(&fixture_registry(), options).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_slice(&yaml).unwrap();
+
+        assert_eq!(config["llm"]["port"], 41001);
+        assert_eq!(config["config"]["adminAddr"], "127.0.0.1:41002");
+        assert_eq!(config["config"]["statsAddr"], "127.0.0.1:41003");
+        assert_eq!(config["config"]["readinessAddr"], "127.0.0.1:41004");
     }
 
     #[test]
