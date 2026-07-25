@@ -263,6 +263,17 @@ impl FunctionalHarness {
             .unwrap()
     }
 
+    async fn unauthenticated_generation(&self) -> Response {
+        self.client
+            .get(format!(
+                "{}/api/v1/generation?id=unknown",
+                self.router_base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn sidecar_chat(&self, model: &str) -> Response {
         self.client
             .post(format!("{}/v1/chat/completions", self.sidecar_base_url))
@@ -538,6 +549,10 @@ async fn functional_auth_rejected() {
         json!({"error": {"message": "unauthorized"}})
     );
     assert_eq!(harness.sidecar_request_count(), 0);
+    assert_eq!(
+        harness.unauthenticated_generation().await.status(),
+        StatusCode::UNAUTHORIZED
+    );
 
     harness.shutdown_and_assert_clean().await;
 }
