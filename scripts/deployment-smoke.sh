@@ -9,7 +9,7 @@ die() {
     exit 1
 }
 
-for tool in awk chmod curl docker mktemp rg rm sleep; do
+for tool in awk chmod curl docker grep mktemp rm sleep; do
     command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
 docker compose version >/dev/null 2>&1 || die "docker compose is required"
@@ -87,13 +87,13 @@ fi
 
 curl --fail --silent --max-time 3 "http://${published}/livez" >/dev/null
 metrics="$(curl --fail --silent --max-time 3 "http://${published}/metrics")"
-rg -q '^seren_router_' <<<"$metrics" || die "Prometheus metrics prefix is missing"
+grep -q '^seren_router_' <<<"$metrics" || die "Prometheus metrics prefix is missing"
 
 rendered="$SEREN_ROUTER_SMOKE_CONFIG_DIR/agentgateway.yaml"
 [[ -f "$rendered" ]] || die "renderer did not create AgentGateway configuration"
-rg -q '\$SEREN_ROUTER_KEY_OPENROUTER' "$rendered" \
+grep -Fq '$SEREN_ROUTER_KEY_OPENROUTER' "$rendered" \
     || die "rendered configuration omitted the provider environment reference"
-if rg -q 'deployment-smoke-only' "$rendered"; then
+if grep -Fq 'deployment-smoke-only' "$rendered"; then
     die "rendered configuration resolved a secret value"
 fi
 
