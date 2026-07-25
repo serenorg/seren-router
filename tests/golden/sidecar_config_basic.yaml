@@ -9,6 +9,9 @@ llm:
       baseUrl: http://127.0.0.1:4101/v1
       model: slow-shared
       apiKey: $SEREN_ROUTER_KEY_SLOW
+    responseHeaders:
+      set:
+        x-seren-served-provider: slow
     health:
       eviction:
         consecutiveFailures: 1
@@ -19,6 +22,9 @@ llm:
       baseUrl: http://127.0.0.1:4101/v1
       model: slow-exclusive
       apiKey: $SEREN_ROUTER_KEY_SLOW
+    responseHeaders:
+      set:
+        x-seren-served-provider: slow
     health:
       eviction:
         consecutiveFailures: 1
@@ -29,6 +35,9 @@ llm:
       baseUrl: http://127.0.0.1:4102/v1
       model: fast-shared
       apiKey: $SEREN_ROUTER_KEY_FAST
+    responseHeaders:
+      set:
+        x-seren-served-provider: fast
     health:
       eviction:
         consecutiveFailures: 1
