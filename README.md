@@ -63,15 +63,18 @@ continues checking that pool. The sidecar URL defaults to `http://127.0.0.1:4000
 the provider registry path defaults to `registry/providers.yaml`; override them with
 `SEREN_ROUTER_SIDECAR_URL` and `SEREN_ROUTER_REGISTRY_PATH`.
 
-The protected route registry exposes the initial completion and generation paths:
+The protected route registry exposes the initial completion, generation, and catalog
+paths:
 
 - `POST /api/v1/chat/completions`
 - `POST /api/v1/completions`
 - `GET /api/v1/generation?id=<provider-response-id>`
+- `GET /api/v1/models`
 
 All require `Authorization: Bearer <SEREN_ROUTER_GATEWAY_KEY>`. Completion responses
 carry exact provider `usage.cost`; successful costed generations are persisted for
-post-hoc lookup and reconciliation.
+post-hoc lookup and reconciliation. The model catalog is assembled at startup from
+enabled provider mappings and reports exact per-token prices as decimal strings.
 
 ## Pinned agentgateway sidecar
 

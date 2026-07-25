@@ -1,5 +1,6 @@
 pub mod attribution;
 pub mod auth;
+pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod gateway_auth;

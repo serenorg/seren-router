@@ -1,7 +1,7 @@
 use anyhow::Context;
 use seren_router::{
-    config::RouterConfig, db, gateway_auth::GatewayAuth, ledger::Ledger, pricing::PriceTable,
-    proxy::ProxyState, registry::Registry, routes, server,
+    catalog::Catalog, config::RouterConfig, db, gateway_auth::GatewayAuth, ledger::Ledger,
+    pricing::PriceTable, proxy::ProxyState, registry::Registry, routes, server,
 };
 
 #[tokio::main]
@@ -35,6 +35,7 @@ async fn run() -> anyhow::Result<()> {
     registry
         .validate()
         .context("provider registry validation failed")?;
+    let catalog = Catalog::from_registry(&registry);
     let price_table =
         PriceTable::from_registry(&registry).context("provider registry pricing is invalid")?;
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
@@ -51,7 +52,7 @@ async fn run() -> anyhow::Result<()> {
     let ledger = Ledger::new(pool.clone());
     let proxy = ProxyState::new(config.sidecar_url(), price_table, ledger.clone())
         .context("invalid sidecar proxy configuration")?;
-    let app = routes::public_router().merge(routes::protected_router(auth, proxy, ledger));
+    let app = routes::public_router().merge(routes::protected_router(auth, proxy, ledger, catalog));
 
     server::serve(app, Some(pool))
         .await

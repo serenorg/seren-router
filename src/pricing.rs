@@ -145,6 +145,8 @@ providers:
     priority: 0
     models:
       - slug: canonical/model
+        name: Canonical Model
+        context_length: 131072
         provider_model_id: provider/model
         input_price_per_mtok: "0.1234500"
         output_price_per_mtok: "0.80"
@@ -156,6 +158,8 @@ providers:
     priority: 1
     models:
       - slug: canonical/model
+        name: Canonical Model
+        context_length: 131072
         provider_model_id: provider/model
         input_price_per_mtok: "9.99"
         output_price_per_mtok: "9.99"

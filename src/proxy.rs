@@ -487,6 +487,8 @@ mod tests {
                 priority: 0,
                 models: vec![ModelMapping {
                     slug: "functional-model".to_owned(),
+                    name: "Functional Model".to_owned(),
+                    context_length: 131_072,
                     provider_model_id: "local-model".to_owned(),
                     input_price_per_mtok: Decimal::new(40, 2),
                     output_price_per_mtok: Decimal::new(80, 2),
