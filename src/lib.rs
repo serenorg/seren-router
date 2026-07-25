@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod compatibility;
 pub mod config;
 pub mod db;
+pub mod deployment;
 pub mod gateway_auth;
 pub mod ledger;
 pub mod policy;

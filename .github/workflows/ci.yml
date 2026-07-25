@@ -49,6 +49,9 @@ jobs:
           test -n "$expected_version"
           test "$actual_version" = "$expected_version"
 
+      - name: Verify pinned agentgateway image
+        run: ./scripts/verify-sidecar-image.sh
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -77,3 +80,12 @@ jobs:
           cargo test --test sidecar_config_validation \
             production_registry_validates_with_pinned_sidecar \
             -- --ignored --exact
+
+      - name: Validate composite readiness with pinned sidecar
+        run: |
+          cargo test --test functional \
+            harness::functional_composite_readiness_tracks_real_sidecar_lifecycle \
+            -- --ignored --exact --test-threads=1
+
+      - name: Smoke production deployment image
+        run: ./scripts/deployment-smoke.sh

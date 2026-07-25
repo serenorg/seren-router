@@ -24,6 +24,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use reqwest::{Client, Url, redirect::Policy};
 use sqlx::PgPool;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::{
@@ -44,6 +45,9 @@ const INFERENCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Graceful shutdown timeout.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A readiness dependency must fail quickly enough for Kubernetes to reroute traffic.
+const READINESS_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Prometheus metrics endpoint path.
 #[cfg(feature = "metrics")]
@@ -123,7 +127,9 @@ impl MakeRequestId for RequestIdGenerator {
 // ---------------------------------------------------------------------------
 
 struct ServerState {
-    db: Option<PgPool>,
+    db: PgPool,
+    sidecar_client: Client,
+    sidecar_readiness_url: Url,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,28 +150,55 @@ async fn livez() -> impl IntoResponse {
 /// from service endpoints while this returns non-200, so traffic shifts to
 /// healthy pods without a restart.
 async fn readyz(Extension(state): Extension<Arc<ServerState>>) -> impl IntoResponse {
-    if let Some(db) = &state.db {
-        match sqlx::query("SELECT 1").execute(db).await {
-            Ok(_) => (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({ "status": "ok" })),
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "readyz: database check failed");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    axum::Json(
-                        serde_json::json!({ "status": "unavailable", "reason": "database" }),
-                    ),
-                )
-            }
+    match tokio::time::timeout(
+        READINESS_DEPENDENCY_TIMEOUT,
+        sqlx::query("SELECT 1").execute(&state.db),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "readyz: database check failed");
+            return unavailable("database");
         }
-    } else {
-        (
+        Err(_) => {
+            tracing::warn!("readyz: database check timed out");
+            return unavailable("database");
+        }
+    }
+
+    match state
+        .sidecar_client
+        .get(state.sidecar_readiness_url.clone())
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => (
             StatusCode::OK,
             axum::Json(serde_json::json!({ "status": "ok" })),
-        )
+        ),
+        Ok(response) => {
+            tracing::warn!(
+                status = %response.status(),
+                "readyz: AgentGateway check returned an unhealthy status"
+            );
+            unavailable("sidecar")
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "readyz: AgentGateway check failed");
+            unavailable("sidecar")
+        }
     }
+}
+
+fn unavailable(reason: &'static str) -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({
+            "status": "unavailable",
+            "reason": reason
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -313,21 +346,13 @@ const fn inference_payload_size() -> Option<usize> {
 /// apply [`standard_route_policies`] or [`inference_route_policies`] before the
 /// router reaches this shared stack.
 ///
-/// Pass `Some(pool)` to enable database readiness checks on `/readyz`.
-/// Pass `None` if the service has no database dependency.
-pub async fn serve(app: Router, db: Option<PgPool>) -> anyhow::Result<()> {
+/// Both PostgreSQL and AgentGateway must be reachable for `/readyz` to return 200.
+pub async fn serve(app: Router, db: PgPool, sidecar_readiness_url: Url) -> anyhow::Result<()> {
     let x_request_id = HeaderName::from_static("x-request-id");
-
-    let state = Arc::new(ServerState { db });
 
     // --- innermost layers first (health probes, then feature-gated, then always-on) ---
 
-    let health = standard_route_policies(
-        Router::new()
-            .route("/livez", get(livez))
-            .route("/readyz", get(readyz)),
-    )
-    .layer(Extension(state));
+    let health = health_router(db, sidecar_readiness_url)?;
     let app = app.merge(health);
 
     // Concurrency limit
@@ -449,6 +474,27 @@ pub async fn serve(app: Router, db: Option<PgPool>) -> anyhow::Result<()> {
     tracing::info!("server stopped");
 
     Ok(())
+}
+
+/// Build dependency-aware health routes for the production server and real functional gates.
+pub fn health_router(db: PgPool, sidecar_readiness_url: Url) -> anyhow::Result<Router> {
+    let sidecar_client = Client::builder()
+        .connect_timeout(READINESS_DEPENDENCY_TIMEOUT)
+        .timeout(READINESS_DEPENDENCY_TIMEOUT)
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()?;
+    let state = Arc::new(ServerState {
+        db,
+        sidecar_client,
+        sidecar_readiness_url,
+    });
+    Ok(standard_route_policies(
+        Router::new()
+            .route("/livez", get(livez))
+            .route("/readyz", get(readyz)),
+    )
+    .layer(Extension(state)))
 }
 
 #[cfg(all(test, feature = "payload-limit"))]

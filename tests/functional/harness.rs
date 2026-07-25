@@ -22,8 +22,8 @@ use seren_router::policy::measurements::{MeasurementStore, Observation};
 use seren_router::pricing::{PriceTable, Usage, cost_usd};
 use seren_router::proxy::ProxyState;
 use seren_router::registry::{ModelMapping, Provider, Registry};
-use seren_router::routes;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
+use seren_router::{routes, server};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, timeout};
@@ -201,11 +201,17 @@ impl FunctionalHarness {
             .await
             .expect("functional test database migrations must succeed");
         let measurements = MeasurementStore::default();
-        let app = router_app(
-            &sidecar_url,
-            &registry,
-            Ledger::new(pool),
-            measurements.clone(),
+        let ledger = Ledger::new(pool.clone());
+        let app = router_app(&sidecar_url, &registry, ledger, measurements.clone()).merge(
+            server::health_router(
+                pool,
+                Url::parse(&format!(
+                    "http://127.0.0.1:{}/healthz/ready",
+                    ports.readiness
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
         );
         let (router_shutdown, shutdown) = oneshot::channel();
         let router_task = tokio::spawn(async move {
@@ -383,6 +389,18 @@ impl FunctionalHarness {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn livez(&self) -> Response {
+        self.unauthenticated_get("/livez").await
+    }
+
+    async fn readyz(&self) -> Response {
+        self.unauthenticated_get("/readyz").await
+    }
+
+    fn terminate_sidecar(&mut self) {
+        self.sidecar.terminate();
     }
 
     async fn sidecar_chat(&self, model: &str) -> Response {
@@ -588,6 +606,40 @@ fn sidecar_binary() -> PathBuf {
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+}
+
+#[tokio::test]
+#[ignore = "functional"]
+async fn functional_composite_readiness_tracks_real_sidecar_lifecycle() {
+    let mut harness = FunctionalHarness::start().await;
+
+    let ready = harness.readyz().await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(
+        ready.json::<Value>().await.unwrap(),
+        json!({"status": "ok"})
+    );
+
+    harness.terminate_sidecar();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let unavailable = loop {
+        let response = harness.readyz().await;
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "router remained ready after AgentGateway stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        unavailable.json::<Value>().await.unwrap(),
+        json!({"status": "unavailable", "reason": "sidecar"})
+    );
+    assert_eq!(harness.livez().await.status(), StatusCode::OK);
+
+    harness.shutdown_and_assert_clean().await;
 }
 
 #[tokio::test]

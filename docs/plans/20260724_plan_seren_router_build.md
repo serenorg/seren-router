@@ -755,6 +755,15 @@ seren-desktop client changes (gated: docs/08 Phase 5, seren-desktop#3291), and
 identity-token auth hardening (M2-1 note). When you think you need any of these early,
 reread docs/05 and stop.
 
+Repository-owned deployment boundary completed on 2026-07-26: the production app image
+now doubles as an atomic sidecar-config init renderer, `/readyz` checks both PostgreSQL
+and the real sidecar with bounded timeouts, the official multi-architecture
+AgentGateway image is pinned and verified by immutable digest, and a local production
+container smoke proves rendering, migrations, probes, and metrics without provider
+traffic. See `docs/10-deployment.md`. Cluster selection, environment overlays,
+provisioning, secrets binding, DNS, deployment, canary mechanics, and publisher
+mutation remain gated on Taariq/Christian.
+
 ---
 
 ## Part 5 — Working agreements recap (pin this)
