@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+.editorconfig
+.pre-commit-config.yaml
+.env
+.env.*
+!.env.example

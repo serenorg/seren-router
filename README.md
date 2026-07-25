@@ -29,4 +29,30 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 
 ## Status
 
-Design approved; foundation decided. seren-router is built as a **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the verified evaluation). The implementation plan in `docs/08` is the next actionable step.
+Implementation is underway. The service uses the standard Seren Rust chassis and is
+built as a **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
+[agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
+verified evaluation).
+
+## Service development
+
+Rust 1.95 or newer is required. The production feature group enables metrics, security
+headers, sensitive-header redaction, and payload limits; it deliberately excludes the
+template's per-IP rate limiter because the Gateway is this service's single caller.
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --features production -- -D warnings
+cargo test --features production
+```
+
+Run the chassis locally:
+
+```bash
+cargo run --features production
+curl http://127.0.0.1:8000/readyz
+# {"status":"ok"}
+```
+
+The protected route registry exposes no handlers until the compatibility-layer
+milestone adds the Gateway-facing static bearer authentication.
