@@ -11,14 +11,18 @@ use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use futures::{Stream, StreamExt, stream};
 use reqwest::{Client, Url};
-use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::attribution::ServedProvider;
+use crate::config::RoutingConfig;
 use crate::ledger::{GenerationWrite, Ledger};
+use crate::policy::measurements::{MeasurementStore, Observation};
+use crate::policy::routing::{RouteDecision, RoutingPolicy, RoutingPolicyError};
 use crate::pricing::PriceTable;
+use crate::registry::Registry;
 use crate::sse::UsageCostTransformer;
-use crate::usage_cost::{CostedUsage, canonical_slug, inject_usage_cost, prices_for_request};
+use crate::usage_cost::{CostedUsage, inject_usage_cost, prices_for_request};
 
 const CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
 const LEGACY_COMPLETIONS_PATH: &str = "v1/completions";
@@ -30,6 +34,7 @@ pub struct ProxyState {
     legacy_completions_url: Url,
     price_table: Arc<PriceTable>,
     ledger: Ledger,
+    routing: RoutingPolicy,
 }
 
 impl ProxyState {
@@ -37,17 +42,21 @@ impl ProxyState {
         sidecar_url: &str,
         price_table: PriceTable,
         ledger: Ledger,
+        registry: &Registry,
+        routing_config: RoutingConfig,
+        measurements: MeasurementStore,
     ) -> Result<Self, ProxyConfigError> {
         let normalized = format!("{}/", sidecar_url.trim_end_matches('/'));
-        let base_url = Url::parse(&normalized).map_err(|_| ProxyConfigError)?;
+        let base_url = Url::parse(&normalized).map_err(|_| ProxyConfigError::InvalidSidecarUrl)?;
         if !matches!(base_url.scheme(), "http" | "https")
             || !base_url.username().is_empty()
             || base_url.password().is_some()
             || base_url.query().is_some()
             || base_url.fragment().is_some()
         {
-            return Err(ProxyConfigError);
+            return Err(ProxyConfigError::InvalidSidecarUrl);
         }
+        let routing = RoutingPolicy::from_registry(registry, routing_config, measurements)?;
 
         Ok(Self {
             client: Client::new(),
@@ -59,13 +68,22 @@ impl ProxyState {
                 .expect("constant legacy-completions path is valid"),
             price_table: Arc::new(price_table),
             ledger,
+            routing,
         })
+    }
+
+    pub fn measurements(&self) -> MeasurementStore {
+        self.routing.measurements()
     }
 }
 
 #[derive(Debug, Error)]
-#[error("invalid SEREN_ROUTER_SIDECAR_URL")]
-pub struct ProxyConfigError;
+pub enum ProxyConfigError {
+    #[error("invalid SEREN_ROUTER_SIDECAR_URL")]
+    InvalidSidecarUrl,
+    #[error(transparent)]
+    InvalidRouting(#[from] RoutingPolicyError),
+}
 
 pub async fn chat_completions(State(proxy): State<ProxyState>, body: Bytes) -> Response {
     forward(proxy, CompletionEndpoint::Chat, body).await
@@ -81,38 +99,41 @@ enum CompletionEndpoint {
     Legacy,
 }
 
-#[derive(Default, Deserialize)]
-struct CompletionRequestMetadata {
-    model: Option<String>,
-    #[serde(default)]
-    stream: bool,
-}
-
 async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -> Response {
-    let started_at = Instant::now();
-    let request = serde_json::from_slice::<CompletionRequestMetadata>(&body).unwrap_or_default();
+    let request_started_at = Instant::now();
+    let mut request = match serde_json::from_slice::<Value>(&body) {
+        Ok(request) => request,
+        Err(_) => return invalid_json_request(),
+    };
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
+    let decision = match proxy.routing.route(&mut request) {
+        Ok(decision) => decision,
+        Err(error) => return error.into_response(),
+    };
     let url = match endpoint {
         CompletionEndpoint::Chat => &proxy.chat_completions_url,
         CompletionEndpoint::Legacy => &proxy.legacy_completions_url,
     };
-    let response = match proxy
-        .client
-        .post(url.clone())
-        .header(CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                endpoint = url.path(),
-                "sidecar completion request failed"
-            );
-            return upstream_unavailable();
-        }
-    };
+    let selected_body =
+        serde_json::to_vec(&request).expect("a parsed JSON completion request serializes");
+    let upstream =
+        match send_selected_then_fallback(&proxy.client, url, request, selected_body, &decision)
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    endpoint = url.path(),
+                    "sidecar completion request failed"
+                );
+                return upstream_unavailable();
+            }
+        };
+    let response = upstream.response;
 
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
@@ -138,18 +159,26 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
         );
     }
 
-    if request.stream {
-        let body = match (is_event_stream, &request.model, &served_provider) {
-            (false, _, _) => Body::from_stream(response.bytes_stream()),
-            (true, Some(requested_model), Some(served_provider)) => {
-                match prices_for_request(requested_model, served_provider, &proxy.price_table) {
+    if stream {
+        let body = match (is_event_stream, &served_provider) {
+            (false, _) => Body::from_stream(response.bytes_stream()),
+            (true, Some(served_provider)) => {
+                match prices_for_request(
+                    &decision.canonical_model,
+                    served_provider,
+                    &proxy.price_table,
+                ) {
                     Ok(prices) => {
                         let generation = GenerationContext::new(
                             proxy.ledger.clone(),
-                            requested_model,
+                            proxy.measurements(),
+                            &decision.canonical_model,
                             served_provider,
                             status,
-                            started_at,
+                            GenerationTiming::streaming(
+                                request_started_at,
+                                upstream.attempt_started_at,
+                            ),
                         );
                         Body::from_stream(stream_with_usage_cost(
                             response.bytes_stream(),
@@ -160,7 +189,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                     Err(reason) => {
                         tracing::warn!(
                             reason = %reason,
-                            requested_model,
+                            requested_model = decision.canonical_model,
                             served_provider = served_provider.as_str(),
                             "streaming response cost was omitted"
                         );
@@ -168,11 +197,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                     }
                 }
             }
-            (true, None, _) => {
-                tracing::warn!("streaming response cost was omitted: request model is missing");
-                Body::from_stream(response.bytes_stream())
-            }
-            (true, _, None) => Body::from_stream(response.bytes_stream()),
+            (true, None) => Body::from_stream(response.bytes_stream()),
         };
 
         return downstream_response(status, content_type, body, served_provider);
@@ -189,29 +214,35 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
             return upstream_unavailable();
         }
     };
-    let downstream_body = match (&request.model, &served_provider) {
-        (Some(requested_model), Some(served_provider)) => {
+    let response_completed_at = Instant::now();
+    let downstream_body = match &served_provider {
+        Some(served_provider) => {
             match inject_usage_cost(
                 &upstream_body,
-                requested_model,
+                &decision.canonical_model,
                 served_provider,
                 &proxy.price_table,
             ) {
                 Ok(costed) => {
                     GenerationContext::new(
                         proxy.ledger.clone(),
-                        requested_model,
+                        proxy.measurements(),
+                        &decision.canonical_model,
                         served_provider,
                         status,
-                        started_at,
+                        GenerationTiming::non_streaming(
+                            request_started_at,
+                            upstream.attempt_started_at,
+                            upstream.headers_received_at,
+                        ),
                     )
-                    .record(costed.usage);
+                    .record_at(costed.usage, response_completed_at);
                     Bytes::from(costed.body)
                 }
                 Err(reason) => {
                     tracing::warn!(
                         reason = %reason,
-                        requested_model,
+                        requested_model = decision.canonical_model,
                         served_provider = served_provider.as_str(),
                         "non-streaming response cost was omitted"
                     );
@@ -219,11 +250,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                 }
             }
         }
-        (None, _) => {
-            tracing::warn!("non-streaming response cost was omitted: request model is missing");
-            upstream_body
-        }
-        (_, None) => upstream_body,
+        None => upstream_body,
     };
 
     downstream_response(
@@ -232,6 +259,64 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
         Body::from(downstream_body),
         served_provider,
     )
+}
+
+struct UpstreamResponse {
+    response: reqwest::Response,
+    attempt_started_at: Instant,
+    headers_received_at: Instant,
+}
+
+async fn send_selected_then_fallback(
+    client: &Client,
+    url: &Url,
+    mut request: Value,
+    selected_body: Vec<u8>,
+    decision: &RouteDecision,
+) -> Result<UpstreamResponse, reqwest::Error> {
+    let selected = send_attempt(client, url, selected_body).await;
+    let should_fallback = decision.has_alternatives
+        && match &selected {
+            Ok(upstream) => retryable_status(upstream.response.status()),
+            Err(_) => true,
+        };
+    if !should_fallback {
+        return selected;
+    }
+
+    tracing::warn!(
+        selected_provider = decision.selected_provider,
+        canonical_model = decision.canonical_model,
+        "selected provider failed before response commit; retrying through sidecar failover"
+    );
+    request["model"] = Value::String(decision.canonical_model.clone());
+    let fallback_body =
+        serde_json::to_vec(&request).expect("a parsed JSON completion request serializes");
+    send_attempt(client, url, fallback_body).await
+}
+
+async fn send_attempt(
+    client: &Client,
+    url: &Url,
+    body: Vec<u8>,
+) -> Result<UpstreamResponse, reqwest::Error> {
+    let attempt_started_at = Instant::now();
+    let response = client
+        .post(url.clone())
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?;
+
+    Ok(UpstreamResponse {
+        response,
+        attempt_started_at,
+        headers_received_at: Instant::now(),
+    })
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 fn downstream_response(
@@ -270,6 +355,11 @@ where
             loop {
                 match input.next().await {
                     Some(Ok(chunk)) => {
+                        if !chunk.is_empty()
+                            && let Some(generation) = generation.as_mut()
+                        {
+                            generation.observe_first_output(Instant::now());
+                        }
                         let current = transformer
                             .take()
                             .expect("transformer is present until the source ends");
@@ -319,30 +409,74 @@ where
 
 struct GenerationContext {
     ledger: Ledger,
+    measurements: MeasurementStore,
     canonical_slug: String,
     provider_id: String,
     status: StatusCode,
-    started_at: Instant,
+    request_started_at: Instant,
+    attempt_started_at: Instant,
+    first_output_at: Option<Instant>,
+}
+
+struct GenerationTiming {
+    request_started_at: Instant,
+    attempt_started_at: Instant,
+    first_output_at: Option<Instant>,
+}
+
+impl GenerationTiming {
+    fn streaming(request_started_at: Instant, attempt_started_at: Instant) -> Self {
+        Self {
+            request_started_at,
+            attempt_started_at,
+            first_output_at: None,
+        }
+    }
+
+    fn non_streaming(
+        request_started_at: Instant,
+        attempt_started_at: Instant,
+        headers_received_at: Instant,
+    ) -> Self {
+        Self {
+            request_started_at,
+            attempt_started_at,
+            first_output_at: Some(headers_received_at),
+        }
+    }
 }
 
 impl GenerationContext {
     fn new(
         ledger: Ledger,
-        requested_model: &str,
+        measurements: MeasurementStore,
+        canonical_slug: &str,
         served_provider: &ServedProvider,
         status: StatusCode,
-        started_at: Instant,
+        timing: GenerationTiming,
     ) -> Self {
         Self {
             ledger,
-            canonical_slug: canonical_slug(requested_model, served_provider.as_str()).to_owned(),
+            measurements,
+            canonical_slug: canonical_slug.to_owned(),
             provider_id: served_provider.as_str().to_owned(),
             status,
-            started_at,
+            request_started_at: timing.request_started_at,
+            attempt_started_at: timing.attempt_started_at,
+            first_output_at: timing.first_output_at,
         }
     }
 
+    fn observe_first_output(&mut self, observed_at: Instant) {
+        self.first_output_at.get_or_insert(observed_at);
+    }
+
     fn record(self, costed: CostedUsage) {
+        self.record_at(costed, Instant::now());
+    }
+
+    fn record_at(self, costed: CostedUsage, completed_at: Instant) {
+        self.record_measurement(&costed, completed_at);
         let Some(id) = costed.response_id else {
             self.warn_incomplete("costed response omitted a provider response id");
             return;
@@ -355,7 +489,12 @@ impl GenerationContext {
             self.warn_incomplete("completion token count exceeds the ledger BIGINT");
             return;
         };
-        let latency_ms = i64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let latency_ms = i64::try_from(
+            completed_at
+                .saturating_duration_since(self.request_started_at)
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
         let generation = GenerationWrite {
             id,
             canonical_slug: self.canonical_slug,
@@ -381,6 +520,37 @@ impl GenerationContext {
         });
     }
 
+    fn record_measurement(&self, costed: &CostedUsage, completed_at: Instant) {
+        let Some(first_output_at) = self.first_output_at else {
+            return;
+        };
+        let stream_duration = completed_at.saturating_duration_since(first_output_at);
+        if stream_duration.is_zero() {
+            tracing::debug!(
+                provider_id = self.provider_id,
+                canonical_slug = self.canonical_slug,
+                "provider measurement omitted because output duration was zero"
+            );
+            return;
+        }
+        let observation = Observation {
+            completion_tokens: costed.usage.completion_tokens,
+            stream_duration,
+            time_to_first_token: first_output_at.saturating_duration_since(self.attempt_started_at),
+        };
+        if let Err(error) =
+            self.measurements
+                .observe(&self.provider_id, &self.canonical_slug, observation)
+        {
+            tracing::debug!(
+                error = %error,
+                provider_id = self.provider_id,
+                canonical_slug = self.canonical_slug,
+                "provider measurement was omitted"
+            );
+        }
+    }
+
     fn warn_incomplete(&self, reason: &'static str) {
         tracing::warn!(
             reason,
@@ -397,6 +567,18 @@ fn upstream_unavailable() -> Response {
         Json(serde_json::json!({
             "error": {
                 "message": "upstream unavailable"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn invalid_json_request() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": "request body must be valid JSON"
             }
         })),
     )

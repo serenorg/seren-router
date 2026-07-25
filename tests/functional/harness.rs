@@ -14,9 +14,11 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use seren_router::attribution::SERVED_PROVIDER_HEADER;
 use seren_router::catalog::Catalog;
+use seren_router::config::RoutingConfig;
 use seren_router::db;
 use seren_router::gateway_auth::GatewayAuth;
 use seren_router::ledger::Ledger;
+use seren_router::policy::measurements::{MeasurementStore, Observation};
 use seren_router::pricing::{PriceTable, Usage, cost_usd};
 use seren_router::proxy::ProxyState;
 use seren_router::registry::{ModelMapping, Provider, Registry};
@@ -140,6 +142,7 @@ struct FunctionalHarness {
     router_task: Option<JoinHandle<std::io::Result<()>>>,
     runtime_ports: [u16; 5],
     artifacts: Artifacts,
+    measurements: MeasurementStore,
 }
 
 impl FunctionalHarness {
@@ -165,6 +168,7 @@ impl FunctionalHarness {
             .arg(&artifacts.config)
             .env("SEREN_TEST_KEY_DEAD", "functional-fixture-only")
             .env("SEREN_TEST_KEY_LOCAL", "functional-fixture-only")
+            .env("SEREN_TEST_KEY_EXPENSIVE", "functional-fixture-only")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -195,7 +199,13 @@ impl FunctionalHarness {
             .run(&pool)
             .await
             .expect("functional test database migrations must succeed");
-        let app = router_app(&sidecar_url, &registry, Ledger::new(pool));
+        let measurements = MeasurementStore::default();
+        let app = router_app(
+            &sidecar_url,
+            &registry,
+            Ledger::new(pool),
+            measurements.clone(),
+        );
         let (router_shutdown, shutdown) = oneshot::channel();
         let router_task = tokio::spawn(async move {
             axum::serve(router_listener, app)
@@ -216,10 +226,15 @@ impl FunctionalHarness {
             router_task: Some(router_task),
             runtime_ports,
             artifacts,
+            measurements,
         }
     }
 
     async fn chat(&self, model: &str, stream: bool) -> Response {
+        self.chat_with_sort(model, stream, None).await
+    }
+
+    async fn chat_with_sort(&self, model: &str, stream: bool, sort: Option<&str>) -> Response {
         let mut body = json!({
             "model": model,
             "messages": [{"role": "user", "content": "Reply only with the word pong."}],
@@ -229,6 +244,9 @@ impl FunctionalHarness {
         });
         if stream {
             body["stream_options"] = json!({"include_usage": true});
+        }
+        if let Some(sort) = sort {
+            body["provider"] = json!({"sort": sort});
         }
 
         self.client
@@ -240,6 +258,26 @@ impl FunctionalHarness {
             .unwrap()
     }
 
+    fn seed_measurement(
+        &self,
+        provider_id: &str,
+        completion_tokens: u64,
+        stream_duration: Duration,
+        time_to_first_token: Duration,
+    ) {
+        self.measurements
+            .observe(
+                provider_id,
+                VIRTUAL_MODEL,
+                Observation {
+                    completion_tokens,
+                    stream_duration,
+                    time_to_first_token,
+                },
+            )
+            .unwrap();
+    }
+
     async fn unauthenticated_chat(&self) -> Response {
         self.client
             .post(format!("{}/api/v1/chat/completions", self.router_base_url))
@@ -248,6 +286,17 @@ impl FunctionalHarness {
                 "messages": [{"role": "user", "content": "pong"}],
                 "max_tokens": 4
             }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn raw_completion(&self, path: &str, body: impl Into<reqwest::Body>) -> Response {
+        self.client
+            .post(format!("{}{path}", self.router_base_url))
+            .bearer_auth(GATEWAY_KEY)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .await
             .unwrap()
@@ -391,13 +440,21 @@ impl Drop for FunctionalHarness {
     }
 }
 
-fn router_app(sidecar_url: &str, registry: &Registry, ledger: Ledger) -> Router {
+fn router_app(
+    sidecar_url: &str,
+    registry: &Registry,
+    ledger: Ledger,
+    measurements: MeasurementStore,
+) -> Router {
     let auth = GatewayAuth::new(GATEWAY_KEY.as_bytes());
     let catalog = Catalog::from_registry(registry);
     let proxy = ProxyState::new(
         sidecar_url,
         PriceTable::from_registry(registry).unwrap(),
         ledger.clone(),
+        registry,
+        RoutingConfig::new("2.0".parse().unwrap(), 0.1, Decimal::ONE, 100).unwrap(),
+        measurements,
     )
     .unwrap();
     routes::public_router().merge(routes::protected_router(auth, proxy, ledger, catalog))
@@ -423,6 +480,15 @@ fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Regis
                 model,
                 "0.40",
                 "0.80",
+            ),
+            functional_provider(
+                "expensive",
+                upstream_url.to_owned(),
+                "SEREN_TEST_KEY_EXPENSIVE",
+                2,
+                model,
+                "2.00",
+                "4.00",
             ),
         ],
     }
@@ -546,7 +612,7 @@ async fn functional_chat_completion() {
         })
     );
 
-    let response = harness.chat(LOCAL_MODEL, false).await;
+    let response = harness.chat(VIRTUAL_MODEL, false).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
@@ -562,6 +628,12 @@ async fn functional_chat_completion() {
         .expect("completion must include a provider response id");
     let generation = wait_for_generation(&harness, generation_id).await;
     assert_generation_matches(&generation, &body);
+    let measurement = harness
+        .measurements
+        .get("local", VIRTUAL_MODEL)
+        .expect("non-streaming completion must update provider measurements");
+    assert!(measurement.throughput_tokens_per_second > 0.0);
+    assert!(measurement.time_to_first_token_seconds >= 0.0);
 
     harness.shutdown_and_assert_clean().await;
 }
@@ -618,6 +690,18 @@ async fn functional_compatibility_metadata() {
                         },
                         "provider_name": "Functional local",
                         "tag": "local"
+                    },
+                    {
+                        "name": "Functional expensive: Functional Model",
+                        "model_id": VIRTUAL_MODEL,
+                        "model_name": "Functional Model",
+                        "context_length": 131072,
+                        "pricing": {
+                            "prompt": "0.000002",
+                            "completion": "0.000004"
+                        },
+                        "provider_name": "Functional expensive",
+                        "tag": "expensive"
                     }
                 ]
             }
@@ -639,7 +723,7 @@ async fn functional_compatibility_metadata() {
 #[ignore = "functional"]
 async fn functional_streaming() {
     let harness = FunctionalHarness::start().await;
-    let response = harness.chat(LOCAL_MODEL, true).await;
+    let response = harness.chat(VIRTUAL_MODEL, true).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -683,6 +767,12 @@ async fn functional_streaming() {
         .expect("terminal usage event must include a provider response id");
     let generation = wait_for_generation(&harness, generation_id).await;
     assert_generation_matches(&generation, &usage_event);
+    let measurement = harness
+        .measurements
+        .get("local", VIRTUAL_MODEL)
+        .expect("streaming completion must update provider measurements");
+    assert!(measurement.throughput_tokens_per_second > 0.0);
+    assert!(measurement.time_to_first_token_seconds >= 0.0);
 
     harness.shutdown_and_assert_clean().await;
 }
@@ -731,28 +821,153 @@ async fn functional_auth_rejected() {
 async fn functional_failover() {
     let harness = FunctionalHarness::start().await;
 
-    let first = harness.chat(VIRTUAL_MODEL, false).await;
-    assert!(
-        first.status().is_success() || first.status().is_server_error(),
-        "unexpected first-attempt status: {}",
-        first.status()
+    let sidecar_first = harness.sidecar_chat(VIRTUAL_MODEL).await;
+    assert_eq!(
+        sidecar_first.status(),
+        StatusCode::OK,
+        "sidecar retry policy must save the first virtual-model request"
     );
-    let second = harness.chat(VIRTUAL_MODEL, false).await;
-    assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(second.headers().get(SERVED_PROVIDER_HEADER), None);
-    let body: Value = second.json().await.unwrap();
+    assert_eq!(
+        sidecar_first.headers().get(SERVED_PROVIDER_HEADER).unwrap(),
+        "local"
+    );
+
+    let router_first = harness
+        .chat_with_sort(VIRTUAL_MODEL, false, Some("throughput"))
+        .await;
+    assert_eq!(
+        router_first.status(),
+        StatusCode::OK,
+        "router safety-net retry must save the first selected dead route"
+    );
+    assert_eq!(router_first.headers().get(SERVED_PROVIDER_HEADER), None);
+    let body: Value = router_first.json().await.unwrap();
     assert!(
         body["choices"][0]["message"]["content"]
             .as_str()
             .is_some_and(|content| !content.is_empty())
     );
     assert_local_usage_cost(&body);
+    let generation = wait_for_generation(
+        &harness,
+        body["id"]
+            .as_str()
+            .expect("failover response must include an id"),
+    )
+    .await;
+    assert_generation_matches(&generation, &body);
+    assert!(
+        harness.measurements.get("local", VIRTUAL_MODEL).is_some(),
+        "fallback measurements must be attributed to the actual served provider"
+    );
 
-    let attributed = harness.sidecar_chat(VIRTUAL_MODEL).await;
-    assert_eq!(attributed.status(), StatusCode::OK);
+    harness.shutdown_and_assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "functional"]
+async fn functional_invalid_requests_stay_local() {
+    let harness = FunctionalHarness::start().await;
+    assert_eq!(harness.sidecar_request_count(), 0);
+
+    let malformed = harness
+        .raw_completion("/api/v1/chat/completions", "{")
+        .await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        attributed.headers().get(SERVED_PROVIDER_HEADER).unwrap(),
-        "local"
+        malformed.json::<Value>().await.unwrap(),
+        json!({"error": {"message": "request body must be valid JSON"}})
+    );
+
+    let invalid_model = harness
+        .raw_completion("/api/v1/completions", r#"{"prompt":"hello"}"#)
+        .await;
+    assert_eq!(invalid_model.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_model.json::<Value>().await.unwrap(),
+        json!({"error": {"message": "model must be a string"}})
+    );
+
+    let invalid_sort = harness
+        .raw_completion(
+            "/api/v1/chat/completions",
+            r#"{"model":"functional-model","provider":{"sort":"quality"}}"#,
+        )
+        .await;
+    assert_eq!(invalid_sort.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_sort.json::<Value>().await.unwrap(),
+        json!({
+            "error": {
+                "message": "provider.sort must be one of: price, throughput, latency"
+            }
+        })
+    );
+
+    let unknown = harness
+        .raw_completion(
+            "/api/v1/completions",
+            r#"{"model":"unknown/model","prompt":"hello"}"#,
+        )
+        .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        unknown.json::<Value>().await.unwrap(),
+        json!({"error": {"code": 404, "message": "model not found"}})
+    );
+    assert_eq!(
+        harness.sidecar_request_count(),
+        0,
+        "locally rejected completion requests must never reach the sidecar"
+    );
+
+    harness.shutdown_and_assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "functional"]
+async fn functional_sort_modes() {
+    let harness = FunctionalHarness::start().await;
+
+    let price = harness
+        .chat_with_sort(VIRTUAL_MODEL, false, Some("price"))
+        .await;
+    assert_eq!(price.status(), StatusCode::OK);
+    let price_body: Value = price.json().await.unwrap();
+    let price_generation = wait_for_generation(
+        &harness,
+        price_body["id"]
+            .as_str()
+            .expect("price response must include an id"),
+    )
+    .await;
+    assert_eq!(price_generation["data"]["provider_name"], "local");
+
+    harness.seed_measurement(
+        "local",
+        10,
+        Duration::from_secs(1),
+        Duration::from_millis(500),
+    );
+    harness.seed_measurement(
+        "expensive",
+        1_000,
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    );
+    let default = harness.chat(VIRTUAL_MODEL, false).await;
+    assert_eq!(default.status(), StatusCode::OK);
+    let default_body: Value = default.json().await.unwrap();
+    let default_generation = wait_for_generation(
+        &harness,
+        default_body["id"]
+            .as_str()
+            .expect("default response must include an id"),
+    )
+    .await;
+    assert_eq!(
+        default_generation["data"]["provider_name"], "local",
+        "the much faster expensive provider must remain above the default ceiling"
     );
 
     harness.shutdown_and_assert_clean().await;
