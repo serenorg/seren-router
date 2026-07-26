@@ -2461,6 +2461,7 @@ dependencies = [
  "helmet-core",
  "jiff",
  "jiff-sqlx",
+ "metrics",
  "prometheus",
  "rand 0.10.2",
  "reqwest",
