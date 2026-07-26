@@ -431,6 +431,11 @@ pub async fn serve(app: Router, db: PgPool, sidecar_readiness_url: Url) -> anyho
                 .with_ignore_pattern(METRICS_ROUTE)
                 .with_default_metrics()
                 .build_pair();
+        metrics::describe_histogram!(
+            crate::proxy::PROXY_SEGMENT_METRIC,
+            metrics::Unit::Seconds,
+            "Duration of successful costed completion request lifecycle segments."
+        );
         tracing::info!(path = METRICS_ROUTE, "prometheus metrics enabled");
         app.route(
             METRICS_ROUTE,

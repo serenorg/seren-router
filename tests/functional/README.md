@@ -61,6 +61,19 @@ The composite-readiness gate does not need a loaded model. It stops the real pin
 sidecar, requires `/readyz` to return 503 with reason `sidecar`, and confirms
 dependency-free `/livez` remains 200.
 
+`functional_streaming_component_latency` is the non-paid regression gate for the
+completion hot path. It sends 50 interleaved one-token streams directly to the local
+model, through stock AgentGateway, and through the complete router. It reports p95 time
+to response headers, first body chunk, and stream completion for all three paths, then
+requires the router path to add less than 50 ms at every segment. Run this focused gate
+with the same `DATABASE_URL`, `SEREN_TEST_MODEL`, and optional
+`SEREN_TEST_UPSTREAM_URL` settings:
+
+```bash
+cargo test --test functional functional_streaming_component_latency \
+  -- --ignored --nocapture --test-threads=1
+```
+
 The routing tests register the same real model server as both a cheap `local` provider
 and an expensive `expensive` provider. Their fake registry prices let the harness prove
 strict price sorting and the default price ceiling without requiring a second model

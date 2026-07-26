@@ -145,6 +145,13 @@ struct FunctionalHarness {
     measurements: MeasurementStore,
 }
 
+#[derive(Clone, Copy)]
+struct StreamTiming {
+    headers: Duration,
+    first_chunk: Duration,
+    complete: Duration,
+}
+
 impl FunctionalHarness {
     async fn start() -> Self {
         let ports = Ports::allocate();
@@ -415,6 +422,43 @@ impl FunctionalHarness {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn timed_stream(&self, url: String, model: &str, bearer: Option<&str>) -> StreamTiming {
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply only with the word pong."}],
+            "temperature": 0,
+            "max_tokens": 1,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let started_at = Instant::now();
+        let mut request = self.client.post(url).json(&body);
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let mut response = request.send().await.unwrap();
+        let headers = started_at.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut first_chunk = None;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            first_chunk.get_or_insert_with(|| started_at.elapsed());
+            body.extend_from_slice(&chunk);
+        }
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .replace("\r\n", "\n")
+                .ends_with("data: [DONE]\n\n")
+        );
+
+        StreamTiming {
+            headers,
+            first_chunk: first_chunk.expect("stream must contain at least one chunk"),
+            complete: started_at.elapsed(),
+        }
     }
 
     fn sidecar_request_count(&self) -> usize {
@@ -831,6 +875,126 @@ async fn functional_streaming() {
 }
 
 #[tokio::test]
+#[ignore = "requires real LM Studio, stock agentgateway, and PostgreSQL"]
+async fn functional_streaming_component_latency() {
+    const WARMUPS: usize = 5;
+    const SAMPLES: usize = 50;
+    const MAX_P95_ADDED_LATENCY: Duration = Duration::from_millis(50);
+
+    let harness = FunctionalHarness::start().await;
+    let upstream_url = env_or_default("SEREN_TEST_UPSTREAM_URL", DEFAULT_UPSTREAM_URL);
+    let upstream_model = env_or_default("SEREN_TEST_MODEL", DEFAULT_MODEL);
+    let paths = [
+        (
+            format!("{upstream_url}/chat/completions"),
+            upstream_model.as_str(),
+            None,
+        ),
+        (
+            format!("{}/v1/chat/completions", harness.sidecar_base_url),
+            LOCAL_MODEL,
+            None,
+        ),
+        (
+            format!("{}/api/v1/chat/completions", harness.router_base_url),
+            VIRTUAL_MODEL,
+            Some(GATEWAY_KEY),
+        ),
+    ];
+
+    for _ in 0..WARMUPS {
+        for (url, model, bearer) in &paths {
+            harness
+                .timed_stream(url.clone(), model, bearer.as_deref())
+                .await;
+        }
+    }
+
+    let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+    for sequence in 0..SAMPLES {
+        let order = match sequence % 3 {
+            0 => [0, 1, 2],
+            1 => [1, 2, 0],
+            _ => [2, 0, 1],
+        };
+        for index in order {
+            let (url, model, bearer) = &paths[index];
+            samples[index].push(
+                harness
+                    .timed_stream(url.clone(), model, bearer.as_deref())
+                    .await,
+            );
+        }
+    }
+
+    let summaries = samples.map(|timings| StreamTiming {
+        headers: percentile_95(
+            &timings
+                .iter()
+                .map(|timing| timing.headers)
+                .collect::<Vec<_>>(),
+        ),
+        first_chunk: percentile_95(
+            &timings
+                .iter()
+                .map(|timing| timing.first_chunk)
+                .collect::<Vec<_>>(),
+        ),
+        complete: percentile_95(
+            &timings
+                .iter()
+                .map(|timing| timing.complete)
+                .collect::<Vec<_>>(),
+        ),
+    });
+    for (label, timing) in ["direct", "sidecar", "router"].into_iter().zip(&summaries) {
+        println!(
+            "stream_component_latency path={label} samples={SAMPLES} headers_p95_ms={:.3} first_chunk_p95_ms={:.3} complete_p95_ms={:.3}",
+            milliseconds(timing.headers),
+            milliseconds(timing.first_chunk),
+            milliseconds(timing.complete),
+        );
+    }
+    for (segment, direct, sidecar, router) in [
+        (
+            "headers",
+            summaries[0].headers,
+            summaries[1].headers,
+            summaries[2].headers,
+        ),
+        (
+            "first_chunk",
+            summaries[0].first_chunk,
+            summaries[1].first_chunk,
+            summaries[2].first_chunk,
+        ),
+        (
+            "complete",
+            summaries[0].complete,
+            summaries[1].complete,
+            summaries[2].complete,
+        ),
+    ] {
+        let sidecar_added = sidecar.saturating_sub(direct);
+        let router_added = router.saturating_sub(direct);
+        let app_added = router.saturating_sub(sidecar);
+        println!(
+            "stream_component_added_latency segment={segment} sidecar_p95_ms={:.3} app_p95_ms={:.3} total_p95_ms={:.3}",
+            milliseconds(sidecar_added),
+            milliseconds(app_added),
+            milliseconds(router_added),
+        );
+        assert!(
+            router_added < MAX_P95_ADDED_LATENCY,
+            "local {segment} p95 router-added latency was {:.3} ms, at or above the 50 ms gate",
+            milliseconds(router_added),
+        );
+    }
+
+    harness.shutdown_and_assert_clean().await;
+}
+
+#[tokio::test]
 #[ignore = "functional"]
 async fn functional_auth_rejected() {
     let harness = FunctionalHarness::start().await;
@@ -1086,4 +1250,16 @@ async fn wait_for_generation(harness: &FunctionalHarness, id: &str) -> Value {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn percentile_95(samples: &[Duration]) -> Duration {
+    assert!(!samples.is_empty());
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = (sorted.len() * 95).div_ceil(100);
+    sorted[rank - 1]
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }

@@ -2,7 +2,7 @@
 // ABOUTME: Adds exact provider cost to non-streaming JSON and terminal SSE usage events.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -27,6 +27,8 @@ use crate::usage_cost::{CostedUsage, inject_usage_cost, prices_for_request};
 const CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
 const LEGACY_COMPLETIONS_PATH: &str = "v1/completions";
 const GENERATION_ID_HEADER: &str = "x-generation-id";
+#[cfg(feature = "metrics")]
+pub(crate) const PROXY_SEGMENT_METRIC: &str = "seren_router_proxy_segment_duration_seconds";
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -98,6 +100,15 @@ pub async fn legacy_completions(State(proxy): State<ProxyState>, body: Bytes) ->
 enum CompletionEndpoint {
     Chat,
     Legacy,
+}
+
+impl CompletionEndpoint {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Legacy => "legacy",
+        }
+    }
 }
 
 async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -> Response {
@@ -181,7 +192,9 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                             GenerationTiming::streaming(
                                 request_started_at,
                                 upstream.attempt_started_at,
+                                upstream.headers_received_at,
                             ),
+                            endpoint.label(),
                         );
                         Body::from_stream(stream_with_usage_cost(
                             response.bytes_stream(),
@@ -220,12 +233,15 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
     let response_completed_at = Instant::now();
     let downstream_body = match &served_provider {
         Some(served_provider) => {
-            match inject_usage_cost(
+            let processing_started_at = Instant::now();
+            let costed = inject_usage_cost(
                 &upstream_body,
                 &decision.canonical_model,
                 served_provider,
                 &proxy.price_table,
-            ) {
+            );
+            let processing_duration = processing_started_at.elapsed();
+            match costed {
                 Ok(costed) => {
                     GenerationContext::new(
                         proxy.ledger.clone(),
@@ -237,7 +253,9 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                             request_started_at,
                             upstream.attempt_started_at,
                             upstream.headers_received_at,
+                            processing_duration,
                         ),
+                        endpoint.label(),
                     )
                     .record_at(costed.usage, response_completed_at);
                     Bytes::from(costed.body)
@@ -371,7 +389,11 @@ where
                         let current = transformer
                             .take()
                             .expect("transformer is present until the source ends");
+                        let processing_started_at = Instant::now();
                         let (next, output, completed) = current.transform(&chunk);
+                        if let Some(generation) = generation.as_mut() {
+                            generation.observe_processing(processing_started_at.elapsed());
+                        }
                         transformer = Some(next);
                         if let Some(completed) = completed
                             && let Some(generation) = generation.take()
@@ -392,10 +414,14 @@ where
                         return Some((Err(error), (input, None, generation)));
                     }
                     None => {
+                        let processing_started_at = Instant::now();
                         let (output, completed) = transformer
                             .take()
                             .expect("transformer is present until the source ends")
                             .finish();
+                        if let Some(generation) = generation.as_mut() {
+                            generation.observe_processing(processing_started_at.elapsed());
+                        }
                         if let Some(completed) = completed
                             && let Some(generation) = generation.take()
                         {
@@ -423,25 +449,22 @@ struct GenerationContext {
     status: StatusCode,
     request_started_at: Instant,
     attempt_started_at: Instant,
+    headers_received_at: Instant,
     first_output_at: Option<Instant>,
+    processing_duration: Duration,
+    endpoint: &'static str,
 }
 
 struct GenerationTiming {
     request_started_at: Instant,
     attempt_started_at: Instant,
+    headers_received_at: Instant,
     first_output_at: Option<Instant>,
+    processing_duration: Duration,
 }
 
 impl GenerationTiming {
-    fn streaming(request_started_at: Instant, attempt_started_at: Instant) -> Self {
-        Self {
-            request_started_at,
-            attempt_started_at,
-            first_output_at: None,
-        }
-    }
-
-    fn non_streaming(
+    fn streaming(
         request_started_at: Instant,
         attempt_started_at: Instant,
         headers_received_at: Instant,
@@ -449,7 +472,24 @@ impl GenerationTiming {
         Self {
             request_started_at,
             attempt_started_at,
+            headers_received_at,
+            first_output_at: None,
+            processing_duration: Duration::ZERO,
+        }
+    }
+
+    fn non_streaming(
+        request_started_at: Instant,
+        attempt_started_at: Instant,
+        headers_received_at: Instant,
+        processing_duration: Duration,
+    ) -> Self {
+        Self {
+            request_started_at,
+            attempt_started_at,
+            headers_received_at,
             first_output_at: Some(headers_received_at),
+            processing_duration,
         }
     }
 }
@@ -462,6 +502,7 @@ impl GenerationContext {
         served_provider: &ServedProvider,
         status: StatusCode,
         timing: GenerationTiming,
+        endpoint: &'static str,
     ) -> Self {
         Self {
             ledger,
@@ -471,12 +512,19 @@ impl GenerationContext {
             status,
             request_started_at: timing.request_started_at,
             attempt_started_at: timing.attempt_started_at,
+            headers_received_at: timing.headers_received_at,
             first_output_at: timing.first_output_at,
+            processing_duration: timing.processing_duration,
+            endpoint,
         }
     }
 
     fn observe_first_output(&mut self, observed_at: Instant) {
         self.first_output_at.get_or_insert(observed_at);
+    }
+
+    fn observe_processing(&mut self, duration: Duration) {
+        self.processing_duration = self.processing_duration.saturating_add(duration);
     }
 
     fn record(self, costed: CostedUsage) {
@@ -485,6 +533,7 @@ impl GenerationContext {
 
     fn record_at(self, costed: CostedUsage, completed_at: Instant) {
         self.record_measurement(&costed, completed_at);
+        self.record_proxy_segments(completed_at);
         let Some(id) = costed.response_id else {
             self.warn_incomplete("costed response omitted a provider response id");
             return;
@@ -559,6 +608,43 @@ impl GenerationContext {
         }
     }
 
+    fn record_proxy_segments(&self, completed_at: Instant) {
+        let Some(first_output_at) = self.first_output_at else {
+            return;
+        };
+        for (segment, duration) in [
+            (
+                "pre_sidecar",
+                self.attempt_started_at
+                    .saturating_duration_since(self.request_started_at),
+            ),
+            (
+                "sidecar_headers",
+                self.headers_received_at
+                    .saturating_duration_since(self.attempt_started_at),
+            ),
+            (
+                "first_output",
+                first_output_at.saturating_duration_since(self.attempt_started_at),
+            ),
+            (
+                "sidecar_stream",
+                completed_at.saturating_duration_since(self.headers_received_at),
+            ),
+            (
+                "post_first_output",
+                completed_at.saturating_duration_since(first_output_at),
+            ),
+            ("app_processing", self.processing_duration),
+            (
+                "total",
+                completed_at.saturating_duration_since(self.request_started_at),
+            ),
+        ] {
+            record_proxy_segment(self.endpoint, &self.provider_id, segment, duration);
+        }
+    }
+
     fn warn_incomplete(&self, reason: &'static str) {
         tracing::warn!(
             reason,
@@ -567,6 +653,31 @@ impl GenerationContext {
             "generation ledger record was omitted"
         );
     }
+}
+
+#[cfg(feature = "metrics")]
+fn record_proxy_segment(
+    endpoint: &'static str,
+    provider: &str,
+    segment: &'static str,
+    duration: Duration,
+) {
+    metrics::histogram!(
+        PROXY_SEGMENT_METRIC,
+        "endpoint" => endpoint,
+        "provider" => provider.to_owned(),
+        "segment" => segment,
+    )
+    .record(duration.as_secs_f64());
+}
+
+#[cfg(not(feature = "metrics"))]
+fn record_proxy_segment(
+    _endpoint: &'static str,
+    _provider: &str,
+    _segment: &'static str,
+    _duration: Duration,
+) {
 }
 
 fn upstream_unavailable() -> Response {

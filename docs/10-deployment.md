@@ -106,6 +106,14 @@ It verifies renderer exit status, secret references without resolved values,
 PostgreSQL migrations, composite `/readyz`, dependency-free `/livez`, and production
 `/metrics`. It uses fixture-only credentials and sends no provider request.
 
+Production metrics also expose
+`seren_router_proxy_segment_duration_seconds{endpoint,provider,segment}` for successful
+costed completions. The bounded `segment` values separate work before the sidecar,
+sidecar response headers, first output, the response body, post-first-output time,
+active Rust response transformation, and the complete request. Compare
+`pre_sidecar` plus `app_processing` with AgentGateway's own processing metrics before
+attributing provider or network tail latency to the proxy stack.
+
 The separate ignored functional gate uses the pinned host binary to stop the real
 sidecar and prove `/readyz` changes to 503 while `/livez` remains 200:
 
