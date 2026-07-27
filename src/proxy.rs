@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::Extension;
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -21,6 +22,7 @@ use crate::policy::measurements::{MeasurementStore, Observation};
 use crate::policy::routing::{RouteDecision, RoutingPolicy, RoutingPolicyError};
 use crate::pricing::PriceTable;
 use crate::registry::Registry;
+use crate::routing_profile::RoutingProfile;
 use crate::sse::UsageCostTransformer;
 use crate::usage_cost::{CostedUsage, inject_usage_cost, prices_for_request};
 
@@ -88,12 +90,20 @@ pub enum ProxyConfigError {
     InvalidRouting(#[from] RoutingPolicyError),
 }
 
-pub async fn chat_completions(State(proxy): State<ProxyState>, body: Bytes) -> Response {
-    forward(proxy, CompletionEndpoint::Chat, body).await
+pub async fn chat_completions(
+    State(proxy): State<ProxyState>,
+    Extension(profile): Extension<RoutingProfile>,
+    body: Bytes,
+) -> Response {
+    forward(proxy, profile, CompletionEndpoint::Chat, body).await
 }
 
-pub async fn legacy_completions(State(proxy): State<ProxyState>, body: Bytes) -> Response {
-    forward(proxy, CompletionEndpoint::Legacy, body).await
+pub async fn legacy_completions(
+    State(proxy): State<ProxyState>,
+    Extension(profile): Extension<RoutingProfile>,
+    body: Bytes,
+) -> Response {
+    forward(proxy, profile, CompletionEndpoint::Legacy, body).await
 }
 
 #[derive(Clone, Copy)]
@@ -111,7 +121,12 @@ impl CompletionEndpoint {
     }
 }
 
-async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -> Response {
+async fn forward(
+    proxy: ProxyState,
+    profile: RoutingProfile,
+    endpoint: CompletionEndpoint,
+    body: Bytes,
+) -> Response {
     let request_started_at = Instant::now();
     let mut request = match serde_json::from_slice::<Value>(&body) {
         Ok(request) => request,
@@ -121,7 +136,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or_default();
-    let decision = match proxy.routing.route(&mut request) {
+    let decision = match proxy.routing.route(profile, &mut request) {
         Ok(decision) => decision,
         Err(error) => return error.into_response(),
     };
@@ -140,6 +155,8 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                 tracing::warn!(
                     error = %error,
                     endpoint = url.path(),
+                    routing_profile = %decision.profile,
+                    selected_provider = decision.selected_provider,
                     "sidecar completion request failed"
                 );
                 return upstream_unavailable();
@@ -156,9 +173,18 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim() == "text/event-stream");
     let served_provider = ServedProvider::from_headers(response.headers());
+    tracing::debug!(
+        routing_profile = %decision.profile,
+        selected_provider = decision.selected_provider,
+        served_provider = served_provider.as_ref().map(ServedProvider::as_str),
+        canonical_model = decision.canonical_model,
+        "completion route resolved"
+    );
     if status.is_success() && served_provider.is_none() {
         tracing::warn!(
             endpoint = url.path(),
+            routing_profile = %decision.profile,
+            selected_provider = decision.selected_provider,
             "successful sidecar response omitted served-provider attribution"
         );
     }
@@ -193,6 +219,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                                 request_started_at,
                                 upstream.attempt_started_at,
                                 upstream.headers_received_at,
+                                profile,
                             ),
                             endpoint.label(),
                         );
@@ -205,6 +232,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                     Err(reason) => {
                         tracing::warn!(
                             reason = %reason,
+                            routing_profile = %decision.profile,
                             requested_model = decision.canonical_model,
                             served_provider = served_provider.as_str(),
                             "streaming response cost was omitted"
@@ -225,6 +253,8 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
             tracing::warn!(
                 error = %error,
                 endpoint = url.path(),
+                routing_profile = %decision.profile,
+                selected_provider = decision.selected_provider,
                 "failed to read non-streaming sidecar response"
             );
             return upstream_unavailable();
@@ -254,6 +284,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                             upstream.attempt_started_at,
                             upstream.headers_received_at,
                             processing_duration,
+                            profile,
                         ),
                         endpoint.label(),
                     )
@@ -263,6 +294,7 @@ async fn forward(proxy: ProxyState, endpoint: CompletionEndpoint, body: Bytes) -
                 Err(reason) => {
                     tracing::warn!(
                         reason = %reason,
+                        routing_profile = %decision.profile,
                         requested_model = decision.canonical_model,
                         served_provider = served_provider.as_str(),
                         "non-streaming response cost was omitted"
@@ -308,10 +340,11 @@ async fn send_selected_then_fallback(
 
     tracing::warn!(
         selected_provider = decision.selected_provider,
+        routing_profile = %decision.profile,
         canonical_model = decision.canonical_model,
         "selected provider failed before response commit; retrying through sidecar failover"
     );
-    request["model"] = Value::String(decision.canonical_model.clone());
+    request["model"] = Value::String(decision.fallback_model.clone());
     let fallback_body =
         serde_json::to_vec(&request).expect("a parsed JSON completion request serializes");
     send_attempt(client, url, fallback_body).await
@@ -453,6 +486,7 @@ struct GenerationContext {
     first_output_at: Option<Instant>,
     processing_duration: Duration,
     endpoint: &'static str,
+    profile: RoutingProfile,
 }
 
 struct GenerationTiming {
@@ -461,6 +495,7 @@ struct GenerationTiming {
     headers_received_at: Instant,
     first_output_at: Option<Instant>,
     processing_duration: Duration,
+    profile: RoutingProfile,
 }
 
 impl GenerationTiming {
@@ -468,6 +503,7 @@ impl GenerationTiming {
         request_started_at: Instant,
         attempt_started_at: Instant,
         headers_received_at: Instant,
+        profile: RoutingProfile,
     ) -> Self {
         Self {
             request_started_at,
@@ -475,6 +511,7 @@ impl GenerationTiming {
             headers_received_at,
             first_output_at: None,
             processing_duration: Duration::ZERO,
+            profile,
         }
     }
 
@@ -483,6 +520,7 @@ impl GenerationTiming {
         attempt_started_at: Instant,
         headers_received_at: Instant,
         processing_duration: Duration,
+        profile: RoutingProfile,
     ) -> Self {
         Self {
             request_started_at,
@@ -490,6 +528,7 @@ impl GenerationTiming {
             headers_received_at,
             first_output_at: Some(headers_received_at),
             processing_duration,
+            profile,
         }
     }
 }
@@ -516,6 +555,7 @@ impl GenerationContext {
             first_output_at: timing.first_output_at,
             processing_duration: timing.processing_duration,
             endpoint,
+            profile: timing.profile,
         }
     }
 
@@ -554,6 +594,7 @@ impl GenerationContext {
         .unwrap_or(i64::MAX);
         let generation = GenerationWrite {
             id,
+            routing_profile: self.profile,
             canonical_slug: self.canonical_slug,
             provider_id: self.provider_id,
             prompt_tokens,
@@ -569,6 +610,7 @@ impl GenerationContext {
                 tracing::error!(
                     error = %error,
                     generation_id = generation.id,
+                    routing_profile = %generation.routing_profile,
                     provider_id = generation.provider_id,
                     canonical_slug = generation.canonical_slug,
                     "generation ledger insert failed"
@@ -595,12 +637,15 @@ impl GenerationContext {
             stream_duration,
             time_to_first_token: first_output_at.saturating_duration_since(self.attempt_started_at),
         };
-        if let Err(error) =
-            self.measurements
-                .observe(&self.provider_id, &self.canonical_slug, observation)
-        {
+        if let Err(error) = self.measurements.observe_for(
+            self.profile,
+            &self.provider_id,
+            &self.canonical_slug,
+            observation,
+        ) {
             tracing::debug!(
                 error = %error,
+                routing_profile = %self.profile,
                 provider_id = self.provider_id,
                 canonical_slug = self.canonical_slug,
                 "provider measurement was omitted"
@@ -641,13 +686,20 @@ impl GenerationContext {
                 completed_at.saturating_duration_since(self.request_started_at),
             ),
         ] {
-            record_proxy_segment(self.endpoint, &self.provider_id, segment, duration);
+            record_proxy_segment(
+                self.endpoint,
+                self.profile,
+                &self.provider_id,
+                segment,
+                duration,
+            );
         }
     }
 
     fn warn_incomplete(&self, reason: &'static str) {
         tracing::warn!(
             reason,
+            routing_profile = %self.profile,
             provider_id = self.provider_id,
             canonical_slug = self.canonical_slug,
             "generation ledger record was omitted"
@@ -658,6 +710,7 @@ impl GenerationContext {
 #[cfg(feature = "metrics")]
 fn record_proxy_segment(
     endpoint: &'static str,
+    profile: RoutingProfile,
     provider: &str,
     segment: &'static str,
     duration: Duration,
@@ -665,6 +718,7 @@ fn record_proxy_segment(
     metrics::histogram!(
         PROXY_SEGMENT_METRIC,
         "endpoint" => endpoint,
+        "profile" => profile.as_str(),
         "provider" => provider.to_owned(),
         "segment" => segment,
     )
@@ -674,6 +728,7 @@ fn record_proxy_segment(
 #[cfg(not(feature = "metrics"))]
 fn record_proxy_segment(
     _endpoint: &'static str,
+    _profile: RoutingProfile,
     _provider: &str,
     _segment: &'static str,
     _duration: Duration,
@@ -706,6 +761,8 @@ fn invalid_json_request() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use rust_decimal::Decimal;
     use serde_json::Value;
 
@@ -786,6 +843,7 @@ mod tests {
                 secret_env: "TEST_ONLY".to_owned(),
                 enabled: true,
                 priority: 0,
+                profiles: BTreeSet::from([RoutingProfile::Production]),
                 models: vec![ModelMapping {
                     slug: "functional-model".to_owned(),
                     name: "Functional Model".to_owned(),

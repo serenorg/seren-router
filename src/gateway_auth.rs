@@ -10,15 +10,38 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use subtle::ConstantTimeEq;
 
+use crate::routing_profile::RoutingProfile;
+
 #[derive(Clone)]
 pub struct GatewayAuth {
-    expected_key: Arc<[u8]>,
+    production_key: Arc<[u8]>,
+    beta_key: Option<Arc<[u8]>>,
 }
 
 impl GatewayAuth {
     pub fn new(expected_key: impl AsRef<[u8]>) -> Self {
         Self {
-            expected_key: Arc::from(expected_key.as_ref()),
+            production_key: Arc::from(expected_key.as_ref()),
+            beta_key: None,
+        }
+    }
+
+    pub fn with_beta_key(mut self, beta_key: impl AsRef<[u8]>) -> Self {
+        self.beta_key = Some(Arc::from(beta_key.as_ref()));
+        self
+    }
+
+    fn profile_for(&self, provided: &[u8]) -> Option<RoutingProfile> {
+        let production_match = bool::from(self.production_key.as_ref().ct_eq(provided));
+        let beta_match = self
+            .beta_key
+            .as_deref()
+            .is_some_and(|expected| bool::from(expected.ct_eq(provided)));
+
+        match (production_match, beta_match) {
+            (true, false) => Some(RoutingProfile::Production),
+            (false, true) => Some(RoutingProfile::Beta),
+            (false, false) | (true, true) => None,
         }
     }
 }
@@ -27,15 +50,16 @@ pub fn protect(router: Router, auth: GatewayAuth) -> Router {
     router.layer(middleware::from_fn_with_state(auth, authorize))
 }
 
-async fn authorize(State(auth): State<GatewayAuth>, request: Request, next: Next) -> Response {
-    let authorized = request
+async fn authorize(State(auth): State<GatewayAuth>, mut request: Request, next: Next) -> Response {
+    let profile = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|provided| bool::from(auth.expected_key.as_ref().ct_eq(provided.as_bytes())));
+        .and_then(|provided| auth.profile_for(provided.as_bytes()));
 
-    if authorized {
+    if let Some(profile) = profile {
+        request.extensions_mut().insert(profile);
         next.run(request).await
     } else {
         unauthorized()
@@ -56,6 +80,7 @@ fn unauthorized() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use axum::Extension;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
@@ -64,11 +89,20 @@ mod tests {
     use super::*;
 
     const TEST_KEY: &str = "expected-gateway-key";
+    const BETA_KEY: &str = "expected-beta-key";
 
     fn app() -> Router {
         protect(
-            Router::new().route("/protected", get(|| async { StatusCode::NO_CONTENT })),
-            GatewayAuth::new(TEST_KEY),
+            Router::new().route(
+                "/protected",
+                get(|Extension(profile): Extension<RoutingProfile>| async move {
+                    match profile {
+                        RoutingProfile::Production => StatusCode::NO_CONTENT,
+                        RoutingProfile::Beta => StatusCode::ACCEPTED,
+                    }
+                }),
+            ),
+            GatewayAuth::new(TEST_KEY).with_beta_key(BETA_KEY),
         )
     }
 
@@ -99,6 +133,30 @@ mod tests {
     #[tokio::test]
     async fn correct_bearer_reaches_handler() {
         let response = request(Some("Bearer expected-gateway-key")).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn beta_bearer_attaches_beta_profile() {
+        let response = request(Some("Bearer expected-beta-key")).await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn forged_profile_header_cannot_change_the_credential_profile() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(AUTHORIZATION, "Bearer expected-gateway-key")
+                    .header("x-seren-routing-profile", "beta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }

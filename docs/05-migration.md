@@ -27,10 +27,13 @@ That makes seren-router an immediate *superset* of today's behavior. We can repo
 
 ## Peel providers off incrementally
 
-1. Wire Together directly → watch margin and reliability improve on Llama/Qwen traffic.
-2. Wire Fireworks.
-3. Wire Blackbox.
-4. … each move shifts more traffic off OpenRouter onto direct connections.
+1. Validate DeepInfra Llama 3.3 through the credential-bound beta profile after
+   the contractual and pricing-policy gates in `docs/11`.
+2. Enable it only if compatibility, cost, and reliability remain green.
+3. Re-evaluate Fireworks and Together after their documented no-go conditions
+   change.
+4. Wire Blackbox.
+5. … each move shifts more traffic off OpenRouter onto direct connections.
 
 When direct coverage reaches the models users actually call (checked against recent `seren-models` usage), OpenRouter's fallback share trends to zero — and we **delete that registry entry**. If the Stripe deal closes and OpenRouter's terms change mid-migration, we are already mostly off it.
 

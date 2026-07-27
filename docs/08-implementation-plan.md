@@ -40,9 +40,13 @@ Phased so each step is independently shippable and reversible. The guiding princ
 
 ## Phase 4 — Direct providers (peel off)
 
-- [ ] Add the first direct provider (Together): registry row + key + adapter + slug mappings.
+- [x] Select the first direct provider engineering canary: DeepInfra Llama 3.3
+  70B Turbo (`docs/11`, 2026-07-27). The registry entry is disabled and
+  beta-only; legal, pricing-policy, credential, and spend gates remain.
+- [ ] Activate DeepInfra after the `docs/11` gates: written provider consent,
+  reviewed billing policy, scoped key, live compatibility test, and spend cap.
 - [ ] Confirm cheaper `usage.cost` and equal/better reliability; shift its slugs off the fallback.
-- [ ] Repeat: Fireworks, Blackbox, DeepInfra, Novita, Baseten, … (prioritize by traffic volume × margin gain).
+- [ ] Repeat: Fireworks, Blackbox, Novita, Baseten, … (prioritize by traffic volume × margin gain).
 - [ ] Implement the routing policy in full (`docs/02`): outage gate, inverse-square price weighting, `sort` modes, `:nitro`/`:floor`, failover.
 - [ ] Stand up the per-request cost ledger + provider-invoice reconciliation (`docs/04`).
 

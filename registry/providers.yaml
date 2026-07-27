@@ -9,6 +9,7 @@ providers:
     secret_env: SEREN_ROUTER_KEY_OPENROUTER
     enabled: true
     priority: 255
+    profiles: [production, beta]
     models:
       - slug: openai/gpt-5.6-luna
         name: OpenAI GPT-5.6 Luna
@@ -53,10 +54,17 @@ providers:
         input_price_per_mtok: "3.00"
         output_price_per_mtok: "15.00"
 
-  - id: fireworks
-    display_name: Fireworks AI
-    base_url: https://api.fireworks.ai/inference/v1
-    secret_env: SEREN_ROUTER_KEY_FIREWORKS
+  - id: deepinfra
+    display_name: DeepInfra
+    base_url: https://api.deepinfra.com/v1/openai
+    secret_env: SEREN_ROUTER_KEY_DEEPINFRA
     enabled: false
     priority: 0
-    models: []
+    profiles: [beta]
+    models:
+      - slug: meta-llama/llama-3.3-70b-instruct
+        name: Meta Llama 3.3 70B Instruct
+        context_length: 131072
+        provider_model_id: meta-llama/Llama-3.3-70B-Instruct-Turbo
+        input_price_per_mtok: "0.10"
+        output_price_per_mtok: "0.32"

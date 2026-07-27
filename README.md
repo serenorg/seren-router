@@ -26,6 +26,7 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/08-implementation-plan.md`](docs/08-implementation-plan.md) | Phased implementation plan |
 | [`docs/09-agentgateway-evaluation.md`](docs/09-agentgateway-evaluation.md) | DECIDED: built on agentgateway (Linux Foundation, Rust, Apache-2.0) — verified by source inspection + live functional test |
 | [`docs/10-deployment.md`](docs/10-deployment.md) | Validated two-container pod boundary, image pin, probes, and local production smoke |
+| [`docs/11-first-direct-provider.md`](docs/11-first-direct-provider.md) | First direct-provider selection, evidence, and activation gates |
 | [`docs/plans/20260724_plan_seren_router_build.md`](docs/plans/20260724_plan_seren_router_build.md) | The build plan: zero-context, task-by-task implementation guide (M0–M7) with tests and commit points |
 
 ## Status
@@ -34,9 +35,10 @@ The Phase 1 compatibility skeleton and live M6 OpenRouter parity/soak gate are c
 as of 2026-07-25. The service uses the standard Seren Rust chassis and is built as a
 **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
-verified evaluation). Deployment, canary, and publisher cutover remain separate
-operations work in Phases 2–3. The repository-owned two-container packaging and local
-production smoke are complete; no production environment has been selected or changed.
+verified evaluation). The OpenRouter-only image was deployed to the existing production
+environment and passed its bounded canary on 2026-07-26. Production publisher cutover
+and direct-provider activation remain separate, explicitly gated operations; this
+repository change performs neither.
 
 ## Service development
 
@@ -61,7 +63,7 @@ cargo run --features production -- \
 SEREN_ROUTER_KEY_OPENROUTER=<from-secret-manager> \
   ./sidecar/bin/agentgateway -f /tmp/seren-router-agentgateway.yaml
 
-# Terminal 2: start the app and query composite readiness.
+# Terminal 2: start the app and query inference readiness.
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/seren_router \
 SEREN_ROUTER_GATEWAY_KEY=local-development-only \
 SEREN_ROUTER_COMBINED_PRICE_CEILING_PER_MTOK=<reviewed-combined-price-ceiling> \
@@ -70,7 +72,7 @@ SEREN_ROUTER_MAX_SHARE=<reviewed-fraction> \
 SEREN_ROUTER_SHARE_WINDOW=<reviewed-request-count> \
 cargo run --features production
 curl http://127.0.0.1:8000/readyz
-# {"status":"ok"}
+# {"status":"ok","dependencies":{"database":"ok","sidecar":"ok"}}
 ```
 
 `SEREN_ROUTER_GATEWAY_KEY`, `DATABASE_URL`, and the four routing-policy variables shown
@@ -79,10 +81,12 @@ the price ceiling, hysteresis, provider max share, or rolling share-window size.
 The AgentGateway sidecar also requires `SEREN_ROUTER_KEY_OPENROUTER` while the
 checked-in OpenRouter fallback provider is enabled; inject it from the deployment
 secret manager and never store it in the registry or rendered configuration.
-Startup connects to
-PostgreSQL and applies embedded migrations before the HTTP listener binds; `/readyz`
-continues checking that pool and also requires AgentGateway readiness. `/livez` remains
-dependency-free. The sidecar URLs default to `http://127.0.0.1:4000` and
+Startup opens a lazy PostgreSQL pool, binds the HTTP listener without waiting for the
+generation ledger, and retries embedded migrations in an event-driven background
+supervisor. `/readyz` requires AgentGateway and reports PostgreSQL as `starting`, `ok`,
+or `degraded` without taking inference out of service. `/livez` remains dependency-free.
+The supervisor does not periodically poll PostgreSQL, so it does not keep scale-to-zero
+compute awake. The sidecar URLs default to `http://127.0.0.1:4000` and
 `http://127.0.0.1:19001/healthz/ready`; the provider registry path defaults to
 `registry/providers.yaml`. Override them with `SEREN_ROUTER_SIDECAR_URL`,
 `SEREN_ROUTER_SIDECAR_READINESS_URL`, and `SEREN_ROUTER_REGISTRY_PATH`.
@@ -99,7 +103,10 @@ paths:
 - `GET /api/v1/auth/key`
 - `GET /api/v1/credits`
 
-All require `Authorization: Bearer <SEREN_ROUTER_GATEWAY_KEY>`. Completion responses
+All require a Gateway bearer credential. `SEREN_ROUTER_GATEWAY_KEY` is bound to the
+production provider profile; optional `SEREN_ROUTER_BETA_GATEWAY_KEY` is bound to the
+beta profile and must be distinct. Client headers cannot choose or override the
+profile. Completion responses
 carry exact provider `usage.cost`; successful costed generations are persisted for
 post-hoc lookup and reconciliation. The model and endpoint catalogs are assembled at
 startup from enabled provider mappings and report exact per-token prices as decimal

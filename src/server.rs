@@ -25,7 +25,6 @@ use axum::{
     routing::get,
 };
 use reqwest::{Client, Url, redirect::Policy};
-use sqlx::PgPool;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::{
     catch_panic::CatchPanicLayer,
@@ -36,6 +35,8 @@ use tower_http::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::{ContextV7, Timestamp, Uuid};
+
+use crate::db::DatabaseHealth;
 
 /// Default timeout for metadata, health, and other short-lived requests.
 const STANDARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -127,7 +128,7 @@ impl MakeRequestId for RequestIdGenerator {
 // ---------------------------------------------------------------------------
 
 struct ServerState {
-    db: PgPool,
+    database_health: DatabaseHealth,
     sidecar_client: Client,
     sidecar_readiness_url: Url,
 }
@@ -146,27 +147,12 @@ async fn livez() -> impl IntoResponse {
 
 /// Readiness probe - is the service ready to accept traffic?
 ///
-/// Checks that all dependencies are reachable. Kubernetes removes the pod
-/// from service endpoints while this returns non-200, so traffic shifts to
-/// healthy pods without a restart.
+/// Gates on AgentGateway, the synchronous inference dependency. PostgreSQL is
+/// an asynchronous ledger dependency and is reported without taking inference
+/// out of service.
 async fn readyz(Extension(state): Extension<Arc<ServerState>>) -> impl IntoResponse {
-    match tokio::time::timeout(
-        READINESS_DEPENDENCY_TIMEOUT,
-        sqlx::query("SELECT 1").execute(&state.db),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "readyz: database check failed");
-            return unavailable("database");
-        }
-        Err(_) => {
-            tracing::warn!("readyz: database check timed out");
-            return unavailable("database");
-        }
-    }
-
+    state.database_health.record_availability();
+    let database_status = state.database_health.status().as_str();
     match state
         .sidecar_client
         .get(state.sidecar_readiness_url.clone())
@@ -175,28 +161,38 @@ async fn readyz(Extension(state): Extension<Arc<ServerState>>) -> impl IntoRespo
     {
         Ok(response) if response.status().is_success() => (
             StatusCode::OK,
-            axum::Json(serde_json::json!({ "status": "ok" })),
+            axum::Json(serde_json::json!({
+                "status": "ok",
+                "dependencies": {
+                    "database": database_status,
+                    "sidecar": "ok"
+                }
+            })),
         ),
         Ok(response) => {
             tracing::warn!(
                 status = %response.status(),
                 "readyz: AgentGateway check returned an unhealthy status"
             );
-            unavailable("sidecar")
+            unavailable(database_status)
         }
         Err(error) => {
             tracing::warn!(error = %error, "readyz: AgentGateway check failed");
-            unavailable("sidecar")
+            unavailable(database_status)
         }
     }
 }
 
-fn unavailable(reason: &'static str) -> (StatusCode, axum::Json<serde_json::Value>) {
+fn unavailable(database_status: &'static str) -> (StatusCode, axum::Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         axum::Json(serde_json::json!({
             "status": "unavailable",
-            "reason": reason
+            "reason": "sidecar",
+            "dependencies": {
+                "database": database_status,
+                "sidecar": "unavailable"
+            }
         })),
     )
 }
@@ -346,13 +342,18 @@ const fn inference_payload_size() -> Option<usize> {
 /// apply [`standard_route_policies`] or [`inference_route_policies`] before the
 /// router reaches this shared stack.
 ///
-/// Both PostgreSQL and AgentGateway must be reachable for `/readyz` to return 200.
-pub async fn serve(app: Router, db: PgPool, sidecar_readiness_url: Url) -> anyhow::Result<()> {
+/// AgentGateway must be reachable for `/readyz` to return 200. PostgreSQL state
+/// remains observable but does not gate inference readiness.
+pub async fn serve(
+    app: Router,
+    database_health: DatabaseHealth,
+    sidecar_readiness_url: Url,
+) -> anyhow::Result<()> {
     let x_request_id = HeaderName::from_static("x-request-id");
 
     // --- innermost layers first (health probes, then feature-gated, then always-on) ---
 
-    let health = health_router(db, sidecar_readiness_url)?;
+    let health = health_router(database_health.clone(), sidecar_readiness_url)?;
     let app = app.merge(health);
 
     // Concurrency limit
@@ -436,6 +437,8 @@ pub async fn serve(app: Router, db: PgPool, sidecar_readiness_url: Url) -> anyho
             metrics::Unit::Seconds,
             "Duration of successful costed completion request lifecycle segments."
         );
+        crate::db::describe_metrics();
+        database_health.record_availability();
         tracing::info!(path = METRICS_ROUTE, "prometheus metrics enabled");
         app.route(
             METRICS_ROUTE,
@@ -482,7 +485,10 @@ pub async fn serve(app: Router, db: PgPool, sidecar_readiness_url: Url) -> anyho
 }
 
 /// Build dependency-aware health routes for the production server and real functional gates.
-pub fn health_router(db: PgPool, sidecar_readiness_url: Url) -> anyhow::Result<Router> {
+pub fn health_router(
+    database_health: DatabaseHealth,
+    sidecar_readiness_url: Url,
+) -> anyhow::Result<Router> {
     let sidecar_client = Client::builder()
         .connect_timeout(READINESS_DEPENDENCY_TIMEOUT)
         .timeout(READINESS_DEPENDENCY_TIMEOUT)
@@ -490,7 +496,7 @@ pub fn health_router(db: PgPool, sidecar_readiness_url: Url) -> anyhow::Result<R
         .no_proxy()
         .build()?;
     let state = Arc::new(ServerState {
-        db,
+        database_health,
         sidecar_client,
         sidecar_readiness_url,
     });

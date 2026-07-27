@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::attribution::SERVED_PROVIDER_HEADER;
 use crate::registry::{ModelMapping, Provider, Registry, RegistryValidationError};
+use crate::routing_profile::RoutingProfile;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SidecarConfigOptions {
@@ -54,7 +55,8 @@ fn build_config(
     registry.validate()?;
 
     let mut models = Vec::new();
-    let mut targets_by_slug: BTreeMap<String, Vec<VirtualTarget>> = BTreeMap::new();
+    let mut targets_by_profile_slug: BTreeMap<(RoutingProfile, String), Vec<VirtualTarget>> =
+        BTreeMap::new();
 
     for provider in registry
         .providers
@@ -63,30 +65,29 @@ fn build_config(
     {
         for mapping in &provider.models {
             let route = ModelRoute::new(provider, mapping);
-            targets_by_slug
-                .entry(mapping.slug.clone())
-                .or_default()
-                .push(VirtualTarget {
-                    model: route.name.clone(),
-                    priority: provider.priority,
-                });
+            for profile in provider.profiles.iter().copied() {
+                targets_by_profile_slug
+                    .entry((profile, mapping.slug.clone()))
+                    .or_default()
+                    .push(VirtualTarget {
+                        model: route.name.clone(),
+                        priority: provider.priority,
+                    });
+            }
             models.push(route);
         }
     }
 
-    let virtual_models = targets_by_slug
+    let virtual_models = targets_by_profile_slug
         .into_iter()
-        .filter_map(|(slug, mut targets)| {
-            if targets.len() < 2 {
-                return None;
-            }
+        .map(|((profile, slug), mut targets)| {
             targets.sort_by_key(|target| target.priority);
-            Some(VirtualModel {
-                name: slug,
+            VirtualModel {
+                name: profile.sidecar_alias(&slug),
                 routing: VirtualRouting {
                     failover: Failover { targets },
                 },
-            })
+            }
         })
         .collect();
 
@@ -328,7 +329,13 @@ mod tests {
     #[test]
     fn failover_targets_follow_provider_priority() {
         let config = build_config(&fixture_registry(), SidecarConfigOptions::default()).unwrap();
-        let priorities: Vec<_> = config.llm.virtual_models[0]
+        let shared = config
+            .llm
+            .virtual_models
+            .iter()
+            .find(|model| model.name == "seren-profile-production/acme/shared")
+            .unwrap();
+        let priorities: Vec<_> = shared
             .routing
             .failover
             .targets
@@ -337,6 +344,36 @@ mod tests {
             .collect();
 
         assert_eq!(priorities, [5, 20]);
+    }
+
+    #[test]
+    fn profile_aliases_never_include_providers_from_another_profile() {
+        let mut registry = fixture_registry();
+        registry.providers[0].profiles =
+            std::collections::BTreeSet::from([RoutingProfile::Production]);
+        registry.providers[1].profiles = std::collections::BTreeSet::from([RoutingProfile::Beta]);
+        let config = build_config(&registry, SidecarConfigOptions::default()).unwrap();
+
+        let production = config
+            .llm
+            .virtual_models
+            .iter()
+            .find(|model| model.name == "seren-profile-production/acme/shared")
+            .unwrap();
+        let beta = config
+            .llm
+            .virtual_models
+            .iter()
+            .find(|model| model.name == "seren-profile-beta/acme/shared")
+            .unwrap();
+
+        assert_eq!(production.routing.failover.targets.len(), 1);
+        assert_eq!(
+            production.routing.failover.targets[0].model,
+            "slow/acme/shared"
+        );
+        assert_eq!(beta.routing.failover.targets.len(), 1);
+        assert_eq!(beta.routing.failover.targets[0].model, "fast/acme/shared");
     }
 
     #[test]

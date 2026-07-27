@@ -62,6 +62,7 @@ async fn hello() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use axum::Extension;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
@@ -70,6 +71,7 @@ mod tests {
     use super::{catalog_router, public_router};
     use crate::catalog::Catalog;
     use crate::registry::Registry;
+    use crate::routing_profile::RoutingProfile;
 
     #[tokio::test]
     async fn public_router_serves_root() {
@@ -85,7 +87,8 @@ mod tests {
     async fn production_catalog_routes_match_for_canonical_and_encoded_model_paths() {
         let registry: Registry =
             serde_yaml::from_str(include_str!("../tests/fixtures/catalog_registry.yaml")).unwrap();
-        let app = catalog_router(Catalog::from_registry(&registry));
+        let app = catalog_router(Catalog::from_registry(&registry))
+            .layer(Extension(RoutingProfile::Production));
 
         let canonical = app
             .clone()

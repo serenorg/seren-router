@@ -1,11 +1,13 @@
 // ABOUTME: Defines the declarative inference-provider and model registry.
 // ABOUTME: Validates reviewable provider metadata before sidecar config compilation.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::routing_profile::RoutingProfile;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +26,8 @@ pub struct Provider {
     pub enabled: bool,
     #[serde(default)]
     pub priority: u8,
+    #[serde(default = "default_profiles")]
+    pub profiles: BTreeSet<RoutingProfile>,
     pub models: Vec<ModelMapping>,
 }
 
@@ -42,6 +46,8 @@ pub struct ModelMapping {
 pub enum RegistryValidationError {
     #[error("duplicate provider id: {0}")]
     DuplicateProviderId(String),
+    #[error("provider {0} must allow at least one routing profile")]
+    EmptyProviderProfiles(String),
     #[error("model {slug} for provider {provider_id} has an empty display name")]
     EmptyModelName { provider_id: String, slug: String },
     #[error("model {slug} for provider {provider_id} has a zero context length")]
@@ -55,6 +61,11 @@ impl Registry {
         for provider in &self.providers {
             if !provider_ids.insert(provider.id.as_str()) {
                 return Err(RegistryValidationError::DuplicateProviderId(
+                    provider.id.clone(),
+                ));
+            }
+            if provider.profiles.is_empty() {
+                return Err(RegistryValidationError::EmptyProviderProfiles(
                     provider.id.clone(),
                 ));
             }
@@ -77,6 +88,16 @@ impl Registry {
 
         Ok(())
     }
+}
+
+impl Provider {
+    pub fn supports(&self, profile: RoutingProfile) -> bool {
+        self.profiles.contains(&profile)
+    }
+}
+
+fn default_profiles() -> BTreeSet<RoutingProfile> {
+    BTreeSet::from([RoutingProfile::Production])
 }
 
 #[cfg(test)]
@@ -122,6 +143,10 @@ providers:
         assert_eq!(reparsed, registry);
         assert!(!registry.providers[1].enabled);
         assert_eq!(registry.providers[1].priority, 0);
+        assert_eq!(
+            registry.providers[1].profiles,
+            BTreeSet::from([RoutingProfile::Production])
+        );
     }
 
     #[test]
@@ -174,6 +199,19 @@ providers:
                 provider_id: "openrouter".to_owned(),
                 slug: "meta-llama/llama-3.3-70b-instruct".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn empty_provider_profiles_are_rejected() {
+        let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
+        registry.providers[0].profiles.clear();
+
+        assert_eq!(
+            registry.validate(),
+            Err(RegistryValidationError::EmptyProviderProfiles(
+                "openrouter".to_owned()
+            ))
         );
     }
 }
