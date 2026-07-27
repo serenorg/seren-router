@@ -351,6 +351,7 @@ mod tests {
     #[test]
     fn provider_selection_and_share_state_are_profile_scoped() {
         let registry = Registry {
+            sell_prices: vec![],
             providers: vec![
                 provider_for("production-only", 0, "1.0", [RoutingProfile::Production]),
                 provider_for("beta-only", 0, "1.0", [RoutingProfile::Beta]),
@@ -381,6 +382,7 @@ mod tests {
         let mut disabled = provider("disabled", 0, "0.1");
         disabled.enabled = false;
         let registry = Registry {
+            sell_prices: vec![],
             providers: vec![
                 disabled,
                 provider("cheap", 1, "1.0"),

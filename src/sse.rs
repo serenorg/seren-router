@@ -1,19 +1,21 @@
 // ABOUTME: Frames OpenAI-compatible server-sent events across arbitrary HTTP chunks.
-// ABOUTME: Adds exact provider cost to either supported terminal streaming usage shape.
+// ABOUTME: Adds the exact customer sell subtotal to supported terminal usage shapes.
 
 use serde_json::Value;
 
+use crate::pricing::BillingPrices;
+#[cfg(test)]
 use crate::pricing::ModelPrices;
 use crate::usage_cost::{CostedUsage, inject_usage_cost_value};
 
 pub(crate) struct UsageCostTransformer {
     pending: Vec<u8>,
-    prices: ModelPrices,
+    prices: BillingPrices,
     costed_usage: Option<CostedUsage>,
 }
 
 impl UsageCostTransformer {
-    pub(crate) fn new(prices: ModelPrices) -> Self {
+    pub(crate) fn new(prices: BillingPrices) -> Self {
         Self {
             pending: Vec::new(),
             prices,
@@ -221,10 +223,16 @@ mod tests {
         );
     }
 
-    fn test_prices() -> ModelPrices {
-        ModelPrices {
-            input_price_per_mtok: Decimal::new(40, 2),
-            output_price_per_mtok: Decimal::new(80, 2),
+    fn test_prices() -> BillingPrices {
+        BillingPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: Decimal::new(10, 2),
+                output_price_per_mtok: Decimal::new(20, 2),
+            },
+            sell_price: ModelPrices {
+                input_price_per_mtok: Decimal::new(40, 2),
+                output_price_per_mtok: Decimal::new(80, 2),
+            },
         }
     }
 
@@ -235,7 +243,8 @@ mod tests {
                 prompt_tokens: 16,
                 completion_tokens: 3,
             },
-            cost_usd: "0.0000088000".parse().unwrap(),
+            provider_cost_usd: "0.0000022000".parse().unwrap(),
+            sell_price_usd: "0.0000088000".parse().unwrap(),
         }
     }
 }

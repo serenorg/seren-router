@@ -2,7 +2,7 @@
 // ABOUTME: Detects accidental provider enablement, alias drift, or unreviewed price changes.
 
 use rust_decimal::Decimal;
-use seren_router::pricing::{ModelPrices, PriceTable};
+use seren_router::pricing::{BillingPrices, ModelPrices, PriceTable, Usage, cost_usd};
 use seren_router::registry::Registry;
 use seren_router::routing_profile::RoutingProfile;
 
@@ -124,9 +124,15 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
     let prices = PriceTable::from_registry(&registry).unwrap();
     assert_eq!(
         prices.get("openrouter", "meta-llama/llama-3.3-70b-instruct"),
-        Some(&ModelPrices {
-            input_price_per_mtok: Decimal::new(13, 2),
-            output_price_per_mtok: Decimal::new(40, 2),
+        Some(&BillingPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: Decimal::new(13, 2),
+                output_price_per_mtok: Decimal::new(40, 2),
+            },
+            sell_price: ModelPrices {
+                input_price_per_mtok: Decimal::new(13, 2),
+                output_price_per_mtok: Decimal::new(40, 2),
+            },
         })
     );
     assert!(
@@ -134,5 +140,47 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
             .get("deepinfra", "meta-llama/llama-3.3-70b-instruct")
             .is_none(),
         "disabled provider prices must not enter the live price table"
+    );
+}
+
+#[test]
+fn direct_and_fallback_routes_keep_one_reviewed_sell_price_and_separate_costs() {
+    let mut registry: Registry =
+        serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap();
+    registry
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "deepinfra")
+        .unwrap()
+        .enabled = true;
+    let prices = PriceTable::from_registry(&registry).unwrap();
+    let slug = "meta-llama/llama-3.3-70b-instruct";
+    let fallback = prices.get("openrouter", slug).unwrap();
+    let direct = prices.get("deepinfra", slug).unwrap();
+
+    assert_eq!(fallback.sell_price, direct.sell_price);
+    assert_eq!(
+        direct.provider_cost,
+        ModelPrices {
+            input_price_per_mtok: Decimal::new(10, 2),
+            output_price_per_mtok: Decimal::new(32, 2),
+        }
+    );
+    assert_eq!(fallback.provider_cost, fallback.sell_price);
+
+    let observed_usage = Usage {
+        prompt_tokens: 3_962,
+        completion_tokens: 214,
+    };
+    let sell_subtotal = cost_usd(&direct.sell_price, &observed_usage);
+    let direct_provider_cost = cost_usd(&direct.provider_cost, &observed_usage);
+    let fallback_provider_cost = cost_usd(&fallback.provider_cost, &observed_usage);
+
+    assert_eq!(sell_subtotal.to_string(), "0.0006006600");
+    assert_eq!(fallback_provider_cost, sell_subtotal);
+    assert_eq!(direct_provider_cost.to_string(), "0.0004646800");
+    assert_eq!(
+        (sell_subtotal - direct_provider_cost).to_string(),
+        "0.0001359800"
     );
 }

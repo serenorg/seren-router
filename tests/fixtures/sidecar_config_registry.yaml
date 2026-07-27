@@ -1,3 +1,11 @@
+sell_prices:
+  - slug: acme/shared
+    input_price_per_mtok: "1.50"
+    output_price_per_mtok: "3.00"
+  - slug: acme/exclusive
+    input_price_per_mtok: "0.75"
+    output_price_per_mtok: "1.50"
+
 providers:
   - id: slow
     display_name: Slow Provider

@@ -1,12 +1,12 @@
-// ABOUTME: Builds exact provider/model price lookups from the reviewed registry.
-// ABOUTME: Computes true provider USD cost without floating-point arithmetic.
+// ABOUTME: Builds exact provider-cost and customer-sell lookups from the registry.
+// ABOUTME: Computes both USD amounts without floating-point arithmetic.
 
 use std::collections::HashMap;
 
 use rust_decimal::{Decimal, RoundingStrategy};
 use thiserror::Error;
 
-use crate::registry::Registry;
+use crate::registry::{PriceSide, Registry, RegistryValidationError};
 
 const TOKENS_PER_MILLION: u64 = 1_000_000;
 // Matches the request ledger's NUMERIC(18, 10) USD column.
@@ -18,6 +18,12 @@ pub struct ModelPrices {
     pub output_price_per_mtok: Decimal,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BillingPrices {
+    pub provider_cost: ModelPrices,
+    pub sell_price: ModelPrices,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Usage {
     pub prompt_tokens: u64,
@@ -26,11 +32,13 @@ pub struct Usage {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PriceTable {
-    prices_by_provider: HashMap<String, HashMap<String, ModelPrices>>,
+    prices_by_provider: HashMap<String, HashMap<String, BillingPrices>>,
 }
 
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum PriceTableError {
+    #[error(transparent)]
+    InvalidRegistry(#[from] RegistryValidationError),
     #[error("duplicate price mapping for provider {provider_id} and model {canonical_slug}")]
     DuplicateMapping {
         provider_id: String,
@@ -44,23 +52,9 @@ pub enum PriceTableError {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PriceSide {
-    Input,
-    Output,
-}
-
-impl std::fmt::Display for PriceSide {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Input => formatter.write_str("input"),
-            Self::Output => formatter.write_str("output"),
-        }
-    }
-}
-
 impl PriceTable {
     pub fn from_registry(registry: &Registry) -> Result<Self, PriceTableError> {
+        registry.validate()?;
         let enabled_provider_count = registry
             .providers
             .iter()
@@ -91,9 +85,18 @@ impl PriceTable {
                     }
                 }
 
-                let model_prices = ModelPrices {
-                    input_price_per_mtok: model.input_price_per_mtok,
-                    output_price_per_mtok: model.output_price_per_mtok,
+                let sell_price = registry
+                    .sell_price(&model.slug)
+                    .expect("validated registry has a sell price for every model");
+                let model_prices = BillingPrices {
+                    provider_cost: ModelPrices {
+                        input_price_per_mtok: model.input_price_per_mtok,
+                        output_price_per_mtok: model.output_price_per_mtok,
+                    },
+                    sell_price: ModelPrices {
+                        input_price_per_mtok: sell_price.input_price_per_mtok,
+                        output_price_per_mtok: sell_price.output_price_per_mtok,
+                    },
                 };
 
                 if provider_prices
@@ -111,7 +114,7 @@ impl PriceTable {
         Ok(Self { prices_by_provider })
     }
 
-    pub fn get(&self, provider_id: &str, canonical_slug: &str) -> Option<&ModelPrices> {
+    pub fn get(&self, provider_id: &str, canonical_slug: &str) -> Option<&BillingPrices> {
         self.prices_by_provider
             .get(provider_id)
             .and_then(|provider_prices| provider_prices.get(canonical_slug))
@@ -136,6 +139,10 @@ mod tests {
     use crate::registry::Registry;
 
     const PRICE_REGISTRY: &str = r#"
+sell_prices:
+  - slug: canonical/model
+    input_price_per_mtok: "1.00"
+    output_price_per_mtok: "2.00"
 providers:
   - id: enabled-provider
     display_name: Enabled Provider
@@ -172,9 +179,15 @@ providers:
 
         assert_eq!(
             table.get("enabled-provider", "canonical/model"),
-            Some(&ModelPrices {
-                input_price_per_mtok: "0.1234500".parse().unwrap(),
-                output_price_per_mtok: "0.80".parse().unwrap(),
+            Some(&BillingPrices {
+                provider_cost: ModelPrices {
+                    input_price_per_mtok: "0.1234500".parse().unwrap(),
+                    output_price_per_mtok: "0.80".parse().unwrap(),
+                },
+                sell_price: ModelPrices {
+                    input_price_per_mtok: "1.00".parse().unwrap(),
+                    output_price_per_mtok: "2.00".parse().unwrap(),
+                },
             })
         );
         assert_eq!(table.get("disabled-provider", "canonical/model"), None);
