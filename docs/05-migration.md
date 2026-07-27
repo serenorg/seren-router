@@ -48,9 +48,14 @@ When direct coverage reaches the models users actually call (checked against rec
 
 **Instant revert is available at every step** by restoring the `api_url` field.
 
-## Cost-parity gate
+## Pricing and cost gate
 
-Before and during migration, compare seren-router's reported `usage.cost` against OpenRouter's for the same model + token counts. A direct provider should be **cheaper** (no middleman cut); if a wired provider is not, leave that slug on the fallback until its economics or reliability justify the switch.
+Before and during migration, confirm that seren-router reports the reviewed
+route-independent sell subtotal at `usage.cost` for the same model and token counts.
+Then compare the separately stored `provider_cost_usd` across routes. A direct
+provider should cost Seren less than the OpenRouter fallback while the customer sell
+price remains exactly the catalog price. If it does not, leave that slug on the
+fallback until its economics or reliability justify the switch.
 
 ## Other OpenRouter dependencies to absorb later
 

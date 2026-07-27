@@ -42,13 +42,17 @@ Phased so each step is independently shippable and reversible. The guiding princ
 
 - [x] Select the first direct provider engineering canary: DeepInfra Llama 3.3
   70B Turbo (`docs/11`, 2026-07-27). The registry entry is disabled and
-  beta-only; legal, pricing-policy, credential, and spend gates remain.
-- [ ] Activate DeepInfra after the `docs/11` gates: written provider consent,
-  reviewed billing policy, scoped key, live compatibility test, and spend cap.
-- [ ] Confirm cheaper `usage.cost` and equal/better reliability; shift its slugs off the fallback.
+  beta-only; legal, credential, and spend gates remain.
+- [x] Approve and implement route-independent sell pricing with separately
+  reconciled provider cost (`docs/04`, 2026-07-27).
+- [ ] Activate DeepInfra after the remaining `docs/11` gates: written provider
+  consent, scoped key, live compatibility test, and spend cap.
+- [ ] Confirm lower provider cost, invariant sell-price `usage.cost`, and
+  equal/better reliability; shift its slugs off the fallback.
 - [ ] Repeat: Fireworks, Blackbox, Novita, Baseten, … (prioritize by traffic volume × margin gain).
 - [ ] Implement the routing policy in full (`docs/02`): outage gate, inverse-square price weighting, `sort` modes, `:nitro`/`:floor`, failover.
-- [ ] Stand up the per-request cost ledger + provider-invoice reconciliation (`docs/04`).
+- [x] Stand up the per-request provider-cost/sell-price ledger and reconciliation
+  contract (`docs/04`, 2026-07-27).
 
 ## Phase 5 — seren-desktop client changes
 

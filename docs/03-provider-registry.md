@@ -7,28 +7,41 @@ The core requirement: **adding a new provider must be a data + secret operation,
 
 ## Provider registry entry (declarative)
 
-One config row per inference host, versioned in this repo:
+Canonical sell prices and one config row per inference host are versioned in this
+repo:
 
 ```yaml
-- id: deepinfra
-  display_name: DeepInfra
-  base_url: https://api.deepinfra.com/v1/openai
-  auth:
-    style: bearer            # Authorization: Bearer <key>
-    secret_ref: SEREN_ROUTER_KEY_DEEPINFRA   # name only — never the key
-  adapter: openai-compatible # or a named shim for oddballs
-  enabled: true
-  profiles: [beta]
-  overrides:                 # optional
-    price_ceiling_usd_per_mtok: null
-    weight: 1.0
-    region: us
+sell_prices:
+  - slug: meta-llama/llama-3.3-70b-instruct
+    input_price_per_mtok: "0.13"
+    output_price_per_mtok: "0.40"
+
+providers:
+  - id: deepinfra
+    display_name: DeepInfra
+    base_url: https://api.deepinfra.com/v1/openai
+    secret_env: SEREN_ROUTER_KEY_DEEPINFRA # name only — never the key
+    enabled: false
+    priority: 0
+    profiles: [beta]
+    models:
+      - slug: meta-llama/llama-3.3-70b-instruct
+        name: Meta Llama 3.3 70B Instruct
+        context_length: 131072
+        provider_model_id: meta-llama/Llama-3.3-70B-Instruct-Turbo
+        input_price_per_mtok: "0.10"  # exact provider cost
+        output_price_per_mtok: "0.32"
 ```
 
 Key points:
 
-- **`secret_ref` is a name, not a key.** The actual credential lives in the secrets manager (below). Rotating or adding a key never touches this file.
-- **`adapter` defaults to `openai-compatible`.** Most of the chart's hosts (Together, Fireworks, DeepInfra, Novita, Baseten, Blackbox…) already speak OpenAI's API, so their adapters are thin. Only a host with a non-standard API needs a new code shim.
+- **`secret_env` is a name, not a key.** The actual credential lives in the
+  secrets manager (below). Rotating or adding a key never puts it in this file.
+- **Provider prices are cost, not customer price.** The top-level `sell_prices`
+  table owns the route-independent customer subtotal reported at `usage.cost`.
+  See `docs/04`.
+- **OpenAI-compatible is the current standard path.** Most candidate hosts already
+  speak OpenAI's API. Only a host with a non-standard API needs a new code shim.
 - **`profiles` is an allowlist, not a traffic hint.** Omission safely defaults to
   production for backward compatibility. A beta-only provider must declare
   `profiles: [beta]`; routing, catalog responses, measurements, share state, and
@@ -80,14 +93,19 @@ A scheduled task:
 
 1. Hits each enabled provider's own `/models` endpoint (or a curated map where a provider lacks one).
 2. Normalizes results into canonical `vendor/model` slugs.
-3. Records that provider's price, context window, and capabilities per slug.
+3. Records that provider's cost, context window, and capabilities per slug.
 4. Rebuilds the **slug → providers index** that the router ranks over, and which backs `GET /api/v1/models`.
+
+Discovery never changes `sell_prices`. A new slug or customer-price change needs
+explicit owner review. Catalog `pricing` fields always come from the reviewed sell
+table, so provider discovery cannot silently alter customer billing.
 
 ## Onboarding a provider — the happy path
 
-1. Add a registry row.
-2. Drop the key into the secrets manager.
-3. Let the sync job discover its models.
+1. Add or review the canonical sell-price row.
+2. Add a provider registry row with exact provider costs.
+3. Drop the key into the secrets manager.
+4. Let the sync job discover its models.
 
 No deploy for standard hosts. A non-standard host additionally needs an adapter (code).
 

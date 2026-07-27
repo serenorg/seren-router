@@ -1,4 +1,4 @@
-// ABOUTME: Persists successful provider generations for exact cost reconciliation.
+// ABOUTME: Persists provider cost and customer sell subtotal for reconciliation.
 // ABOUTME: Serves OpenRouter-shaped generation metadata by provider response ID.
 
 use std::str::FromStr;
@@ -51,10 +51,12 @@ impl Ledger {
                     prompt_tokens,
                     completion_tokens,
                     cost_usd,
+                    provider_cost_usd,
+                    sell_price_usd,
                     latency_ms,
                     status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 "#,
             )
             .bind(&generation.id)
@@ -63,7 +65,10 @@ impl Ledger {
             .bind(&generation.provider_id)
             .bind(generation.prompt_tokens)
             .bind(generation.completion_tokens)
-            .bind(generation.cost_usd)
+            // cost_usd remains a rollback-compatible mirror of sell_price_usd.
+            .bind(generation.sell_price_usd)
+            .bind(generation.provider_cost_usd)
+            .bind(generation.sell_price_usd)
             .bind(generation.latency_ms)
             .bind(generation.status)
             .execute(&self.pool),
@@ -100,7 +105,8 @@ impl Ledger {
                     provider_id,
                     prompt_tokens,
                     completion_tokens,
-                    cost_usd,
+                    COALESCE(sell_price_usd, cost_usd) AS sell_price_usd,
+                    provider_cost_usd,
                     latency_ms
                 FROM generations
                 WHERE id = $1
@@ -135,7 +141,8 @@ pub(crate) struct GenerationWrite {
     pub(crate) provider_id: String,
     pub(crate) prompt_tokens: i64,
     pub(crate) completion_tokens: i64,
-    pub(crate) cost_usd: Decimal,
+    pub(crate) provider_cost_usd: Decimal,
+    pub(crate) sell_price_usd: Decimal,
     pub(crate) latency_ms: i64,
     pub(crate) status: i16,
 }
@@ -148,7 +155,8 @@ struct Generation {
     provider_id: String,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
-    cost_usd: Option<Decimal>,
+    sell_price_usd: Option<Decimal>,
+    provider_cost_usd: Option<Decimal>,
     latency_ms: i64,
 }
 
@@ -186,7 +194,7 @@ pub(crate) async fn get_generation(
 
 fn generation_response(generation: Generation) -> Response {
     let total_cost = generation
-        .cost_usd
+        .sell_price_usd
         .map(decimal_value)
         .unwrap_or(Value::Null);
 
@@ -242,7 +250,8 @@ mod tests {
             provider_id: "provider-a".to_owned(),
             prompt_tokens: 12,
             completion_tokens: 5,
-            cost_usd: "0.0000190000".parse().unwrap(),
+            provider_cost_usd: "0.0000150000".parse().unwrap(),
+            sell_price_usd: "0.0000190000".parse().unwrap(),
             latency_ms: 321,
             status: 200,
         };
@@ -266,7 +275,16 @@ mod tests {
         assert_eq!(stored.provider_id, write.provider_id);
         assert_eq!(stored.prompt_tokens, Some(write.prompt_tokens));
         assert_eq!(stored.completion_tokens, Some(write.completion_tokens));
-        assert_eq!(stored.cost_usd, Some(write.cost_usd));
+        assert_eq!(stored.provider_cost_usd, Some(write.provider_cost_usd));
+        assert_eq!(stored.sell_price_usd, Some(write.sell_price_usd));
+        assert_eq!(
+            sqlx::query_scalar::<_, Decimal>("SELECT cost_usd FROM generations WHERE id = $1")
+                .bind(&write.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            write.sell_price_usd
+        );
         assert_eq!(stored.latency_ms, write.latency_ms);
         assert_eq!(
             sqlx::query_scalar::<_, i16>("SELECT status FROM generations WHERE id = $1")
@@ -279,7 +297,7 @@ mod tests {
 
         let app = axum::Router::new()
             .route("/api/v1/generation", get(get_generation))
-            .with_state(ledger)
+            .with_state(ledger.clone())
             .layer(Extension(RoutingProfile::Production));
         let found = app
             .clone()
@@ -323,5 +341,34 @@ mod tests {
             .unwrap(),
             json!({"error": {"message": "generation not found"}})
         );
+
+        sqlx::query(
+            r#"
+            INSERT INTO generations (
+                id,
+                routing_profile,
+                canonical_slug,
+                provider_id,
+                prompt_tokens,
+                completion_tokens,
+                cost_usd,
+                latency_ms,
+                status
+            )
+            VALUES ($1, 'production', 'canonical/model', 'legacy-provider', 1, 1, $2, 1, 200)
+            "#,
+        )
+        .bind("chatcmpl-legacy-rollback")
+        .bind(Decimal::new(7, 10))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let legacy = ledger
+            .fetch("chatcmpl-legacy-rollback", RoutingProfile::Production)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.sell_price_usd, Some(Decimal::new(7, 10)));
+        assert_eq!(legacy.provider_cost_usd, None);
     }
 }

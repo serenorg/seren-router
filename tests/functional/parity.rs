@@ -74,7 +74,7 @@ impl Settings {
             .get("openrouter", &model)
             .unwrap_or_else(|| panic!("{MODEL_ENV} must name an enabled OpenRouter registry model"))
             .clone();
-        let estimated_cost = estimated_maximum_cost(planned_calls, &prices);
+        let estimated_cost = estimated_maximum_cost(planned_calls, &prices.provider_cost);
         assert!(
             estimated_cost <= budget,
             "planned traffic has a conservative estimated cost of ${estimated_cost}, above the ${budget} budget"
@@ -1041,7 +1041,8 @@ mod tests {
             .clone();
 
         assert!(
-            estimated_maximum_cost(SOAK_REQUESTS_PER_PATH * 2, &prices) < "0.10".parse().unwrap()
+            estimated_maximum_cost(SOAK_REQUESTS_PER_PATH * 2, &prices.provider_cost)
+                < "0.10".parse().unwrap()
         );
     }
 }

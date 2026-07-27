@@ -21,7 +21,7 @@ use seren_router::ledger::Ledger;
 use seren_router::policy::measurements::{MeasurementStore, Observation};
 use seren_router::pricing::{PriceTable, Usage, cost_usd};
 use seren_router::proxy::ProxyState;
-use seren_router::registry::{ModelMapping, Provider, Registry};
+use seren_router::registry::{ModelMapping, Provider, Registry, SellPrice};
 use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 use seren_router::{routes, server};
@@ -617,6 +617,18 @@ fn router_app(
 
 fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Registry {
     Registry {
+        sell_prices: vec![
+            SellPrice {
+                slug: VIRTUAL_MODEL.to_owned(),
+                input_price_per_mtok: "0.40".parse().unwrap(),
+                output_price_per_mtok: "0.80".parse().unwrap(),
+            },
+            SellPrice {
+                slug: BETA_VIRTUAL_MODEL.to_owned(),
+                input_price_per_mtok: "0.40".parse().unwrap(),
+                output_price_per_mtok: "0.80".parse().unwrap(),
+            },
+        ],
         providers: vec![
             functional_provider(
                 "dead",
@@ -1155,8 +1167,8 @@ async fn functional_compatibility_metadata() {
                         "model_name": "Functional Model",
                         "context_length": 131072,
                         "pricing": {
-                            "prompt": "0.000009",
-                            "completion": "0.000009"
+                            "prompt": "0.0000004",
+                            "completion": "0.0000008"
                         },
                         "provider_name": "Functional dead",
                         "tag": "dead"
@@ -1179,8 +1191,8 @@ async fn functional_compatibility_metadata() {
                         "model_name": "Functional Model",
                         "context_length": 131072,
                         "pricing": {
-                            "prompt": "0.000002",
-                            "completion": "0.000004"
+                            "prompt": "0.0000004",
+                            "completion": "0.0000008"
                         },
                         "provider_name": "Functional expensive",
                         "tag": "expensive"

@@ -35,19 +35,19 @@ identifiers, or generation bodies:
 
 At the reviewed prices, exact decimal arithmetic gives:
 
-| Route | Input / MTok | Output / MTok | 72-hour provider cost | 5% Gateway fee | Customer total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| OpenRouter fallback | $0.13 | $0.40 | $0.0006006600 | $0.0000300330 | $0.0006306930 |
-| DeepInfra direct | $0.10 | $0.32 | $0.0004646800 | $0.0000232340 | $0.0004879140 |
+| Route | Provider input / MTok | Provider output / MTok | Provider cost | Sell subtotal | 5% Gateway fee | Customer total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OpenRouter fallback | $0.13 | $0.40 | $0.0006006600 | $0.0006006600 | $0.0000300330 | $0.0006306930 |
+| DeepInfra direct | $0.10 | $0.32 | $0.0004646800 | $0.0006006600 | $0.0000300330 | $0.0006306930 |
 
 For this token mix, the direct route is $0.0001359800 cheaper, a
 22.6384310592% provider-cost reduction. Input is 23.0769230769% cheaper and
 output is 20% cheaper.
 
-The current true-cost-plus-5% billing contract passes the saving to the customer
-and reduces the absolute Gateway fee. It does **not** retain the removed
-middleman spread as Seren margin. That pricing-policy mismatch must be resolved
-before presenting the provider move as margin expansion.
+The approved policy in `docs/04` keeps one reviewed sell price across routes and
+stores provider cost separately. For this mix, the direct route therefore creates
+$0.0001359800 of router gross margin, or 22.6384310592% of the sell subtotal,
+without changing the documented customer price or the existing Gateway fee.
 
 ## Compatibility and operations
 
@@ -125,7 +125,8 @@ a separate issue before the provider is enabled:
    immediately on suspected exposure or owner/access changes.
 4. Start with a cumulative $5 beta spend limit and record the account's actual
    RPM/TPM limits before sending traffic.
-5. Resolve the true-cost billing/margin policy and approve the customer price.
+5. **Resolved in #58:** keep the reviewed OpenRouter-equivalent sell price,
+   preserve exact provider cost separately, and let Gateway apply its 5% once.
 6. Run JSON, SSE, schema, usage-cost, provider-attribution, failover, and
    zero-cross-profile-leakage tests through the beta credential only.
 7. Keep OpenRouter enabled for both profiles as the immediate fallback and do

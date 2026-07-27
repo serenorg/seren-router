@@ -1,5 +1,5 @@
 // ABOUTME: Proxies authenticated completion requests through the agentgateway sidecar.
-// ABOUTME: Adds exact provider cost to non-streaming JSON and terminal SSE usage events.
+// ABOUTME: Adds the reviewed customer sell subtotal to JSON and terminal SSE usage.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -599,7 +599,8 @@ impl GenerationContext {
             provider_id: self.provider_id,
             prompt_tokens,
             completion_tokens,
-            cost_usd: costed.cost_usd,
+            provider_cost_usd: costed.provider_cost_usd,
+            sell_price_usd: costed.sell_price_usd,
             latency_ms,
             status: i16::try_from(self.status.as_u16()).expect("HTTP status fits in SMALLINT"),
         };
@@ -767,7 +768,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::registry::{ModelMapping, Provider, Registry};
+    use crate::registry::{ModelMapping, Provider, Registry, SellPrice};
     use crate::usage_cost::CostOmission;
 
     #[test]
@@ -800,7 +801,8 @@ mod tests {
                     prompt_tokens: 16,
                     completion_tokens: 3,
                 },
-                cost_usd: "0.0000088000".parse().unwrap(),
+                provider_cost_usd: "0.0000022000".parse().unwrap(),
+                sell_price_usd: "0.0000088000".parse().unwrap(),
             }
         );
         assert!(expected.get("provider").is_none());
@@ -836,6 +838,11 @@ mod tests {
 
     fn test_price_table() -> PriceTable {
         PriceTable::from_registry(&Registry {
+            sell_prices: vec![SellPrice {
+                slug: "functional-model".to_owned(),
+                input_price_per_mtok: Decimal::new(40, 2),
+                output_price_per_mtok: Decimal::new(80, 2),
+            }],
             providers: vec![Provider {
                 id: "local".to_owned(),
                 display_name: "Local".to_owned(),
@@ -849,8 +856,8 @@ mod tests {
                     name: "Functional Model".to_owned(),
                     context_length: 131_072,
                     provider_model_id: "local-model".to_owned(),
-                    input_price_per_mtok: Decimal::new(40, 2),
-                    output_price_per_mtok: Decimal::new(80, 2),
+                    input_price_per_mtok: Decimal::new(10, 2),
+                    output_price_per_mtok: Decimal::new(20, 2),
                 }],
             }],
         })

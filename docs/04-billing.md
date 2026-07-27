@@ -1,47 +1,142 @@
-<!-- ABOUTME: The cost-accounting contract for seren-router and how it fits Seren's existing billing.
-ABOUTME: Distinguishes the customer-facing billing (untouched) from provider-facing cost accounting (rebuilt). -->
+<!-- ABOUTME: Defines the reviewed sell-price, provider-cost, and Gateway-fee contract.
+ABOUTME: Gives exact reconciliation formulas and rollout-safe ledger semantics. -->
 
 # 04 — Billing & Cost Accounting
 
-"Copy OpenRouter's billing" needs precision, because there are **two** billing layers and we should rebuild only one. Rebuilding both would duplicate SerenBucks and fight the Gateway.
+## Approved policy
 
-## Layer that stays untouched — customer-facing billing
+Decision date: 2026-07-27. The owner approved a **reviewed sell-price layer** for
+direct-provider routing.
 
-These all live on the **Gateway** and keep working unchanged:
+The customer-facing pre-Gateway price for a canonical model stays at its reviewed
+`sell_prices` registry rate regardless of which provider serves the request. The
+initial sell prices equal the incumbent OpenRouter rates. A cheaper direct route
+therefore leaves the customer's documented price unchanged and converts the removed
+middleman spread into Seren router gross margin.
 
-- SerenBucks debit
-- the `gateway_fee_percent: 5%` markup
-- the `ApiResultResponse` envelope (`cost` / `asset_symbol` / `payment_source` / `cost_breakdown`)
-- prepaid and on-chain (x402) payment
-- 402-on-insufficient-balance
+Provider cost remains exact and separate. It is never substituted for the sell price,
+and it is never discarded.
 
-We do **not** rebuild OpenRouter's customer credit system. Seren already has one.
+## The three amounts
 
-## Layer we rebuild — provider-facing cost accounting
+For one successful generation:
 
-This is the OpenRouter billing behavior seren-router must copy.
+1. **Provider cost** is the served provider's reviewed input/output cost multiplied by
+   actual token usage.
+2. **Sell subtotal** is the canonical model's reviewed input/output sell price
+   multiplied by the same token usage.
+3. **Gateway fee** is the existing 5% fee applied by Seren Gateway to the sell
+   subtotal.
 
-### The critical contract: `usage.cost`
+All router arithmetic uses `rust_decimal`, divides per-million-token rates by exactly
+`1_000_000`, rounds once to ten decimal places with midpoint-away-from-zero, and
+stores `NUMERIC(18, 10)`. No binary floating-point value enters billing.
 
-seren-router's single most important billing job is to **populate `usage.cost` (USD) accurately in every response body**, because the Gateway reads exactly that path (`upstream_cost_response_path: "usage.cost"`) to meter and mark up. For each call:
+The router reports only the sell subtotal at `usage.cost`. Gateway continues to read
+`upstream_cost_response_path: "usage.cost"` and add its 5% exactly once. The router
+does not add, estimate, or embed the Gateway fee.
 
-- compute the true provider cost — the chosen provider's token pricing × actual tokens, or the provider's own returned cost;
-- report it at `usage.cost`.
+## Exact Llama example
 
-### Streaming
+The reviewed 72-hour token mix was 3,962 prompt tokens and 214 completion tokens:
 
-For streamed responses, final cost is not known until the end. seren-router must:
+| Route | Sell subtotal | Provider cost | Router gross margin | Gateway fee | Customer total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OpenRouter fallback | $0.0006006600 | $0.0006006600 | $0.0000000000 | $0.0000300330 | $0.0006306930 |
+| DeepInfra direct | $0.0006006600 | $0.0004646800 | $0.0001359800 | $0.0000300330 | $0.0006306930 |
 
-- emit a **final usage chunk** carrying cost (as OpenRouter does), and
-- back it with `GET /api/v1/generation?id=` for exact post-hoc lookup.
+The intended router gross-margin metric is:
 
-## Where the margin actually grows
+```text
+router_gross_margin_usd = sell_price_usd - provider_cost_usd
+router_gross_margin_percent = router_gross_margin_usd / sell_price_usd × 100
+```
 
-- **Today:** Seren pays OpenRouter (provider rate **plus OpenRouter's cut**), then adds 5%.
-- **After:** Seren pays the provider **directly** — no middleman cut — and still applies its markup.
+For the direct row above, router gross margin is 22.6384310592% of the sell subtotal.
+The Gateway fee is reported separately; combining it with router margin would obscure
+which layer earned the revenue.
 
-seren-router reports the **true provider cost** and lets the Gateway own the markup, so pricing policy stays in one place. Margin expands by exactly OpenRouter's former take. That expansion is the economic case for this project.
+If a reliability fallback costs more than the reviewed sell price, the customer price
+does not rise. Reconciliation reports negative router margin and operations must
+review or disable that route.
 
-## New back-office need: reconciliation
+## Registry and catalog contract
 
-Because Seren now pays N providers directly, it needs a **per-request cost ledger** to reconcile metered `usage.cost` against the actual invoices each provider bills. This is operational finance work OpenRouter previously absorbed (see risks in `docs/07`).
+`registry/providers.yaml` has two independent price sources:
+
+- top-level `sell_prices` contains one reviewed pre-Gateway customer price per
+  canonical slug;
+- each provider model mapping contains that provider's input/output cost.
+
+Every provider mapping, including a disabled canary, must reference exactly one
+non-negative sell-price row. Missing, duplicate, or negative sell prices fail registry
+validation. Missing, duplicate, or negative enabled-provider costs fail price-table
+construction.
+
+`GET /api/v1/models` and every model endpoint expose `sell_prices` as per-token
+`pricing.prompt` and `pricing.completion`. Provider cost is intentionally not exposed
+as customer pricing. Consequently, all endpoints for one canonical slug publish the
+same price even when their underlying costs differ.
+
+A sell-price change requires owner review, an exact-decimal fixture update, and a
+coordinated catalog/Gateway review. Enabling or changing a provider cost cannot
+silently change the customer price.
+
+## JSON, streaming, and generation lookup
+
+For non-streaming responses, the router injects the computed sell subtotal into
+`usage.cost`. For streaming responses it injects the same value into the terminal
+usage event before `[DONE]`.
+
+Both paths retain the provider cost internally and persist both amounts under the
+provider response ID. `GET /api/v1/generation?id=` returns the sell subtotal as
+`data.total_cost`, matching the metered response. It does not expose the internal
+provider cost.
+
+## Ledger and mixed-version safety
+
+New rows contain:
+
+- `provider_cost_usd`: exact cost expected from the served provider;
+- `sell_price_usd`: exact pre-Gateway customer subtotal;
+- `cost_usd`: a rollback-compatible mirror of `sell_price_usd`.
+
+Migration `0003_generation_pricing_policy.sql` backfills both new columns from legacy
+`cost_usd`. Before this policy, `cost_usd` was provider cost, so historical backfilled
+rows correctly have zero inferred router margin. New binaries write all three
+columns. An older binary can still write `cost_usd` during rollback without a schema
+failure; such a row has null new columns and must be treated as legacy.
+
+## Reconciliation
+
+Aggregate only rows with both new amounts present:
+
+```sql
+SELECT
+    date_trunc('day', created_at) AS day,
+    routing_profile,
+    provider_id,
+    canonical_slug,
+    COUNT(*) AS requests,
+    SUM(provider_cost_usd) AS provider_cost_usd,
+    SUM(sell_price_usd) AS sell_price_usd,
+    SUM(sell_price_usd - provider_cost_usd) AS router_gross_margin_usd
+FROM generations
+WHERE provider_cost_usd IS NOT NULL
+  AND sell_price_usd IS NOT NULL
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2, 3, 4;
+```
+
+Operations reconcile `provider_cost_usd` against provider usage exports and invoices,
+then reconcile `sell_price_usd` against Gateway upstream-cost metering. Investigate:
+
+- missing amounts or ledger-write failures;
+- provider invoice drift beyond the provider-specific tolerance;
+- `cost_usd <> sell_price_usd` on new rows;
+- negative router gross margin;
+- catalog sell prices that differ from the checked-in registry; and
+- any Gateway charge that applies the 5% fee more than once.
+
+No prompt, response body, customer identifier, authorization header, or credential is
+needed for this reconciliation.

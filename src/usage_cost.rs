@@ -1,5 +1,5 @@
-// ABOUTME: Resolves the served provider's reviewed model prices for one request.
-// ABOUTME: Injects exact Decimal-derived usage cost into OpenAI-compatible JSON values.
+// ABOUTME: Resolves reviewed provider-cost and customer sell prices for one request.
+// ABOUTME: Injects only the exact sell subtotal into OpenAI-compatible usage.cost.
 
 use std::fmt;
 use std::str::FromStr;
@@ -7,13 +7,14 @@ use std::str::FromStr;
 use serde_json::{Number, Value};
 
 use crate::attribution::ServedProvider;
-use crate::pricing::{ModelPrices, PriceTable, Usage, cost_usd};
+use crate::pricing::{BillingPrices, PriceTable, Usage, cost_usd};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CostedUsage {
     pub(crate) response_id: Option<String>,
     pub(crate) usage: Usage,
-    pub(crate) cost_usd: rust_decimal::Decimal,
+    pub(crate) provider_cost_usd: rust_decimal::Decimal,
+    pub(crate) sell_price_usd: rust_decimal::Decimal,
 }
 
 pub(crate) struct CostedResponse {
@@ -44,7 +45,7 @@ pub(crate) fn prices_for_request<'a>(
     requested_model: &str,
     served_provider: &ServedProvider,
     price_table: &'a PriceTable,
-) -> Result<&'a ModelPrices, CostOmission> {
+) -> Result<&'a BillingPrices, CostOmission> {
     let canonical_slug = canonical_slug(requested_model, served_provider.as_str());
     price_table
         .get(served_provider.as_str(), canonical_slug)
@@ -68,7 +69,7 @@ pub(crate) fn inject_usage_cost(
 
 pub(crate) fn inject_usage_cost_value(
     response: &mut Value,
-    prices: &ModelPrices,
+    prices: &BillingPrices,
 ) -> Result<CostedUsage, CostOmission> {
     let response_id = response
         .get("id")
@@ -88,15 +89,17 @@ pub(crate) fn inject_usage_cost_value(
             .and_then(Value::as_u64)
             .ok_or(CostOmission::InvalidUsage)?,
     };
-    let cost = cost_usd(prices, &token_usage);
-    let cost_number =
-        Number::from_str(&cost.to_string()).expect("Decimal always serializes as a JSON number");
+    let provider_cost = cost_usd(&prices.provider_cost, &token_usage);
+    let sell_price = cost_usd(&prices.sell_price, &token_usage);
+    let cost_number = Number::from_str(&sell_price.to_string())
+        .expect("Decimal always serializes as a JSON number");
     usage.insert("cost".to_owned(), Value::Number(cost_number));
 
     Ok(CostedUsage {
         response_id,
         usage: token_usage,
-        cost_usd: cost,
+        provider_cost_usd: provider_cost,
+        sell_price_usd: sell_price,
     })
 }
 

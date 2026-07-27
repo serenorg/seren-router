@@ -107,8 +107,9 @@ All require a Gateway bearer credential. `SEREN_ROUTER_GATEWAY_KEY` is bound to 
 production provider profile; optional `SEREN_ROUTER_BETA_GATEWAY_KEY` is bound to the
 beta profile and must be distinct. Client headers cannot choose or override the
 profile. Completion responses
-carry exact provider `usage.cost`; successful costed generations are persisted for
-post-hoc lookup and reconciliation. The model and endpoint catalogs are assembled at
+carry exact reviewed sell-price `usage.cost`; successful generations persist both
+provider cost and sell subtotal for post-hoc lookup and reconciliation. The model and
+endpoint catalogs are assembled at
 startup from enabled provider mappings and report exact per-token prices as decimal
 strings. Endpoint responses expose registry metadata only; they never expose provider
 URLs or secret names. The key and credit responses are fixed compatibility metadata
