@@ -4,6 +4,7 @@
 use rust_decimal::Decimal;
 use seren_router::pricing::{ModelPrices, PriceTable};
 use seren_router::registry::Registry;
+use seren_router::routing_profile::RoutingProfile;
 
 #[test]
 fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
@@ -22,6 +23,35 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
     assert_eq!(openrouter.base_url, "https://openrouter.ai/api/v1");
     assert_eq!(openrouter.secret_env, "SEREN_ROUTER_KEY_OPENROUTER");
     assert_eq!(openrouter.priority, u8::MAX);
+    assert_eq!(
+        openrouter.profiles,
+        [RoutingProfile::Production, RoutingProfile::Beta]
+            .into_iter()
+            .collect()
+    );
+    let deepinfra = registry
+        .providers
+        .iter()
+        .find(|provider| provider.id == "deepinfra")
+        .unwrap();
+    assert!(!deepinfra.enabled);
+    assert_eq!(
+        deepinfra.profiles,
+        [RoutingProfile::Beta].into_iter().collect()
+    );
+    assert_eq!(deepinfra.base_url, "https://api.deepinfra.com/v1/openai");
+    assert_eq!(deepinfra.secret_env, "SEREN_ROUTER_KEY_DEEPINFRA");
+    assert_eq!(deepinfra.priority, 0);
+    assert_eq!(deepinfra.models.len(), 1);
+    let deepinfra_llama = &deepinfra.models[0];
+    assert_eq!(deepinfra_llama.slug, "meta-llama/llama-3.3-70b-instruct");
+    assert_eq!(
+        deepinfra_llama.provider_model_id,
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    );
+    assert_eq!(deepinfra_llama.context_length, 131_072);
+    assert_eq!(deepinfra_llama.input_price_per_mtok, Decimal::new(10, 2));
+    assert_eq!(deepinfra_llama.output_price_per_mtok, Decimal::new(32, 2));
 
     let actual: Vec<_> = openrouter
         .models
@@ -99,5 +129,10 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
             output_price_per_mtok: Decimal::new(40, 2),
         })
     );
-    assert!(prices.get("fireworks", "unknown").is_none());
+    assert!(
+        prices
+            .get("deepinfra", "meta-llama/llama-3.3-70b-instruct")
+            .is_none(),
+        "disabled provider prices must not enter the live price table"
+    );
 }

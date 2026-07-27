@@ -1,7 +1,7 @@
 // ABOUTME: Owns the real agentgateway, Axum router, ports, logs, and temp config.
 // ABOUTME: Exercises chat, SSE, authentication, and failover without network mocks.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ use seren_router::policy::measurements::{MeasurementStore, Observation};
 use seren_router::pricing::{PriceTable, Usage, cost_usd};
 use seren_router::proxy::ProxyState;
 use seren_router::registry::{ModelMapping, Provider, Registry};
+use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 use seren_router::{routes, server};
 use tokio::sync::oneshot;
@@ -30,7 +31,9 @@ use tokio::time::{Instant, MissedTickBehavior, timeout};
 use uuid::Uuid;
 
 const GATEWAY_KEY: &str = "functional-gateway-key";
+const BETA_GATEWAY_KEY: &str = "functional-beta-gateway-key";
 const VIRTUAL_MODEL: &str = "functional-model";
+const BETA_VIRTUAL_MODEL: &str = "beta/functional-model";
 const LOCAL_MODEL: &str = "local/functional-model";
 const DEFAULT_UPSTREAM_URL: &str = "http://127.0.0.1:1234/v1";
 const DEFAULT_MODEL: &str = "gemma-3-1b-it-glm-4.7-flash-heretic-uncensored-thinking_gguf";
@@ -140,6 +143,8 @@ struct FunctionalHarness {
     sidecar: OwnedChild,
     router_shutdown: Option<oneshot::Sender<()>>,
     router_task: Option<JoinHandle<std::io::Result<()>>>,
+    database_supervisor: Option<JoinHandle<()>>,
+    database_health: db::DatabaseHealth,
     runtime_ports: [u16; 5],
     artifacts: Artifacts,
     measurements: MeasurementStore,
@@ -154,6 +159,10 @@ struct StreamTiming {
 
 impl FunctionalHarness {
     async fn start() -> Self {
+        Self::start_with_database(DatabaseMode::Reachable).await
+    }
+
+    async fn start_with_database(database_mode: DatabaseMode) -> Self {
         let ports = Ports::allocate();
         let runtime_ports = ports.owned_runtime_ports();
         let artifacts = Artifacts::create();
@@ -177,6 +186,8 @@ impl FunctionalHarness {
             .env("SEREN_TEST_KEY_DEAD", "functional-fixture-only")
             .env("SEREN_TEST_KEY_LOCAL", "functional-fixture-only")
             .env("SEREN_TEST_KEY_EXPENSIVE", "functional-fixture-only")
+            .env("SEREN_TEST_KEY_BETA_DEAD", "functional-fixture-only")
+            .env("SEREN_TEST_KEY_BETA_LOCAL", "functional-fixture-only")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -200,18 +211,34 @@ impl FunctionalHarness {
         let sidecar_url = format!("http://127.0.0.1:{}", ports.llm);
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL is required for functional tests");
-        let pool = db::connect(&database_url)
-            .await
-            .expect("functional test database must be reachable");
-        sqlx::migrate!()
-            .run(&pool)
-            .await
-            .expect("functional test database migrations must succeed");
+        let (pool, database_health, database_supervisor) = match database_mode {
+            DatabaseMode::Reachable => {
+                let pool = db::connect(&database_url)
+                    .await
+                    .expect("functional test database must be reachable");
+                sqlx::migrate!()
+                    .run(&pool)
+                    .await
+                    .expect("functional test database migrations must succeed");
+                (pool, db::DatabaseHealth::ready(), None)
+            }
+            DatabaseMode::Unavailable => {
+                let unavailable_url = format!(
+                    "postgresql://functional:functional@127.0.0.1:{}/functional",
+                    ports.dead_upstream
+                );
+                let pool = db::connect_lazy(&unavailable_url)
+                    .expect("unavailable database URL must still be valid");
+                let health = db::DatabaseHealth::starting();
+                let supervisor = tokio::spawn(db::supervise(pool.clone(), health.clone()));
+                (pool, health, Some(supervisor))
+            }
+        };
         let measurements = MeasurementStore::default();
-        let ledger = Ledger::new(pool.clone());
+        let ledger = Ledger::with_health(pool, database_health.clone());
         let app = router_app(&sidecar_url, &registry, ledger, measurements.clone()).merge(
             server::health_router(
-                pool,
+                database_health.clone(),
                 Url::parse(&format!(
                     "http://127.0.0.1:{}/healthz/ready",
                     ports.readiness
@@ -238,6 +265,8 @@ impl FunctionalHarness {
             sidecar,
             router_shutdown: Some(router_shutdown),
             router_task: Some(router_task),
+            database_supervisor,
+            database_health,
             runtime_ports,
             artifacts,
             measurements,
@@ -270,6 +299,48 @@ impl FunctionalHarness {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn chat_with_key(
+        &self,
+        model: &str,
+        key: &str,
+        forged_profile: Option<&str>,
+    ) -> Response {
+        self.chat_with_key_and_options(model, key, false, forged_profile, None)
+            .await
+    }
+
+    async fn chat_with_key_and_options(
+        &self,
+        model: &str,
+        key: &str,
+        stream: bool,
+        forged_profile: Option<&str>,
+        provider: Option<Value>,
+    ) -> Response {
+        let mut body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply only with the word pong."}],
+            "temperature": 0,
+            "max_tokens": 16,
+            "stream": stream
+        });
+        if stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        if let Some(provider) = provider {
+            body["provider"] = provider;
+        }
+        let mut request = self
+            .client
+            .post(format!("{}/api/v1/chat/completions", self.router_base_url))
+            .bearer_auth(key)
+            .json(&body);
+        if let Some(profile) = forged_profile {
+            request = request.header("x-seren-routing-profile", profile);
+        }
+        request.send().await.unwrap()
     }
 
     fn seed_measurement(
@@ -317,9 +388,13 @@ impl FunctionalHarness {
     }
 
     async fn models(&self) -> Response {
+        self.models_with_key(GATEWAY_KEY).await
+    }
+
+    async fn models_with_key(&self, key: &str) -> Response {
         self.client
             .get(format!("{}/api/v1/models", self.router_base_url))
-            .bearer_auth(GATEWAY_KEY)
+            .bearer_auth(key)
             .send()
             .await
             .unwrap()
@@ -377,14 +452,13 @@ impl FunctionalHarness {
     }
 
     async fn generation(&self, id: &str) -> Response {
+        self.generation_with_key(id, GATEWAY_KEY).await
+    }
+
+    async fn generation_with_key(&self, id: &str, key: &str) -> Response {
         let mut url = Url::parse(&format!("{}/api/v1/generation", self.router_base_url)).unwrap();
         url.query_pairs_mut().append_pair("id", id);
-        self.client
-            .get(url)
-            .bearer_auth(GATEWAY_KEY)
-            .send()
-            .await
-            .unwrap()
+        self.client.get(url).bearer_auth(key).send().await.unwrap()
     }
 
     async fn unauthenticated_generation(&self) -> Response {
@@ -400,6 +474,11 @@ impl FunctionalHarness {
 
     async fn livez(&self) -> Response {
         self.unauthenticated_get("/livez").await
+    }
+
+    fn simulate_database_loss(&self) {
+        self.database_health
+            .report_failure("insert_generation", &sqlx::Error::PoolTimedOut);
     }
 
     async fn readyz(&self) -> Response {
@@ -472,6 +551,10 @@ impl FunctionalHarness {
     async fn shutdown_and_assert_clean(mut self) {
         self.shutdown_router().await;
         self.sidecar.terminate();
+        if let Some(supervisor) = self.database_supervisor.take() {
+            supervisor.abort();
+            let _ = supervisor.await;
+        }
 
         for port in self.runtime_ports {
             StdTcpListener::bind((Ipv4Addr::LOCALHOST, port))
@@ -500,7 +583,16 @@ impl Drop for FunctionalHarness {
         if let Some(task) = self.router_task.take() {
             task.abort();
         }
+        if let Some(supervisor) = self.database_supervisor.take() {
+            supervisor.abort();
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum DatabaseMode {
+    Reachable,
+    Unavailable,
 }
 
 fn router_app(
@@ -509,7 +601,7 @@ fn router_app(
     ledger: Ledger,
     measurements: MeasurementStore,
 ) -> Router {
-    let auth = GatewayAuth::new(GATEWAY_KEY.as_bytes());
+    let auth = GatewayAuth::new(GATEWAY_KEY.as_bytes()).with_beta_key(BETA_GATEWAY_KEY.as_bytes());
     let catalog = Catalog::from_registry(registry);
     let proxy = ProxyState::new(
         sidecar_url,
@@ -553,6 +645,28 @@ fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Regis
                 "2.00",
                 "4.00",
             ),
+            functional_provider_for(
+                "beta-dead",
+                format!("http://127.0.0.1:{dead_port}/v1"),
+                "SEREN_TEST_KEY_BETA_DEAD",
+                0,
+                model,
+                BETA_VIRTUAL_MODEL,
+                "0.10",
+                "0.20",
+                [RoutingProfile::Beta],
+            ),
+            functional_provider_for(
+                "beta-local",
+                upstream_url.to_owned(),
+                "SEREN_TEST_KEY_BETA_LOCAL",
+                1,
+                model,
+                BETA_VIRTUAL_MODEL,
+                "0.40",
+                "0.80",
+                [RoutingProfile::Beta],
+            ),
         ],
     }
 }
@@ -566,6 +680,31 @@ fn functional_provider(
     input_price_per_mtok: &str,
     output_price_per_mtok: &str,
 ) -> Provider {
+    functional_provider_for(
+        id,
+        base_url,
+        secret_env,
+        priority,
+        model,
+        VIRTUAL_MODEL,
+        input_price_per_mtok,
+        output_price_per_mtok,
+        [RoutingProfile::Production],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn functional_provider_for(
+    id: &str,
+    base_url: String,
+    secret_env: &str,
+    priority: u8,
+    model: &str,
+    slug: &str,
+    input_price_per_mtok: &str,
+    output_price_per_mtok: &str,
+    profiles: impl IntoIterator<Item = RoutingProfile>,
+) -> Provider {
     Provider {
         id: id.to_owned(),
         display_name: format!("Functional {id}"),
@@ -573,8 +712,9 @@ fn functional_provider(
         secret_env: secret_env.to_owned(),
         enabled: true,
         priority,
+        profiles: BTreeSet::from_iter(profiles),
         models: vec![ModelMapping {
-            slug: VIRTUAL_MODEL.to_owned(),
+            slug: slug.to_owned(),
             name: "Functional Model".to_owned(),
             context_length: 131_072,
             provider_model_id: model.to_owned(),
@@ -661,7 +801,13 @@ async fn functional_composite_readiness_tracks_real_sidecar_lifecycle() {
     assert_eq!(ready.status(), StatusCode::OK);
     assert_eq!(
         ready.json::<Value>().await.unwrap(),
-        json!({"status": "ok"})
+        json!({
+            "status": "ok",
+            "dependencies": {
+                "database": "ok",
+                "sidecar": "ok"
+            }
+        })
     );
 
     harness.terminate_sidecar();
@@ -679,9 +825,248 @@ async fn functional_composite_readiness_tracks_real_sidecar_lifecycle() {
     };
     assert_eq!(
         unavailable.json::<Value>().await.unwrap(),
-        json!({"status": "unavailable", "reason": "sidecar"})
+        json!({
+            "status": "unavailable",
+            "reason": "sidecar",
+            "dependencies": {
+                "database": "ok",
+                "sidecar": "unavailable"
+            }
+        })
     );
     assert_eq!(harness.livez().await.status(), StatusCode::OK);
+
+    harness.shutdown_and_assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "functional"]
+async fn functional_inference_survives_unavailable_database() {
+    let harness = FunctionalHarness::start_with_database(DatabaseMode::Unavailable).await;
+
+    let ready = harness.readyz().await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    let ready = ready.json::<Value>().await.unwrap();
+    assert_eq!(ready["dependencies"]["sidecar"], "ok");
+    assert!(
+        matches!(
+            ready["dependencies"]["database"].as_str(),
+            Some("starting" | "degraded")
+        ),
+        "database-down startup must expose a structured non-ready ledger state"
+    );
+
+    let response = harness.chat(VIRTUAL_MODEL, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.unwrap();
+    assert_local_usage_cost(&body);
+    assert_eq!(harness.livez().await.status(), StatusCode::OK);
+
+    let generation = harness
+        .generation(
+            body["id"]
+                .as_str()
+                .expect("completion must contain a generation id"),
+        )
+        .await;
+    assert_eq!(generation.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        generation.json::<Value>().await.unwrap(),
+        json!({"error": {"message": "generation ledger unavailable"}})
+    );
+    let degraded = harness.readyz().await;
+    assert_eq!(degraded.status(), StatusCode::OK);
+    assert_eq!(
+        degraded.json::<Value>().await.unwrap()["dependencies"]["database"],
+        "degraded"
+    );
+
+    let stream = harness.chat(VIRTUAL_MODEL, true).await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    let stream_body = stream.text().await.unwrap();
+    assert!(
+        stream_body
+            .replace("\r\n", "\n")
+            .ends_with("data: [DONE]\n\n"),
+        "SSE inference must complete while PostgreSQL is unavailable"
+    );
+
+    harness.shutdown_and_assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "functional"]
+async fn functional_midstream_ledger_loss_recovers_without_interrupting_inference() {
+    let harness = FunctionalHarness::start().await;
+
+    let stream = harness.chat(VIRTUAL_MODEL, true).await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    harness.simulate_database_loss();
+    let degraded = harness.readyz().await;
+    assert_eq!(degraded.status(), StatusCode::OK);
+    assert_eq!(
+        degraded.json::<Value>().await.unwrap()["dependencies"]["database"],
+        "degraded"
+    );
+    assert!(
+        stream
+            .text()
+            .await
+            .unwrap()
+            .replace("\r\n", "\n")
+            .ends_with("data: [DONE]\n\n"),
+        "an in-flight stream must complete across ledger degradation"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if harness.database_health.status() == db::DatabaseStatus::Ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a successful post-stream ledger write did not recover database health"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let json_response = harness.chat(VIRTUAL_MODEL, false).await;
+    assert_eq!(json_response.status(), StatusCode::OK);
+    assert_local_usage_cost(&json_response.json::<Value>().await.unwrap());
+
+    harness.shutdown_and_assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "functional"]
+async fn functional_credentials_isolate_production_and_beta_providers() {
+    let harness = FunctionalHarness::start().await;
+
+    assert_eq!(
+        harness.unauthenticated_chat().await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let production_beta_model = harness
+        .chat_with_key(BETA_VIRTUAL_MODEL, GATEWAY_KEY, None)
+        .await;
+    assert_eq!(production_beta_model.status(), StatusCode::NOT_FOUND);
+
+    let forged_beta_model = harness
+        .chat_with_key(BETA_VIRTUAL_MODEL, GATEWAY_KEY, Some("beta"))
+        .await;
+    assert_eq!(forged_beta_model.status(), StatusCode::NOT_FOUND);
+
+    let beta_production_model = harness
+        .chat_with_key(VIRTUAL_MODEL, BETA_GATEWAY_KEY, None)
+        .await;
+    assert_eq!(beta_production_model.status(), StatusCode::NOT_FOUND);
+
+    let beta = harness
+        .chat_with_key_and_options(
+            BETA_VIRTUAL_MODEL,
+            BETA_GATEWAY_KEY,
+            false,
+            None,
+            Some(json!({"sort": "price"})),
+        )
+        .await;
+    assert_eq!(beta.status(), StatusCode::OK);
+    let beta_body = beta.json::<Value>().await.unwrap();
+    assert_local_usage_cost(&beta_body);
+    let beta_generation_id = beta_body["id"]
+        .as_str()
+        .expect("beta completion must include a provider response id");
+    let beta_generation =
+        wait_for_generation_with_key(&harness, beta_generation_id, BETA_GATEWAY_KEY).await;
+    assert_generation_matches_for(
+        &beta_generation,
+        &beta_body,
+        BETA_VIRTUAL_MODEL,
+        "beta-local",
+    );
+    assert_eq!(
+        harness.generation(beta_generation_id).await.status(),
+        StatusCode::NOT_FOUND,
+        "production credentials must not retrieve beta generation metadata"
+    );
+
+    let beta_stream = harness
+        .chat_with_key_and_options(
+            BETA_VIRTUAL_MODEL,
+            BETA_GATEWAY_KEY,
+            true,
+            None,
+            Some(json!({"sort": "price"})),
+        )
+        .await;
+    assert_eq!(beta_stream.status(), StatusCode::OK);
+    assert_eq!(
+        beta_stream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let beta_stream_body = beta_stream.text().await.unwrap();
+    let beta_stream_events: Vec<_> = beta_stream_body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect();
+    let beta_usage = beta_stream_events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(event).ok())
+        .find(|event| {
+            event["choices"]
+                .as_array()
+                .is_some_and(|choices| choices.is_empty())
+                && event["usage"]["cost"].is_number()
+        })
+        .expect("beta stream must contain a terminal costed usage event");
+    assert_local_usage_cost(&beta_usage);
+    assert_eq!(beta_stream_events.last(), Some(&"[DONE]"));
+
+    let production = harness.chat(VIRTUAL_MODEL, false).await;
+    assert_eq!(production.status(), StatusCode::OK);
+    let production_body = production.json::<Value>().await.unwrap();
+    let production_generation_id = production_body["id"]
+        .as_str()
+        .expect("production completion must include a provider response id");
+    wait_for_generation(&harness, production_generation_id).await;
+    assert_eq!(
+        harness
+            .generation_with_key(production_generation_id, BETA_GATEWAY_KEY)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND,
+        "beta credentials must not retrieve production generation metadata"
+    );
+
+    let production_models = harness.models().await.json::<Value>().await.unwrap();
+    let beta_models = harness
+        .models_with_key(BETA_GATEWAY_KEY)
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(production_models["data"][0]["id"], VIRTUAL_MODEL);
+    assert_eq!(production_models["total_count"], 1);
+    assert_eq!(beta_models["data"][0]["id"], BETA_VIRTUAL_MODEL);
+    assert_eq!(beta_models["total_count"], 1);
+    assert!(
+        harness
+            .measurements
+            .get_for(RoutingProfile::Beta, "beta-local", BETA_VIRTUAL_MODEL)
+            .is_some(),
+        "beta completion measurements must remain in beta state"
+    );
+    assert!(
+        harness
+            .measurements
+            .get_for(RoutingProfile::Production, "beta-local", BETA_VIRTUAL_MODEL)
+            .is_none(),
+        "beta provider measurements must never enter production state"
+    );
 
     harness.shutdown_and_assert_clean().await;
 }
@@ -1038,7 +1423,9 @@ async fn functional_auth_rejected() {
 async fn functional_failover() {
     let harness = FunctionalHarness::start().await;
 
-    let sidecar_first = harness.sidecar_chat(VIRTUAL_MODEL).await;
+    let sidecar_first = harness
+        .sidecar_chat(&RoutingProfile::Production.sidecar_alias(VIRTUAL_MODEL))
+        .await;
     assert_eq!(
         sidecar_first.status(),
         StatusCode::OK,
@@ -1120,6 +1507,28 @@ async fn functional_invalid_requests_stay_local() {
             }
         })
     );
+
+    for field in ["only", "ignore", "order"] {
+        let response = harness
+            .chat_with_key_and_options(
+                VIRTUAL_MODEL,
+                GATEWAY_KEY,
+                false,
+                None,
+                Some(json!({field: ["local"]})),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({
+                "error": {
+                    "code": 400,
+                    "message": "provider.only, provider.ignore, and provider.order are not supported"
+                }
+            })
+        );
+    }
 
     let unknown = harness
         .raw_completion(
@@ -1213,9 +1622,18 @@ fn assert_local_usage_cost(body: &Value) {
 }
 
 fn assert_generation_matches(generation: &Value, response: &Value) {
+    assert_generation_matches_for(generation, response, VIRTUAL_MODEL, "local");
+}
+
+fn assert_generation_matches_for(
+    generation: &Value,
+    response: &Value,
+    model: &str,
+    provider: &str,
+) {
     assert_eq!(generation["data"]["id"], response["id"]);
-    assert_eq!(generation["data"]["model"], VIRTUAL_MODEL);
-    assert_eq!(generation["data"]["provider_name"], "local");
+    assert_eq!(generation["data"]["model"], model);
+    assert_eq!(generation["data"]["provider_name"], provider);
     assert_eq!(
         generation["data"]["tokens_prompt"],
         response["usage"]["prompt_tokens"]
@@ -1233,9 +1651,13 @@ fn assert_generation_matches(generation: &Value, response: &Value) {
 }
 
 async fn wait_for_generation(harness: &FunctionalHarness, id: &str) -> Value {
+    wait_for_generation_with_key(harness, id, GATEWAY_KEY).await
+}
+
+async fn wait_for_generation_with_key(harness: &FunctionalHarness, id: &str, key: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let response = harness.generation(id).await;
+        let response = harness.generation_with_key(id, key).await;
         if response.status() == StatusCode::OK {
             return response.json().await.unwrap();
         }

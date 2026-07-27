@@ -57,9 +57,29 @@ Teardown stops the router and sidecar, waits for the child, removes artifacts, a
 verifies that all runtime ports can be rebound. The deliberately dead provider also
 uses an OS-assigned unused port.
 
-The composite-readiness gate does not need a loaded model. It stops the real pinned
+The sidecar-readiness gate does not need a loaded model. It stops the real pinned
 sidecar, requires `/readyz` to return 503 with reason `sidecar`, and confirms
 dependency-free `/livez` remains 200.
+
+Two focused gates cover the readiness and beta-isolation changes:
+
+```bash
+cargo test --test functional functional_inference_survives_unavailable_database \
+  -- --ignored --nocapture --test-threads=1
+cargo test --test functional functional_midstream_ledger_loss_recovers_without_interrupting_inference \
+  -- --ignored --nocapture --test-threads=1
+cargo test --test functional functional_credentials_isolate_production_and_beta_providers \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The first uses a real unavailable PostgreSQL endpoint and proves that JSON and SSE
+inference plus both health endpoints continue serving while the generation-ledger
+endpoint fails closed with 503. The second degrades the ledger after SSE response
+headers, proves the stream completes, and verifies a later successful write restores
+the structured database status. The third runs real production-only and beta-only
+provider routes, proves each credential sees only its bound catalog, route,
+measurements, and generation records, and proves a forged profile header cannot cross
+the boundary.
 
 `functional_streaming_component_latency` is the non-paid regression gate for the
 completion hot path. It sends 50 interleaved one-token streams directly to the local

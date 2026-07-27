@@ -81,13 +81,18 @@ This customer-demanded behavior *is* Seren's default (see above): throughput-bia
 For a caller who wants absolute maximum speed and is willing to give up
 load-balancing/diversification, `:nitro` / `provider.sort: throughput` still applies the
 stricter sequential form (top-throughput provider first, in order). The live
-per-`(provider, model)` throughput and price measurements power both.
+per-`(provider, model)` throughput and price measurements power both. Measurements and
+rolling traffic-share state are partitioned by authenticated routing profile, so beta
+experiments cannot steer production selection.
 
 ## Failover
 
 Before response bytes are committed, a transport error, `429`, or `5xx` from the
-selected concrete route causes one retry through the bare-slug virtual model, whose
-priority tiers are owned by agentgateway. The sidecar also has a two-attempt retry
+selected concrete route causes one retry through a credential-bound internal virtual
+model. Production and beta have distinct aliases, each compiled only from providers
+allowed for that authenticated routing profile; failover cannot cross the boundary.
+The profile comes from the matched Gateway credential, never from a client header.
+Priority tiers remain owned by agentgateway. The sidecar also has a two-attempt retry
 policy on its generated LLM route so the first request survives a newly dead target.
 Once streaming bytes have been committed, neither a malformed event nor a later stream
 error is replayed: doing so could duplicate billable output or concatenate two

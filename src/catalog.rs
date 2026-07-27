@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -12,24 +13,53 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 
 use crate::registry::{ModelMapping, Provider, Registry};
+use crate::routing_profile::RoutingProfile;
 
 const TOKENS_PER_MILLION: u64 = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub struct Catalog {
+    snapshots: Arc<BTreeMap<RoutingProfile, CatalogSnapshot>>,
+}
+
+#[derive(Clone, Debug)]
+struct CatalogSnapshot {
     response: Arc<ModelsResponse>,
     endpoints_by_slug: Arc<BTreeMap<String, ModelEndpointsResponse>>,
 }
 
 impl Catalog {
     pub fn from_registry(registry: &Registry) -> Self {
+        Self {
+            snapshots: Arc::new(
+                RoutingProfile::ALL
+                    .into_iter()
+                    .map(|profile| (profile, CatalogSnapshot::from_registry(registry, profile)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn snapshot(&self, profile: RoutingProfile) -> &CatalogSnapshot {
+        self.snapshots
+            .get(&profile)
+            .expect("every routing profile has a catalog snapshot")
+    }
+
+    fn endpoint_response(&self, profile: RoutingProfile, slug: &str) -> Response {
+        self.snapshot(profile).endpoint_response(slug)
+    }
+}
+
+impl CatalogSnapshot {
+    fn from_registry(registry: &Registry, profile: RoutingProfile) -> Self {
         let mut cheapest_by_slug = BTreeMap::<String, CatalogCandidate<'_>>::new();
         let mut endpoints_by_slug = BTreeMap::<String, Vec<EndpointCandidate<'_>>>::new();
 
         for provider in registry
             .providers
             .iter()
-            .filter(|provider| provider.enabled)
+            .filter(|provider| provider.enabled && provider.supports(profile))
         {
             for mapping in &provider.models {
                 let candidate = CatalogCandidate {
@@ -239,22 +269,27 @@ struct ErrorDetail {
     message: &'static str,
 }
 
-pub async fn get_models(State(catalog): State<Catalog>) -> impl IntoResponse {
-    Json(catalog.response.as_ref().clone())
+pub async fn get_models(
+    State(catalog): State<Catalog>,
+    Extension(profile): Extension<RoutingProfile>,
+) -> impl IntoResponse {
+    Json(catalog.snapshot(profile).response.as_ref().clone())
 }
 
 pub async fn get_model_endpoints(
     State(catalog): State<Catalog>,
+    Extension(profile): Extension<RoutingProfile>,
     Path(model): Path<String>,
 ) -> Response {
-    catalog.endpoint_response(&model)
+    catalog.endpoint_response(profile, &model)
 }
 
 pub async fn get_model_endpoints_by_author(
     State(catalog): State<Catalog>,
+    Extension(profile): Extension<RoutingProfile>,
     Path((author, slug)): Path<(String, String)>,
 ) -> Response {
-    catalog.endpoint_response(&format!("{author}/{slug}"))
+    catalog.endpoint_response(profile, &format!("{author}/{slug}"))
 }
 
 #[cfg(test)]
@@ -272,7 +307,13 @@ mod tests {
     #[test]
     fn registry_aggregation_matches_live_shape_golden() {
         let catalog = fixture_catalog();
-        let actual = serde_json::to_value(catalog.response.as_ref()).unwrap();
+        let actual = serde_json::to_value(
+            catalog
+                .snapshot(RoutingProfile::Production)
+                .response
+                .as_ref(),
+        )
+        .unwrap();
         let expected: Value =
             serde_json::from_str(include_str!("../tests/golden/models_catalog.json")).unwrap();
 
@@ -282,9 +323,12 @@ mod tests {
     #[test]
     fn endpoint_catalog_includes_only_enabled_providers_in_priority_order() {
         let catalog = fixture_catalog();
-        let actual =
-            serde_json::to_value(&catalog.endpoints_by_slug["anthropic/claude-opus-5-fast"])
-                .unwrap();
+        let actual = serde_json::to_value(
+            &catalog
+                .snapshot(RoutingProfile::Production)
+                .endpoints_by_slug["anthropic/claude-opus-5-fast"],
+        )
+        .unwrap();
 
         assert_eq!(
             actual,
@@ -325,5 +369,26 @@ mod tests {
         assert!(!serialized.contains("disabled"));
         assert!(!serialized.contains("base_url"));
         assert!(!serialized.contains("secret_env"));
+    }
+
+    #[test]
+    fn beta_only_providers_are_absent_from_the_production_catalog() {
+        let mut registry: Registry =
+            serde_yaml::from_str(include_str!("../tests/fixtures/catalog_registry.yaml")).unwrap();
+        registry.providers[1].profiles = std::collections::BTreeSet::from([RoutingProfile::Beta]);
+        let catalog = Catalog::from_registry(&registry);
+        let production = serde_json::to_string(
+            catalog
+                .snapshot(RoutingProfile::Production)
+                .response
+                .as_ref(),
+        )
+        .unwrap();
+        let beta = serde_json::to_string(catalog.snapshot(RoutingProfile::Beta).response.as_ref())
+            .unwrap();
+
+        assert!(!production.contains("openai/gpt-5-mini"));
+        assert!(beta.contains("openai/gpt-5-mini"));
+        assert!(!production.contains("Cheap Input Provider"));
     }
 }

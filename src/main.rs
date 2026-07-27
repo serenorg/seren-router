@@ -71,7 +71,10 @@ async fn dispatch(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()
 
 async fn run_service() -> anyhow::Result<()> {
     let config = RouterConfig::from_env().context("invalid router configuration")?;
-    let auth = GatewayAuth::new(config.gateway_key());
+    let auth = match config.beta_gateway_key() {
+        Some(beta_key) => GatewayAuth::new(config.gateway_key()).with_beta_key(beta_key),
+        None => GatewayAuth::new(config.gateway_key()),
+    };
     let registry_bytes = std::fs::read(config.registry_path()).with_context(|| {
         format!(
             "failed to read provider registry {}",
@@ -94,14 +97,10 @@ async fn run_service() -> anyhow::Result<()> {
     if database_url.trim().is_empty() {
         anyhow::bail!("DATABASE_URL must not be empty");
     }
-    let pool = db::connect(database_url.trim())
-        .await
-        .context("failed to connect to database")?;
-    sqlx::migrate!()
-        .run(&pool)
-        .await
-        .context("failed to migrate database")?;
-    let ledger = Ledger::new(pool.clone());
+    let pool = db::connect_lazy(database_url.trim()).context("invalid DATABASE_URL")?;
+    let database_health = db::DatabaseHealth::starting();
+    tokio::spawn(db::supervise(pool.clone(), database_health.clone()));
+    let ledger = Ledger::with_health(pool, database_health.clone());
     let proxy = ProxyState::new(
         config.sidecar_url(),
         price_table,
@@ -113,7 +112,7 @@ async fn run_service() -> anyhow::Result<()> {
     .context("invalid sidecar proxy configuration")?;
     let app = routes::public_router().merge(routes::protected_router(auth, proxy, ledger, catalog));
 
-    server::serve(app, pool, config.sidecar_readiness_url().clone())
+    server::serve(app, database_health, config.sidecar_readiness_url().clone())
         .await
         .context("HTTP server exited with error")
 }

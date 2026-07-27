@@ -298,7 +298,9 @@ pub struct ModelMapping {
 ```
 
 Also create `registry/providers.yaml` with one real entry (OpenRouter as priority-255
-fallback, per docs/05) and one placeholder (fireworks, `enabled: false`).
+fallback, per docs/05) and one disabled direct-provider placeholder. The original
+Fireworks placeholder was superseded by the evidence-backed DeepInfra beta selection
+in `docs/11` on 2026-07-27.
 
 Unit tests (same file, `#[cfg(test)]`): YAML round-trip of a two-provider registry;
 unknown field rejection (`#[serde(deny_unknown_fields)]` — add it); duplicate provider id
@@ -736,9 +738,10 @@ What is specific to this service:
   from `scripts/fetch-sidecar.sh` onto a distroless base. The sidecar config is rendered
   by our M1 compiler at startup (init container or entrypoint step) from the registry
   file mounted via ConfigMap.
-- **Readiness must be composite.** The app's `/readyz` should also probe the sidecar's
-  readiness address (`127.0.0.1:19001`) — a pod whose sidecar is down must not receive
-  Gateway traffic.
+- **Inference readiness must follow the serving path.** The app's `/readyz` probes the
+  sidecar's readiness address (`127.0.0.1:19001`) — a pod whose sidecar is down must
+  not receive Gateway traffic. PostgreSQL ledger state is reported as
+  `starting`/`ok`/`degraded` but does not remove an otherwise healthy inference pod.
 - **Secrets:** provider keys (`SEREN_ROUTER_KEY_*`) and `SEREN_ROUTER_GATEWAY_KEY` enter
   as k8s Secrets → env vars, matching the registry's `secret_env` names. Never in the
   ConfigMap, never in the image.
@@ -756,13 +759,13 @@ identity-token auth hardening (M2-1 note). When you think you need any of these 
 reread docs/05 and stop.
 
 Repository-owned deployment boundary completed on 2026-07-26: the production app image
-now doubles as an atomic sidecar-config init renderer, `/readyz` checks both PostgreSQL
-and the real sidecar with bounded timeouts, the official multi-architecture
+now doubles as an atomic sidecar-config init renderer, `/readyz` checks the real
+sidecar with a bounded timeout and reports the ledger database separately, the official multi-architecture
 AgentGateway image is pinned and verified by immutable digest, and a local production
 container smoke proves rendering, migrations, probes, and metrics without provider
-traffic. See `docs/10-deployment.md`. Cluster selection, environment overlays,
-provisioning, secrets binding, DNS, deployment, canary mechanics, and publisher
-mutation remain gated on Taariq/Christian.
+traffic. The OpenRouter-only production image and bounded canary were completed on
+2026-07-26. See `docs/10-deployment.md`. Further infrastructure changes, direct-provider
+activation, and publisher mutation remain separately gated on Taariq/Christian.
 
 ---
 

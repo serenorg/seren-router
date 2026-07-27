@@ -12,6 +12,7 @@ pub mod pricing;
 pub mod proxy;
 pub mod registry;
 pub mod routes;
+pub mod routing_profile;
 pub mod server;
 pub mod sidecar_config;
 mod sse;

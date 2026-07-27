@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::routing_profile::RoutingProfile;
+
 // Fixed by the M5 policy; changing smoothing is an operations tuning decision.
 const EWMA_ALPHA: f64 = 0.2;
 
 type MeasurementsByModel = HashMap<String, ModelMeasurements>;
 type MeasurementsByProvider = HashMap<String, MeasurementsByModel>;
+type MeasurementsByProfile = HashMap<RoutingProfile, MeasurementsByProvider>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelMeasurements {
@@ -34,12 +37,27 @@ pub enum MeasurementError {
 
 #[derive(Clone, Debug, Default)]
 pub struct MeasurementStore {
-    measurements: Arc<RwLock<MeasurementsByProvider>>,
+    measurements: Arc<RwLock<MeasurementsByProfile>>,
 }
 
 impl MeasurementStore {
     pub fn observe(
         &self,
+        provider_id: &str,
+        canonical_slug: &str,
+        observation: Observation,
+    ) -> Result<ModelMeasurements, MeasurementError> {
+        self.observe_for(
+            RoutingProfile::Production,
+            provider_id,
+            canonical_slug,
+            observation,
+        )
+    }
+
+    pub fn observe_for(
+        &self,
+        profile: RoutingProfile,
         provider_id: &str,
         canonical_slug: &str,
         observation: Observation,
@@ -58,6 +76,8 @@ impl MeasurementStore {
             .write()
             .expect("measurement store lock poisoned");
         let current = measurements
+            .entry(profile)
+            .or_default()
             .entry(provider_id.to_owned())
             .or_default()
             .entry(canonical_slug.to_owned())
@@ -77,10 +97,20 @@ impl MeasurementStore {
     }
 
     pub fn get(&self, provider_id: &str, canonical_slug: &str) -> Option<ModelMeasurements> {
+        self.get_for(RoutingProfile::Production, provider_id, canonical_slug)
+    }
+
+    pub fn get_for(
+        &self,
+        profile: RoutingProfile,
+        provider_id: &str,
+        canonical_slug: &str,
+    ) -> Option<ModelMeasurements> {
         self.measurements
             .read()
             .expect("measurement store lock poisoned")
-            .get(provider_id)
+            .get(&profile)
+            .and_then(|profile| profile.get(provider_id))
             .and_then(|provider| provider.get(canonical_slug))
             .copied()
     }
@@ -182,5 +212,29 @@ mod tests {
             Err(MeasurementError::ZeroStreamDuration)
         );
         assert_eq!(measurements.get("provider-b", "vendor/model-b"), None);
+    }
+
+    #[test]
+    fn beta_observations_do_not_change_production_measurements() {
+        let measurements = MeasurementStore::default();
+        measurements
+            .observe_for(
+                RoutingProfile::Beta,
+                "provider-a",
+                "vendor/model",
+                Observation {
+                    completion_tokens: 50,
+                    stream_duration: Duration::from_secs(1),
+                    time_to_first_token: Duration::from_millis(500),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(measurements.get("provider-a", "vendor/model"), None);
+        assert!(
+            measurements
+                .get_for(RoutingProfile::Beta, "provider-a", "vendor/model")
+                .is_some()
+        );
     }
 }

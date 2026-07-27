@@ -2,10 +2,11 @@
 // ABOUTME: Serves OpenRouter-shaped generation metadata by provider response ID.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use jiff_sqlx::Timestamp;
@@ -14,70 +15,122 @@ use serde::Deserialize;
 use serde_json::{Number, Value, json};
 use sqlx::{FromRow, PgPool};
 
+use crate::db::DatabaseHealth;
+use crate::routing_profile::RoutingProfile;
+
+const LEDGER_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone)]
 pub struct Ledger {
     pool: PgPool,
+    database_health: DatabaseHealth,
 }
 
 impl Ledger {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self::with_health(pool, DatabaseHealth::ready())
+    }
+
+    pub fn with_health(pool: PgPool, database_health: DatabaseHealth) -> Self {
+        Self {
+            pool,
+            database_health,
+        }
     }
 
     pub(crate) async fn insert(&self, generation: &GenerationWrite) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            INSERT INTO generations (
-                id,
-                canonical_slug,
-                provider_id,
-                prompt_tokens,
-                completion_tokens,
-                cost_usd,
-                latency_ms,
-                status
+        let result = tokio::time::timeout(
+            LEDGER_OPERATION_TIMEOUT,
+            sqlx::query(
+                r#"
+                INSERT INTO generations (
+                    id,
+                    routing_profile,
+                    canonical_slug,
+                    provider_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    cost_usd,
+                    latency_ms,
+                    status
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                "#,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
+            .bind(&generation.id)
+            .bind(generation.routing_profile.as_str())
+            .bind(&generation.canonical_slug)
+            .bind(&generation.provider_id)
+            .bind(generation.prompt_tokens)
+            .bind(generation.completion_tokens)
+            .bind(generation.cost_usd)
+            .bind(generation.latency_ms)
+            .bind(generation.status)
+            .execute(&self.pool),
         )
-        .bind(&generation.id)
-        .bind(&generation.canonical_slug)
-        .bind(&generation.provider_id)
-        .bind(generation.prompt_tokens)
-        .bind(generation.completion_tokens)
-        .bind(generation.cost_usd)
-        .bind(generation.latency_ms)
-        .bind(generation.status)
-        .execute(&self.pool)
-        .await?;
+        .await
+        .unwrap_or(Err(sqlx::Error::PoolTimedOut));
 
-        Ok(())
+        match result {
+            Ok(_) => {
+                self.database_health.report_ready();
+                Ok(())
+            }
+            Err(error) => {
+                self.database_health
+                    .report_failure("insert_generation", &error);
+                Err(error)
+            }
+        }
     }
 
-    async fn fetch(&self, id: &str) -> Result<Option<Generation>, sqlx::Error> {
-        sqlx::query_as::<_, Generation>(
-            r#"
-            SELECT
-                id,
-                created_at,
-                canonical_slug,
-                provider_id,
-                prompt_tokens,
-                completion_tokens,
-                cost_usd,
-                latency_ms
-            FROM generations
-            WHERE id = $1
-            "#,
+    async fn fetch(
+        &self,
+        id: &str,
+        routing_profile: RoutingProfile,
+    ) -> Result<Option<Generation>, sqlx::Error> {
+        let result = tokio::time::timeout(
+            LEDGER_OPERATION_TIMEOUT,
+            sqlx::query_as::<_, Generation>(
+                r#"
+                SELECT
+                    id,
+                    created_at,
+                    canonical_slug,
+                    provider_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    cost_usd,
+                    latency_ms
+                FROM generations
+                WHERE id = $1
+                  AND routing_profile = $2
+                "#,
+            )
+            .bind(id)
+            .bind(routing_profile.as_str())
+            .fetch_optional(&self.pool),
         )
-        .bind(id)
-        .fetch_optional(&self.pool)
         .await
+        .unwrap_or(Err(sqlx::Error::PoolTimedOut));
+
+        match result {
+            Ok(generation) => {
+                self.database_health.report_ready();
+                Ok(generation)
+            }
+            Err(error) => {
+                self.database_health
+                    .report_failure("fetch_generation", &error);
+                Err(error)
+            }
+        }
     }
 }
 
 pub(crate) struct GenerationWrite {
     pub(crate) id: String,
+    pub(crate) routing_profile: RoutingProfile,
     pub(crate) canonical_slug: String,
     pub(crate) provider_id: String,
     pub(crate) prompt_tokens: i64,
@@ -106,6 +159,7 @@ pub(crate) struct GenerationQuery {
 
 pub(crate) async fn get_generation(
     State(ledger): State<Ledger>,
+    Extension(routing_profile): Extension<RoutingProfile>,
     query: Result<Query<GenerationQuery>, QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
@@ -113,7 +167,7 @@ pub(crate) async fn get_generation(
         Ok(_) | Err(_) => return api_error(StatusCode::BAD_REQUEST, "id is required"),
     };
 
-    match ledger.fetch(&query.id).await {
+    match ledger.fetch(&query.id, routing_profile).await {
         Ok(Some(generation)) => generation_response(generation),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "generation not found"),
         Err(error) => {
@@ -123,8 +177,8 @@ pub(crate) async fn get_generation(
                 "generation lookup failed"
             );
             api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "generation lookup failed",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "generation ledger unavailable",
             )
         }
     }
@@ -183,6 +237,7 @@ mod tests {
         let ledger = Ledger::new(pool.clone());
         let write = GenerationWrite {
             id: "chatcmpl-ledger-round-trip".to_owned(),
+            routing_profile: RoutingProfile::Production,
             canonical_slug: "canonical/model".to_owned(),
             provider_id: "provider-a".to_owned(),
             prompt_tokens: 12,
@@ -193,7 +248,18 @@ mod tests {
         };
 
         ledger.insert(&write).await.unwrap();
-        let stored = ledger.fetch(&write.id).await.unwrap().unwrap();
+        let stored = ledger
+            .fetch(&write.id, RoutingProfile::Production)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ledger
+                .fetch(&write.id, RoutingProfile::Beta)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         assert_eq!(stored.id, write.id);
         assert_eq!(stored.canonical_slug, write.canonical_slug);
@@ -213,7 +279,8 @@ mod tests {
 
         let app = axum::Router::new()
             .route("/api/v1/generation", get(get_generation))
-            .with_state(ledger);
+            .with_state(ledger)
+            .layer(Extension(RoutingProfile::Production));
         let found = app
             .clone()
             .oneshot(

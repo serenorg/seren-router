@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use reqwest::Url;
 use rust_decimal::Decimal;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::policy::select::{PolicyConfig, PolicyConfigError, ShareTracker, ShareTrackerError};
@@ -14,6 +15,7 @@ const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:4000";
 const DEFAULT_SIDECAR_READINESS_URL: &str = "http://127.0.0.1:19001/healthz/ready";
 const DEFAULT_REGISTRY_PATH: &str = "registry/providers.yaml";
 const GATEWAY_KEY_ENV: &str = "SEREN_ROUTER_GATEWAY_KEY";
+const BETA_GATEWAY_KEY_ENV: &str = "SEREN_ROUTER_BETA_GATEWAY_KEY";
 const REGISTRY_PATH_ENV: &str = "SEREN_ROUTER_REGISTRY_PATH";
 const SIDECAR_READINESS_URL_ENV: &str = "SEREN_ROUTER_SIDECAR_READINESS_URL";
 const SIDECAR_URL_ENV: &str = "SEREN_ROUTER_SIDECAR_URL";
@@ -26,6 +28,7 @@ pub struct RouterConfig {
     sidecar_url: String,
     sidecar_readiness_url: Url,
     gateway_key: String,
+    beta_gateway_key: Option<String>,
     registry_path: PathBuf,
     routing: RoutingConfig,
 }
@@ -33,6 +36,7 @@ pub struct RouterConfig {
 impl RouterConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let gateway_key = required_env(GATEWAY_KEY_ENV)?;
+        let beta_gateway_key = optional_present_env(BETA_GATEWAY_KEY_ENV)?;
         let sidecar_url = optional_env(SIDECAR_URL_ENV, DEFAULT_SIDECAR_URL)?;
         let sidecar_readiness_url = parse_http_url(
             SIDECAR_READINESS_URL_ENV,
@@ -59,11 +63,7 @@ impl RouterConfig {
                 },
             })?;
 
-        if gateway_key.is_empty() {
-            return Err(ConfigError::Empty {
-                name: GATEWAY_KEY_ENV,
-            });
-        }
+        validate_gateway_keys(&gateway_key, beta_gateway_key.as_deref())?;
         if sidecar_url.trim().is_empty() {
             return Err(ConfigError::Empty {
                 name: SIDECAR_URL_ENV,
@@ -73,6 +73,7 @@ impl RouterConfig {
             sidecar_url: sidecar_url.trim().to_owned(),
             sidecar_readiness_url,
             gateway_key,
+            beta_gateway_key,
             registry_path,
             routing,
         })
@@ -88,6 +89,10 @@ impl RouterConfig {
 
     pub fn gateway_key(&self) -> &[u8] {
         self.gateway_key.as_bytes()
+    }
+
+    pub fn beta_gateway_key(&self) -> Option<&[u8]> {
+        self.beta_gateway_key.as_deref().map(str::as_bytes)
     }
 
     pub fn registry_path(&self) -> &Path {
@@ -152,7 +157,7 @@ pub enum RoutingConfigError {
     ShareWindow(#[from] ShareTrackerError),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Eq, Error, PartialEq)]
 pub enum ConfigError {
     #[error("{name} is required")]
     Missing { name: &'static str },
@@ -176,6 +181,14 @@ fn optional_env(name: &'static str, default: &'static str) -> Result<String, Con
     match env::var(name) {
         Ok(value) => Ok(value),
         Err(env::VarError::NotPresent) => Ok(default.to_owned()),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidUnicode { name }),
+    }
+}
+
+fn optional_present_env(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
         Err(env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidUnicode { name }),
     }
 }
@@ -205,6 +218,30 @@ fn parse_http_url(name: &'static str, value: &str) -> Result<Url, ConfigError> {
         return Err(ConfigError::Invalid { name });
     }
     Ok(url)
+}
+
+fn validate_gateway_keys(
+    gateway_key: &str,
+    beta_gateway_key: Option<&str>,
+) -> Result<(), ConfigError> {
+    if gateway_key.trim().is_empty() {
+        return Err(ConfigError::Empty {
+            name: GATEWAY_KEY_ENV,
+        });
+    }
+    if beta_gateway_key.is_some_and(|key| key.trim().is_empty()) {
+        return Err(ConfigError::Empty {
+            name: BETA_GATEWAY_KEY_ENV,
+        });
+    }
+    if beta_gateway_key
+        .is_some_and(|beta_key| bool::from(beta_key.as_bytes().ct_eq(gateway_key.as_bytes())))
+    {
+        return Err(ConfigError::Invalid {
+            name: BETA_GATEWAY_KEY_ENV,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -261,5 +298,35 @@ mod tests {
                 Err(ConfigError::Empty { .. } | ConfigError::Invalid { .. })
             ));
         }
+    }
+
+    #[test]
+    fn beta_gateway_key_is_optional_but_must_be_distinct_and_nonempty() {
+        assert!(validate_gateway_keys("production", None).is_ok());
+        assert!(validate_gateway_keys("production", Some("beta")).is_ok());
+        assert!(matches!(
+            validate_gateway_keys(" \t", None),
+            Err(ConfigError::Empty {
+                name: GATEWAY_KEY_ENV
+            })
+        ));
+        assert_eq!(
+            validate_gateway_keys("production", Some("")),
+            Err(ConfigError::Empty {
+                name: BETA_GATEWAY_KEY_ENV
+            })
+        );
+        assert!(matches!(
+            validate_gateway_keys("production", Some(" \t")),
+            Err(ConfigError::Empty {
+                name: BETA_GATEWAY_KEY_ENV
+            })
+        ));
+        assert_eq!(
+            validate_gateway_keys("same", Some("same")),
+            Err(ConfigError::Invalid {
+                name: BETA_GATEWAY_KEY_ENV
+            })
+        );
     }
 }

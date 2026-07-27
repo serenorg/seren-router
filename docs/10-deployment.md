@@ -38,7 +38,8 @@ One Kubernetes pod contains two long-running containers and one init container:
 The init container and sidecar share only the rendered-config volume. The registry is
 mounted into the renderer and app. Provider credentials are mounted only into
 AgentGateway; `SEREN_ROUTER_GATEWAY_KEY` and `DATABASE_URL` are mounted only into the
-app.
+app. When beta validation is enabled, the app also receives the distinct
+`SEREN_ROUTER_BETA_GATEWAY_KEY`; it is never mounted into AgentGateway.
 
 The exact security context, service account, namespace, resource requests, replica
 count, disruption budget, topology spread, and secret references belong in the
@@ -74,6 +75,11 @@ The pod-local defaults are:
 - `SEREN_ROUTER_SIDECAR_URL=http://127.0.0.1:4000`
 - `SEREN_ROUTER_SIDECAR_READINESS_URL=http://127.0.0.1:19001/healthz/ready`
 
+`SEREN_ROUTER_BETA_GATEWAY_KEY` is optional. If present, it must be nonempty and
+different from `SEREN_ROUTER_GATEWAY_KEY`.
+Removing it and disabling beta-only registry rows is the beta isolation rollback; it
+does not alter the production OpenRouter route set.
+
 The readiness URL accepts only HTTP(S), must have a host, and rejects credentials,
 queries, and fragments.
 
@@ -81,9 +87,11 @@ queries, and fragments.
 
 - `GET /livez` is dependency-free. It remains 200 when PostgreSQL or AgentGateway is
   unavailable so a sidecar outage does not cause an app restart loop.
-- `GET /readyz` requires both `SELECT 1` on PostgreSQL and a successful AgentGateway
-  readiness response. Each dependency check is bounded to two seconds. Failure returns
-  503 with only the stable reason `database` or `sidecar`.
+- `GET /readyz` requires a successful AgentGateway readiness response. PostgreSQL is
+  an asynchronous generation-ledger dependency: its `starting`, `ok`, or `degraded`
+  state is included in the readiness JSON but does not remove an otherwise healthy
+  inference pod from service. A sidecar failure returns 503 with the stable reason
+  `sidecar`.
 - The app image health check targets `/readyz`.
 - SIGTERM drains application connections for up to 30 seconds.
 
@@ -103,16 +111,31 @@ network namespace between app and sidecar to reproduce pod-localhost behavior:
 ```
 
 It verifies renderer exit status, secret references without resolved values,
-PostgreSQL migrations, composite `/readyz`, dependency-free `/livez`, and production
+PostgreSQL migrations, inference `/readyz`, dependency-free `/livez`, and production
 `/metrics`. It uses fixture-only credentials and sends no provider request.
 
 Production metrics also expose
-`seren_router_proxy_segment_duration_seconds{endpoint,provider,segment}` for successful
+`seren_router_proxy_segment_duration_seconds{endpoint,profile,provider,segment}` for successful
 costed completions. The bounded `segment` values separate work before the sidecar,
 sidecar response headers, first output, the response body, post-first-output time,
 active Rust response transformation, and the complete request. Compare
 `pre_sidecar` plus `app_processing` with AgentGateway's own processing metrics before
 attributing provider or network tail latency to the proxy stack.
+
+Database observability is exposed separately through
+`seren_router_database_available`,
+`seren_router_database_recovery_attempts_total{phase}`, and
+`seren_router_database_operation_failures_total{operation}`. Migrations retry with
+bounded backoff in the background. After recovery, the supervisor sleeps until a
+ledger operation reports another failure; it does not poll PostgreSQL or keep
+scale-to-zero compute awake.
+
+Page on sustained `seren_router_database_available == 0`, a continuing increase in
+operation failures, or reconciliation lag beyond the billing SLO. A brief degraded
+status during a cold wake does not page while inference, AgentGateway readiness, and
+automatic recovery remain healthy. Escalate immediately if database degradation is
+paired with inference errors, sidecar unavailability, or unreconciled usage beyond
+the accepted loss window.
 
 The separate ignored functional gate uses the pinned host binary to stop the real
 sidecar and prove `/readyz` changes to 503 while `/livez` remains 200:
