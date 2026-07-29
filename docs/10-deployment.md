@@ -123,9 +123,9 @@ network namespace between app and sidecar to reproduce pod-localhost behavior:
 
 It verifies renderer exit status, secret references without resolved values,
 PostgreSQL migrations, inference `/readyz`, dependency-free `/livez`, production
-`/metrics`, and production and beta catalogs containing only active OpenRouter routes.
-Candidate-only tests enable Modal in memory to verify its neutral public alias. The
-deployment smoke uses fixture-only credentials and sends no provider request.
+`/metrics`, a production catalog containing only OpenRouter, and a beta catalog
+containing the neutral direct route plus OpenRouter fallback. The deployment smoke
+uses fixture-only credentials and sends no provider request.
 
 Production metrics also expose
 `seren_router_proxy_segment_duration_seconds{endpoint,profile,provider,segment}` for successful

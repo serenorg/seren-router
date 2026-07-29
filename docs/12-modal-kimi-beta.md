@@ -6,18 +6,17 @@ ABOUTME: Pins neutral public naming, exact billing, credential scope, and activa
 ## Decision and scope
 
 Taariq approved authenticated internal beta validation and a cumulative $5 gross
-provider-spend ceiling on 2026-07-29. That approval covered account authentication,
-endpoint provisioning, and bounded internal validation; it did not establish written
-permission for customer-serving use. Retain that permission as an independent rollout
-gate.
+provider-spend ceiling on 2026-07-29. On 2026-07-30, Taariq confirmed that Modal
+granted Seren permission and approved both internal beta activation and a subsequent
+bounded production validation.
 
-The account-provisioned route is checked in as a disabled `beta` candidate. Its first
+The account-provisioned route is checked in as an enabled `beta` route. Its first
 bounded live run proved non-streaming JSON and cache telemetry, but Modal returned no
 terminal usage object for the successful streaming request. The revised two-JSON gate
-then passed with exact cached-token accounting. The candidate remains deliberately
-disabled because deployment activation and customer-serving permission are separate
-decisions. Production and beta both remain OpenRouter-only; no deployment secret,
-customer traffic, or publisher changed.
+then passed with exact cached-token accounting. Streaming remains ineligible and
+routes to OpenRouter. Production remains OpenRouter-only until the separately tracked
+production canary; beta selects Modal first and retains OpenRouter as its compatible
+fallback.
 
 Modal remains the immutable internal provider ID for routing, health, metrics, ledger
 rows, and invoice reconciliation. Customer-facing endpoint and generation metadata use
@@ -49,10 +48,9 @@ this compatibility check removes Modal, the selected and fallback routes both co
 from the remaining concrete candidates. A non-null, nonnumeric `top_p` or `stream` is
 rejected locally before any provider request.
 
-The joined proxy credential is retained only in the local macOS Keychain for
-validation. An approved beta deployment would expose it to AgentGateway as
-`SEREN_ROUTER_KEY_MODAL` through the deployment secret manager and remove the local
-copy afterward. No deployment secret has been created. The authenticated `serendb`
+An approved beta deployment exposes a newly reviewed proxy credential to AgentGateway
+as `SEREN_ROUTER_KEY_MODAL` through the deployment secret manager and removes the
+local validation credential afterward. The authenticated `serendb`
 workspace is on Modal's Starter plan with RBAC disabled, so Modal reports the proxy
 token as workspace-wide rather than environment-scoped. The rendered AgentGateway
 config contains the environment reference, not its value. Only AgentGateway receives
@@ -82,10 +80,10 @@ million tokens. No customer price changes when the beta route is added.
 
 The router records gross provider cost before credits. Promotional-credit consumption
 is reconciled separately from request-level cost and margin. The authenticated
-workspace displayed a $5,030 credit balance on 2026-07-29, not the operator-reported
-$25,000. The beta gate relies only on the separately approved cumulative $5 ceiling;
-the larger grant amount, expiry, and restrictions remain unverified and must not be
-used for production planning.
+workspace displayed approximately $5,030 in credits on 2026-07-29. Taariq confirmed
+on 2026-07-30 that this displayed balance is sufficient and that no reconciliation to
+a separately reported promotional-grant amount is required. The independent
+cumulative $5 validation ceiling remains the operative spend control.
 
 Modal's OpenAI-compatible usage may report cache hits at
 `usage.prompt_tokens_details.cached_tokens`. When that exact count is present and no
@@ -101,10 +99,8 @@ Before any request:
 
 1. Confirm the active CLI profile names the existing Seren workspace.
 2. Confirm the current authenticated balance and compare it with the cumulative local
-   reservation. Record any grant expiry or restrictions if the Credits view exposes
-   them, without copying confidential billing data into this repository. The CLI
-   billing summary can confirm credits applied during a cycle but cannot establish
-   remaining grant eligibility.
+   reservation. The displayed balance is sufficient for the approved bounded
+   validation; the CLI billing summary confirms credits applied during the cycle.
 3. Provision or select the Kimi K3 Shared API endpoint through the dashboard's Managed
    flow and pin its authoritative service hostname in the internal registry mapping.
 4. Create a proxy token, record whether the workspace can enforce environment scope,
@@ -195,18 +191,16 @@ The `$0.00634800` delta was entirely LLM-token cost; deployed-app cost remained
 retained reservations now total `$0.1481760000` against the approved cumulative `$5`
 ceiling. They remain durable even though observed spend was lower.
 
-This passing gate completes the disabled provider integration contract. It does not
-authorize a deployment secret, enable the checked registry row, establish the larger
-reported promotional grant, or provide written customer-serving permission.
+This passing gate completed the provider integration contract. Taariq subsequently
+confirmed permission and authorized the deployment secret, checked beta enablement,
+and bounded production validation on 2026-07-30.
 
 ## Rollout and rollback
 
-A passing revised test permits consideration of a beta deployment. Enabling the
-candidate, copying its credential into the deployment secret manager, and adding a
-beta Gateway credential require a separate deployment approval. Moving the route into
-the production profile additionally requires written customer-serving permission and
-a separate production rollout decision. Until those gates pass, production and beta
-traffic remain on OpenRouter. Rollback is configuration-only:
+The approved beta deployment uses a distinct beta Gateway credential and a new Modal
+credential held by the deployment secret manager. Moving the route into the production
+profile remains a separate bounded rollout tracked independently. Rollback is
+configuration-only:
 
 1. remove `SEREN_ROUTER_BETA_GATEWAY_KEY`;
 2. disable the Modal registry row;

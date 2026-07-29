@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn checked_modal_route_is_neutral_in_beta_and_absent_from_production() {
-        let mut registry: Registry =
+        let registry: Registry =
             serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap();
         registry.validate().unwrap();
         let modal = registry
@@ -438,14 +438,8 @@ mod tests {
             .find(|provider| provider.id == "modal")
             .expect("the checked registry must carry the reviewed Modal beta candidate");
         assert_eq!(modal.id, "modal");
-        assert!(!modal.enabled);
+        assert!(modal.enabled);
         assert_eq!(modal.profiles, [RoutingProfile::Beta].into_iter().collect());
-        registry
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == "modal")
-            .unwrap()
-            .enabled = true;
 
         let catalog = Catalog::from_registry(&registry);
         let production = &catalog

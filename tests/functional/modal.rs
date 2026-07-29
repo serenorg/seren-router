@@ -102,8 +102,8 @@ impl Settings {
             .cloned()
             .expect("the checked registry must contain the internal modal provider");
         assert!(
-            !modal.enabled,
-            "the checked Modal candidate must remain disabled until this gate passes"
+            modal.enabled,
+            "the checked Modal beta route must be enabled"
         );
         assert!(
             modal.supports(RoutingProfile::Beta),
