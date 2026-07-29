@@ -56,6 +56,7 @@ services:
       DATABASE_URL: postgres://seren_router:deployment-smoke-only@postgres:5432/seren_router
       RUST_LOG: seren_router=info
       SEREN_ROUTER_COMBINED_PRICE_CEILING_PER_MTOK: "1000"
+      SEREN_ROUTER_BETA_GATEWAY_KEY: deployment-smoke-beta-only
       SEREN_ROUTER_GATEWAY_KEY: deployment-smoke-only
       SEREN_ROUTER_HYSTERESIS_FRACTION: "0.1"
       SEREN_ROUTER_MAX_SHARE: "1"

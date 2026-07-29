@@ -1,15 +1,22 @@
-// ABOUTME: Pins the reviewed production OpenRouter fallback model coverage and prices.
-// ABOUTME: Detects accidental provider enablement, alias drift, or unreviewed price changes.
+// ABOUTME: Pins the reviewed production and isolated-beta provider contracts.
+// ABOUTME: Detects routing, public-alias, sidecar, or exact-price drift before deployment.
 
 use rust_decimal::Decimal;
-use seren_router::pricing::{BillingPrices, ModelPrices, PriceTable, Usage, cost_usd};
+use serde_json::json;
+use serde_yaml::Value;
+use seren_router::config::RoutingConfig;
+use seren_router::policy::measurements::MeasurementStore;
+use seren_router::policy::routing::{CompletionEndpoint, RouteRequestError, RoutingPolicy};
+use seren_router::pricing::{
+    BillingPrices, ModelPrices, PriceTable, Usage, cost_usd, provider_cost_usd,
+};
 use seren_router::registry::Registry;
 use seren_router::routing_profile::RoutingProfile;
+use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 
 #[test]
-fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
-    let registry: Registry =
-        serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap();
+fn checked_registry_keeps_modal_beta_candidate_disabled() {
+    let registry = checked_registry();
     registry.validate().unwrap();
 
     let enabled: Vec<_> = registry
@@ -18,7 +25,14 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
         .filter(|provider| provider.enabled)
         .collect();
     assert_eq!(enabled.len(), 1);
-    let openrouter = enabled[0];
+
+    let production_enabled: Vec<_> = enabled
+        .iter()
+        .copied()
+        .filter(|provider| provider.supports(RoutingProfile::Production))
+        .collect();
+    assert_eq!(production_enabled.len(), 1);
+    let openrouter = production_enabled[0];
     assert_eq!(openrouter.id, "openrouter");
     assert_eq!(openrouter.base_url, "https://openrouter.ai/api/v1");
     assert_eq!(openrouter.secret_env, "SEREN_ROUTER_KEY_OPENROUTER");
@@ -29,6 +43,64 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
             .into_iter()
             .collect()
     );
+
+    let modal = registry
+        .providers
+        .iter()
+        .find(|provider| provider.id == "modal")
+        .expect("the checked registry must carry the reviewed Modal beta candidate");
+    assert!(
+        !modal.enabled,
+        "the Modal candidate must remain disabled until the revised live gate passes"
+    );
+    assert_eq!(modal.display_name, "Modal");
+    assert_eq!(
+        modal.public_display_name.as_deref(),
+        Some("Seren Inference")
+    );
+    assert_eq!(modal.public_tag.as_deref(), Some("seren"));
+    assert_eq!(modal.base_url, "https://inference.us-west.modal.direct/v1");
+    assert_eq!(modal.secret_env, "SEREN_ROUTER_KEY_MODAL");
+    assert_eq!(modal.priority, 0);
+    assert_eq!(modal.profiles, [RoutingProfile::Beta].into_iter().collect());
+    assert!(!modal.supports(RoutingProfile::Production));
+    assert_eq!(modal.models.len(), 1);
+
+    let modal_kimi = &modal.models[0];
+    assert_eq!(modal_kimi.slug, "moonshotai/kimi-k3");
+    assert_eq!(modal_kimi.name, "MoonshotAI Kimi K3");
+    assert_eq!(modal_kimi.context_length, 1_048_576);
+    assert_ne!(modal_kimi.provider_model_id, modal_kimi.slug);
+    assert_modal_endpoint_hostname(&modal_kimi.provider_model_id);
+    // Authenticated Modal dashboard evidence for the Seren workspace, 2026-07-29.
+    const VERIFIED_MODAL_KIMI_ENDPOINT_HOSTNAME: &str =
+        "serendb--ep-seren-kimi-k3-beta-server.us-west.modal.direct";
+    assert_eq!(
+        modal_kimi.provider_model_id,
+        VERIFIED_MODAL_KIMI_ENDPOINT_HOSTNAME
+    );
+    assert_eq!(modal_kimi.input_price_per_mtok, Decimal::new(300, 2));
+    assert_eq!(
+        modal_kimi.cached_input_price_per_mtok,
+        Some(Decimal::new(30, 2))
+    );
+    assert_eq!(modal_kimi.output_price_per_mtok, Decimal::new(1500, 2));
+    assert_eq!(
+        modal_kimi.request_constraints.endpoints,
+        [CompletionEndpoint::Chat].into_iter().collect()
+    );
+    assert!(
+        !modal_kimi.request_constraints.supports_streaming,
+        "Modal streaming must remain ineligible while its SSE omits terminal usage"
+    );
+    let top_p = modal_kimi
+        .request_constraints
+        .top_p
+        .as_ref()
+        .expect("the Modal Kimi route must pin its supported top_p interval");
+    assert_eq!(top_p.min, Decimal::new(95, 2));
+    assert_eq!(top_p.max, Decimal::ONE);
+
     let deepinfra = registry
         .providers
         .iter()
@@ -129,6 +201,7 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
                 input_price_per_mtok: Decimal::new(13, 2),
                 output_price_per_mtok: Decimal::new(40, 2),
             },
+            provider_cached_input_price_per_mtok: None,
             sell_price: ModelPrices {
                 input_price_per_mtok: Decimal::new(13, 2),
                 output_price_per_mtok: Decimal::new(40, 2),
@@ -141,12 +214,213 @@ fn production_registry_contains_only_the_reviewed_openrouter_fallback() {
             .is_none(),
         "disabled provider prices must not enter the live price table"
     );
+    assert!(
+        prices.get("modal", "moonshotai/kimi-k3").is_none(),
+        "the blocked Modal candidate must not enter the live price table"
+    );
+}
+
+#[test]
+fn modal_cached_provider_cost_is_exact_without_changing_customer_sell_price() {
+    let registry = modal_candidate_registry();
+    let prices = PriceTable::from_registry(&registry).unwrap();
+    let slug = "moonshotai/kimi-k3";
+    let modal = prices.get("modal", slug).unwrap();
+    let openrouter = prices.get("openrouter", slug).unwrap();
+
+    assert_eq!(
+        modal,
+        &BillingPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: Decimal::new(300, 2),
+                output_price_per_mtok: Decimal::new(1500, 2),
+            },
+            provider_cached_input_price_per_mtok: Some(Decimal::new(30, 2)),
+            sell_price: ModelPrices {
+                input_price_per_mtok: Decimal::new(300, 2),
+                output_price_per_mtok: Decimal::new(1500, 2),
+            },
+        }
+    );
+    assert_eq!(modal.sell_price, openrouter.sell_price);
+
+    let usage = Usage {
+        prompt_tokens: 1_000,
+        completion_tokens: 100,
+    };
+    assert_eq!(
+        cost_usd(&modal.sell_price, &usage).to_string(),
+        "0.0045000000"
+    );
+    assert_eq!(
+        provider_cost_usd(modal, &usage, Some(600))
+            .unwrap()
+            .to_string(),
+        "0.0028800000"
+    );
+    assert_eq!(provider_cost_usd(modal, &usage, None), None);
+}
+
+#[test]
+fn routing_policy_keeps_modal_beta_only_and_rejects_provider_selection() {
+    let registry = modal_candidate_registry();
+    let routing = RoutingPolicy::from_registry(
+        &registry,
+        RoutingConfig::new(Decimal::new(100, 0), 0.1, Decimal::ONE, 100).unwrap(),
+        MeasurementStore::default(),
+    )
+    .unwrap();
+    let mut production = json!({
+        "model": "moonshotai/kimi-k3",
+        "provider": {"sort": "price"}
+    });
+    let mut beta = production.clone();
+
+    let production_decision = routing
+        .route(RoutingProfile::Production, &mut production)
+        .unwrap();
+    let beta_decision = routing.route(RoutingProfile::Beta, &mut beta).unwrap();
+
+    assert_eq!(production_decision.selected_provider, "openrouter");
+    assert_eq!(production["model"], "openrouter/moonshotai/kimi-k3");
+    assert_eq!(beta_decision.selected_provider, "modal");
+    assert_eq!(beta["model"], "modal/moonshotai/kimi-k3");
+    assert_eq!(
+        beta_decision.fallback_model.as_deref(),
+        Some("openrouter/moonshotai/kimi-k3")
+    );
+
+    for (endpoint, top_p) in [
+        (CompletionEndpoint::Chat, json!(0.949)),
+        (CompletionEndpoint::Legacy, json!(0.95)),
+    ] {
+        let mut constrained = json!({
+            "model": "moonshotai/kimi-k3",
+            "provider": {"sort": "price"},
+            "top_p": top_p,
+        });
+        let decision = routing
+            .route_for_endpoint(RoutingProfile::Beta, endpoint, &mut constrained)
+            .unwrap();
+
+        assert_eq!(decision.selected_provider, "openrouter");
+        assert_eq!(constrained["model"], "openrouter/moonshotai/kimi-k3");
+        assert_eq!(
+            decision.fallback_model, None,
+            "Modal was filtered, leaving no second compatible route"
+        );
+        assert!(!decision.has_alternatives);
+    }
+
+    let mut streaming = json!({
+        "model": "moonshotai/kimi-k3",
+        "provider": {"sort": "price"},
+        "stream": true,
+        "top_p": 0.95,
+    });
+    let decision = routing
+        .route_for_endpoint(
+            RoutingProfile::Beta,
+            CompletionEndpoint::Chat,
+            &mut streaming,
+        )
+        .unwrap();
+    assert_eq!(decision.selected_provider, "openrouter");
+    assert_eq!(streaming["model"], "openrouter/moonshotai/kimi-k3");
+    assert_eq!(decision.fallback_model, None);
+    assert!(!decision.has_alternatives);
+
+    let mut concrete_provider =
+        json!({"model": "modal/moonshotai/kimi-k3", "provider": {"sort": "price"}});
+    assert_eq!(
+        routing
+            .route(RoutingProfile::Beta, &mut concrete_provider)
+            .unwrap_err(),
+        RouteRequestError::UnknownModel
+    );
+
+    for field in ["only", "ignore", "order"] {
+        let mut override_request = json!({
+            "model": "moonshotai/kimi-k3",
+            "provider": {field: ["modal"]}
+        });
+        assert_eq!(
+            routing
+                .route(RoutingProfile::Beta, &mut override_request)
+                .unwrap_err(),
+            RouteRequestError::UnsupportedProviderOverride
+        );
+    }
+}
+
+#[test]
+fn compiled_sidecar_keeps_modal_internal_and_beta_scoped() {
+    let registry = modal_candidate_registry();
+    let modal_model = &registry
+        .providers
+        .iter()
+        .find(|provider| provider.id == "modal")
+        .unwrap()
+        .models[0];
+    let compiled = compile(&registry, SidecarConfigOptions::default()).unwrap();
+    let config: Value = serde_yaml::from_slice(&compiled).unwrap();
+    let models = config["llm"]["models"].as_sequence().unwrap();
+    let modal_route = named_entry(models, "modal/moonshotai/kimi-k3");
+
+    assert_eq!(modal_route["provider"], "openAI");
+    assert_eq!(
+        modal_route["params"]["baseUrl"],
+        "https://inference.us-west.modal.direct/v1"
+    );
+    assert_eq!(
+        modal_route["params"]["model"],
+        modal_model.provider_model_id
+    );
+    assert_eq!(
+        modal_route["overrides"]["model"],
+        modal_model.provider_model_id
+    );
+    assert_eq!(modal_route["params"]["apiKey"], "$SEREN_ROUTER_KEY_MODAL");
+    assert_eq!(
+        modal_route["responseHeaders"]["set"]["x-seren-served-provider"],
+        "modal"
+    );
+    assert_eq!(modal_route["health"]["eviction"]["consecutiveFailures"], 1);
+    assert_eq!(modal_route["health"]["eviction"]["duration"], "60s");
+
+    let virtual_models = config["llm"]["virtualModels"].as_sequence().unwrap();
+    let production = named_entry(
+        virtual_models,
+        "seren-profile-production/moonshotai/kimi-k3",
+    );
+    let beta = named_entry(virtual_models, "seren-profile-beta/moonshotai/kimi-k3");
+    assert_eq!(
+        production["routing"]["failover"]["targets"],
+        serde_yaml::from_str::<Value>(
+            r#"
+- model: openrouter/moonshotai/kimi-k3
+  priority: 255
+"#
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        beta["routing"]["failover"]["targets"],
+        serde_yaml::from_str::<Value>(
+            r#"
+- model: modal/moonshotai/kimi-k3
+  priority: 0
+- model: openrouter/moonshotai/kimi-k3
+  priority: 255
+"#
+        )
+        .unwrap()
+    );
 }
 
 #[test]
 fn direct_and_fallback_routes_keep_one_reviewed_sell_price_and_separate_costs() {
-    let mut registry: Registry =
-        serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap();
+    let mut registry = checked_registry();
     registry
         .providers
         .iter_mut()
@@ -183,4 +457,49 @@ fn direct_and_fallback_routes_keep_one_reviewed_sell_price_and_separate_costs() 
         (sell_subtotal - direct_provider_cost).to_string(),
         "0.0001359800"
     );
+}
+
+fn checked_registry() -> Registry {
+    serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap()
+}
+
+fn modal_candidate_registry() -> Registry {
+    let mut registry = checked_registry();
+    registry
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "modal")
+        .expect("the checked registry must contain the Modal candidate")
+        .enabled = true;
+    registry
+}
+
+fn assert_modal_endpoint_hostname(hostname: &str) {
+    assert!(!hostname.is_empty());
+    assert_eq!(hostname, hostname.trim());
+    assert!(hostname.ends_with(".us-west.modal.direct"));
+    assert!(!hostname.contains("://"));
+    assert!(!hostname.contains('/'));
+    assert!(hostname.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    }));
+}
+
+fn named_entry<'a>(entries: &'a [Value], name: &str) -> &'a Value {
+    entries
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("missing compiled sidecar entry {name}"))
 }

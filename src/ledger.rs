@@ -1,7 +1,9 @@
 // ABOUTME: Persists provider cost and customer sell subtotal for reconciliation.
 // ABOUTME: Serves OpenRouter-shaped generation metadata by provider response ID.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
@@ -16,6 +18,7 @@ use serde_json::{Number, Value, json};
 use sqlx::{FromRow, PgPool};
 
 use crate::db::DatabaseHealth;
+use crate::registry::Registry;
 use crate::routing_profile::RoutingProfile;
 
 const LEDGER_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -24,6 +27,7 @@ const LEDGER_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Ledger {
     pool: PgPool,
     database_health: DatabaseHealth,
+    public_provider_aliases: Arc<BTreeMap<String, String>>,
 }
 
 impl Ledger {
@@ -35,7 +39,33 @@ impl Ledger {
         Self {
             pool,
             database_health,
+            public_provider_aliases: Arc::default(),
         }
+    }
+
+    pub fn with_public_provider_aliases(mut self, registry: &Registry) -> Self {
+        self.public_provider_aliases = Arc::new(
+            registry
+                .providers
+                .iter()
+                .filter_map(|provider| {
+                    match (&provider.public_display_name, &provider.public_tag) {
+                        (Some(display_name), Some(_)) => {
+                            Some((provider.id.clone(), display_name.clone()))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect(),
+        );
+        self
+    }
+
+    fn public_provider_name<'a>(&'a self, provider_id: &'a str) -> &'a str {
+        self.public_provider_aliases
+            .get(provider_id)
+            .map(String::as_str)
+            .unwrap_or(provider_id)
     }
 
     pub(crate) async fn insert(&self, generation: &GenerationWrite) -> Result<(), sqlx::Error> {
@@ -141,7 +171,7 @@ pub(crate) struct GenerationWrite {
     pub(crate) provider_id: String,
     pub(crate) prompt_tokens: i64,
     pub(crate) completion_tokens: i64,
-    pub(crate) provider_cost_usd: Decimal,
+    pub(crate) provider_cost_usd: Option<Decimal>,
     pub(crate) sell_price_usd: Decimal,
     pub(crate) latency_ms: i64,
     pub(crate) status: i16,
@@ -176,7 +206,12 @@ pub(crate) async fn get_generation(
     };
 
     match ledger.fetch(&query.id, routing_profile).await {
-        Ok(Some(generation)) => generation_response(generation),
+        Ok(Some(generation)) => {
+            let provider_name = ledger
+                .public_provider_name(&generation.provider_id)
+                .to_owned();
+            generation_response(generation, provider_name)
+        }
         Ok(None) => api_error(StatusCode::NOT_FOUND, "generation not found"),
         Err(error) => {
             tracing::error!(
@@ -192,7 +227,7 @@ pub(crate) async fn get_generation(
     }
 }
 
-fn generation_response(generation: Generation) -> Response {
+fn generation_response(generation: Generation, provider_name: String) -> Response {
     let total_cost = generation
         .sell_price_usd
         .map(decimal_value)
@@ -203,7 +238,7 @@ fn generation_response(generation: Generation) -> Response {
             "id": generation.id,
             "created_at": generation.created_at.to_jiff().to_string(),
             "model": generation.canonical_slug,
-            "provider_name": generation.provider_id,
+            "provider_name": provider_name,
             "tokens_prompt": generation.prompt_tokens,
             "tokens_completion": generation.completion_tokens,
             "total_cost": total_cost,
@@ -242,7 +277,13 @@ mod tests {
 
     #[sqlx::test]
     async fn generation_round_trip_and_unknown_lookup(pool: PgPool) {
-        let ledger = Ledger::new(pool.clone());
+        let mut registry: Registry =
+            serde_yaml::from_str(include_str!("../tests/fixtures/catalog_registry.yaml")).unwrap();
+        registry.providers[0].id = "provider-a".to_owned();
+        registry.providers[0].public_display_name = Some("Seren Inference".to_owned());
+        registry.providers[0].public_tag = Some("seren".to_owned());
+        registry.validate().unwrap();
+        let ledger = Ledger::new(pool.clone()).with_public_provider_aliases(&registry);
         let write = GenerationWrite {
             id: "chatcmpl-ledger-round-trip".to_owned(),
             routing_profile: RoutingProfile::Production,
@@ -250,7 +291,7 @@ mod tests {
             provider_id: "provider-a".to_owned(),
             prompt_tokens: 12,
             completion_tokens: 5,
-            provider_cost_usd: "0.0000150000".parse().unwrap(),
+            provider_cost_usd: Some("0.0000150000".parse().unwrap()),
             sell_price_usd: "0.0000190000".parse().unwrap(),
             latency_ms: 321,
             status: 200,
@@ -275,7 +316,7 @@ mod tests {
         assert_eq!(stored.provider_id, write.provider_id);
         assert_eq!(stored.prompt_tokens, Some(write.prompt_tokens));
         assert_eq!(stored.completion_tokens, Some(write.completion_tokens));
-        assert_eq!(stored.provider_cost_usd, Some(write.provider_cost_usd));
+        assert_eq!(stored.provider_cost_usd, write.provider_cost_usd);
         assert_eq!(stored.sell_price_usd, Some(write.sell_price_usd));
         assert_eq!(
             sqlx::query_scalar::<_, Decimal>("SELECT cost_usd FROM generations WHERE id = $1")
@@ -314,7 +355,7 @@ mod tests {
                 .unwrap();
         assert_eq!(found["data"]["id"], write.id);
         assert_eq!(found["data"]["model"], write.canonical_slug);
-        assert_eq!(found["data"]["provider_name"], write.provider_id);
+        assert_eq!(found["data"]["provider_name"], "Seren Inference");
         assert_eq!(found["data"]["tokens_prompt"], write.prompt_tokens);
         assert_eq!(found["data"]["tokens_completion"], write.completion_tokens);
         assert_eq!(
@@ -370,5 +411,47 @@ mod tests {
             .unwrap();
         assert_eq!(legacy.sell_price_usd, Some(Decimal::new(7, 10)));
         assert_eq!(legacy.provider_cost_usd, None);
+    }
+
+    #[sqlx::test]
+    async fn unresolved_provider_cost_round_trips_with_exact_sell_price(pool: PgPool) {
+        let ledger = Ledger::new(pool.clone());
+        let write = GenerationWrite {
+            id: "chatcmpl-unresolved-provider-cost".to_owned(),
+            routing_profile: RoutingProfile::Beta,
+            canonical_slug: "canonical/cached-model".to_owned(),
+            provider_id: "provider-with-cache-pricing".to_owned(),
+            prompt_tokens: 1_000,
+            completion_tokens: 20,
+            provider_cost_usd: None,
+            sell_price_usd: "0.0033000000".parse().unwrap(),
+            latency_ms: 456,
+            status: 200,
+        };
+
+        ledger.insert(&write).await.unwrap();
+
+        let stored = ledger
+            .fetch(&write.id, RoutingProfile::Beta)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.provider_cost_usd, None);
+        assert_eq!(stored.sell_price_usd, Some(write.sell_price_usd));
+
+        let persisted = sqlx::query_as::<_, (Option<Decimal>, Decimal, Decimal)>(
+            r#"
+            SELECT provider_cost_usd, sell_price_usd, cost_usd
+            FROM generations
+            WHERE id = $1
+            "#,
+        )
+        .bind(&write.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted.0, None);
+        assert_eq!(persisted.1, write.sell_price_usd);
+        assert_eq!(persisted.2, write.sell_price_usd);
     }
 }

@@ -100,7 +100,8 @@ async fn run_service() -> anyhow::Result<()> {
     let pool = db::connect_lazy(database_url.trim()).context("invalid DATABASE_URL")?;
     let database_health = db::DatabaseHealth::starting();
     tokio::spawn(db::supervise(pool.clone(), database_health.clone()));
-    let ledger = Ledger::with_health(pool, database_health.clone());
+    let ledger =
+        Ledger::with_health(pool, database_health.clone()).with_public_provider_aliases(&registry);
     let proxy = ProxyState::new(
         config.sidecar_url(),
         price_table,

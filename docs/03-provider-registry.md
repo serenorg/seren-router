@@ -40,6 +40,40 @@ Key points:
 - **Provider prices are cost, not customer price.** The top-level `sell_prices`
   table owns the route-independent customer subtotal reported at `usage.cost`.
   See `docs/04`.
+- **Public aliases do not replace internal attribution.** Optional
+  `public_display_name` and `public_tag` values must be configured together.
+  Catalog endpoint and generation metadata responses use those aliases, while
+  routing, headers, metrics, ledger rows, and reconciliation continue to use the
+  provider's immutable `id`. Providers without aliases preserve the existing
+  `display_name` / `id` response behavior.
+- **Cached-input prices are explicit.** A model mapping may declare
+  `cached_input_price_per_mtok` when the provider charges a distinct cache-hit
+  rate. The router always records the exact sell subtotal from total prompt and
+  completion usage. It requires the upstream usage object to report an exact
+  cached-token count to record provider cost; missing or invalid detail persists
+  `provider_cost_usd` as null rather than estimating it.
+- **Request compatibility is declarative per provider/model.** Omitted
+  `request_constraints` accepts both Chat Completions and legacy Completions, with
+  streaming enabled and any numeric `top_p`. A narrower OpenAI-compatible route can
+  declare the endpoint forms, disable streaming, and set an inclusive interval for
+  an explicitly supplied `top_p`:
+
+  ```yaml
+  request_constraints:
+    endpoints: [chat]
+    supports_streaming: false
+    top_p:
+      min: "0.95"
+      max: "1"
+  ```
+
+  An absent or null `top_p` leaves the provider's own default in effect. An absent,
+  null, or false `stream` is non-streaming; a nonboolean non-null value is rejected
+  locally. When an otherwise compatible route disallows streaming, a streaming
+  request selects another eligible provider. Any pre-response fallback is also a
+  concrete member of that filtered set.
+  Endpoint lists must be non-empty, and bounds must satisfy
+  `0 <= min <= max <= 1`; the checked registry rejects invalid declarations.
 - **OpenAI-compatible is the current standard path.** Most candidate hosts already
   speak OpenAI's API. Only a host with a non-standard API needs a new code shim.
 - **`profiles` is an allowlist, not a traffic hint.** Omission safely defaults to

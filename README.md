@@ -27,6 +27,7 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/09-agentgateway-evaluation.md`](docs/09-agentgateway-evaluation.md) | DECIDED: built on agentgateway (Linux Foundation, Rust, Apache-2.0) — verified by source inspection + live functional test |
 | [`docs/10-deployment.md`](docs/10-deployment.md) | Validated two-container pod boundary, image pin, probes, and local production smoke |
 | [`docs/11-first-direct-provider.md`](docs/11-first-direct-provider.md) | First direct-provider selection, evidence, and activation gates |
+| [`docs/12`](docs/12-modal-kimi-beta.md) | Kimi K3 beta inference contract, neutral naming, and activation gates |
 | [`docs/plans/20260724_plan_seren_router_build.md`](docs/plans/20260724_plan_seren_router_build.md) | The build plan: zero-context, task-by-task implementation guide (M0–M7) with tests and commit points |
 
 ## Status
@@ -36,9 +37,11 @@ as of 2026-07-25. The service uses the standard Seren Rust chassis and is built 
 **thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
 verified evaluation). The OpenRouter-only image was deployed to the existing production
-environment and passed its bounded canary on 2026-07-26. Production publisher cutover
-and direct-provider activation remain separate, explicitly gated operations; this
-repository change performs neither.
+environment and passed its bounded canary on 2026-07-26. The repository also carries
+a disabled, credential-isolated Kimi K3 candidate for the beta profile. Its first
+bounded live gate found that Modal streaming omitted terminal usage, so streaming is
+ineligible and activation remains blocked pending the revised JSON-only live gate.
+Production and beta both remain OpenRouter-only.
 
 ## Service development
 
@@ -78,9 +81,11 @@ curl http://127.0.0.1:8000/readyz
 `SEREN_ROUTER_GATEWAY_KEY`, `DATABASE_URL`, and the four routing-policy variables shown
 above are required. The router deliberately has no unreviewed production defaults for
 the price ceiling, hysteresis, provider max share, or rolling share-window size.
-The AgentGateway sidecar also requires `SEREN_ROUTER_KEY_OPENROUTER` while the
-checked-in OpenRouter fallback provider is enabled; inject it from the deployment
-secret manager and never store it in the registry or rendered configuration.
+The AgentGateway sidecar requires `SEREN_ROUTER_KEY_OPENROUTER` while the checked-in
+OpenRouter fallback provider is enabled. A deployment that enables the checked-in beta
+route also requires `SEREN_ROUTER_KEY_MODAL`. Inject both from the deployment secret
+manager and never store either value in the registry, rendered configuration, or
+seren-router app container.
 Startup opens a lazy PostgreSQL pool, binds the HTTP listener without waiting for the
 generation ledger, and retries embedded migrations in an event-driven background
 supervisor. `/readyz` requires AgentGateway and reports PostgreSQL as `starting`, `ok`,
@@ -106,10 +111,11 @@ paths:
 All require a Gateway bearer credential. `SEREN_ROUTER_GATEWAY_KEY` is bound to the
 production provider profile; optional `SEREN_ROUTER_BETA_GATEWAY_KEY` is bound to the
 beta profile and must be distinct. Client headers cannot choose or override the
-profile. Completion responses
-carry exact reviewed sell-price `usage.cost`; successful generations persist both
-provider cost and sell subtotal for post-hoc lookup and reconciliation. The model and
-endpoint catalogs are assembled at
+profile. Completion responses carry exact reviewed sell-price `usage.cost`; successful
+generations always persist the sell subtotal and persist provider cost only when the
+upstream supplies every usage detail required for an exact calculation. An unresolved
+provider cost is stored explicitly as null for reconciliation. The model and endpoint
+catalogs are assembled at
 startup from enabled provider mappings and report exact per-token prices as decimal
 strings. Endpoint responses expose registry metadata only; they never expose provider
 URLs or secret names. The key and credit responses are fixed compatibility metadata

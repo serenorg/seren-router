@@ -29,6 +29,10 @@ pub struct SellPrice {
 pub struct Provider {
     pub id: String,
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_tag: Option<String>,
     pub base_url: String,
     pub secret_env: String,
     #[serde(default)]
@@ -48,7 +52,67 @@ pub struct ModelMapping {
     pub context_length: u64,
     pub provider_model_id: String,
     pub input_price_per_mtok: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_price_per_mtok: Option<Decimal>,
     pub output_price_per_mtok: Decimal,
+    #[serde(default, skip_serializing_if = "RequestConstraints::is_default")]
+    pub request_constraints: RequestConstraints,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionEndpoint {
+    Chat,
+    Legacy,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestConstraints {
+    #[serde(default = "default_completion_endpoints")]
+    pub endpoints: BTreeSet<CompletionEndpoint>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub supports_streaming: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<TopPBounds>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopPBounds {
+    pub min: Decimal,
+    pub max: Decimal,
+}
+
+impl Default for RequestConstraints {
+    fn default() -> Self {
+        Self {
+            endpoints: default_completion_endpoints(),
+            supports_streaming: true,
+            top_p: None,
+        }
+    }
+}
+
+impl RequestConstraints {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn supports_endpoint(&self, endpoint: CompletionEndpoint) -> bool {
+        self.endpoints.contains(&endpoint)
+    }
+
+    pub fn permits_streaming(&self, stream: bool) -> bool {
+        !stream || self.supports_streaming
+    }
+
+    pub fn permits_top_p(&self, top_p: Option<Decimal>) -> bool {
+        match (&self.top_p, top_p) {
+            (Some(bounds), Some(top_p)) => bounds.min <= top_p && top_p <= bounds.max,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Eq, Error, PartialEq)]
@@ -61,17 +125,35 @@ pub enum RegistryValidationError {
     MissingSellPrice { provider_id: String, slug: String },
     #[error("duplicate provider id: {0}")]
     DuplicateProviderId(String),
+    #[error("provider {0} has an empty public display name")]
+    EmptyProviderPublicDisplayName(String),
+    #[error("provider {0} has an empty public tag")]
+    EmptyProviderPublicTag(String),
+    #[error("provider {0} must configure public_display_name and public_tag together")]
+    IncompleteProviderPublicAliases(String),
     #[error("provider {0} must allow at least one routing profile")]
     EmptyProviderProfiles(String),
     #[error("model {slug} for provider {provider_id} has an empty display name")]
     EmptyModelName { provider_id: String, slug: String },
     #[error("model {slug} for provider {provider_id} has a zero context length")]
     ZeroModelContextLength { provider_id: String, slug: String },
+    #[error("model {slug} for provider {provider_id} must allow at least one completion endpoint")]
+    EmptyModelCompletionEndpoints { provider_id: String, slug: String },
+    #[error(
+        "model {slug} for provider {provider_id} has invalid top_p bounds {min}..={max}; bounds must satisfy 0 <= min <= max <= 1"
+    )]
+    InvalidModelTopPBounds {
+        provider_id: String,
+        slug: String,
+        min: Decimal,
+        max: Decimal,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PriceSide {
     Input,
+    CachedInput,
     Output,
 }
 
@@ -79,6 +161,7 @@ impl std::fmt::Display for PriceSide {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Input => formatter.write_str("input"),
+            Self::CachedInput => formatter.write_str("cached input"),
             Self::Output => formatter.write_str("output"),
         }
     }
@@ -114,6 +197,29 @@ impl Registry {
                     provider.id.clone(),
                 ));
             }
+            if provider.public_display_name.is_some() != provider.public_tag.is_some() {
+                return Err(RegistryValidationError::IncompleteProviderPublicAliases(
+                    provider.id.clone(),
+                ));
+            }
+            if provider
+                .public_display_name
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(RegistryValidationError::EmptyProviderPublicDisplayName(
+                    provider.id.clone(),
+                ));
+            }
+            if provider
+                .public_tag
+                .as_deref()
+                .is_some_and(|tag| tag.trim().is_empty())
+            {
+                return Err(RegistryValidationError::EmptyProviderPublicTag(
+                    provider.id.clone(),
+                ));
+            }
             if provider.profiles.is_empty() {
                 return Err(RegistryValidationError::EmptyProviderProfiles(
                     provider.id.clone(),
@@ -139,6 +245,24 @@ impl Registry {
                         slug: mapping.slug.clone(),
                     });
                 }
+                if mapping.request_constraints.endpoints.is_empty() {
+                    return Err(RegistryValidationError::EmptyModelCompletionEndpoints {
+                        provider_id: provider.id.clone(),
+                        slug: mapping.slug.clone(),
+                    });
+                }
+                if let Some(bounds) = &mapping.request_constraints.top_p
+                    && (bounds.min < Decimal::ZERO
+                        || bounds.min > bounds.max
+                        || bounds.max > Decimal::ONE)
+                {
+                    return Err(RegistryValidationError::InvalidModelTopPBounds {
+                        provider_id: provider.id.clone(),
+                        slug: mapping.slug.clone(),
+                        min: bounds.min,
+                        max: bounds.max,
+                    });
+                }
             }
         }
 
@@ -156,10 +280,36 @@ impl Provider {
     pub fn supports(&self, profile: RoutingProfile) -> bool {
         self.profiles.contains(&profile)
     }
+
+    pub fn catalog_display_name(&self) -> &str {
+        match (&self.public_display_name, &self.public_tag) {
+            (Some(display_name), Some(_)) => display_name,
+            _ => &self.display_name,
+        }
+    }
+
+    pub fn catalog_tag(&self) -> &str {
+        match (&self.public_display_name, &self.public_tag) {
+            (Some(_), Some(tag)) => tag,
+            _ => &self.id,
+        }
+    }
 }
 
 fn default_profiles() -> BTreeSet<RoutingProfile> {
     BTreeSet::from([RoutingProfile::Production])
+}
+
+fn default_completion_endpoints() -> BTreeSet<CompletionEndpoint> {
+    BTreeSet::from([CompletionEndpoint::Chat, CompletionEndpoint::Legacy])
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[cfg(test)]
@@ -213,6 +363,92 @@ providers:
             registry.providers[1].profiles,
             BTreeSet::from([RoutingProfile::Production])
         );
+        assert_eq!(registry.providers[0].public_display_name, None);
+        assert_eq!(registry.providers[0].public_tag, None);
+        assert_eq!(
+            registry.providers[0].models[0].cached_input_price_per_mtok,
+            None
+        );
+        assert_eq!(
+            registry.providers[0].models[0].request_constraints,
+            RequestConstraints::default()
+        );
+        assert_eq!(
+            registry.providers[0].models[0]
+                .request_constraints
+                .endpoints,
+            BTreeSet::from([CompletionEndpoint::Chat, CompletionEndpoint::Legacy])
+        );
+    }
+
+    #[test]
+    fn optional_catalog_aliases_and_cached_input_price_round_trip() {
+        let yaml = TWO_PROVIDER_YAML
+            .replace(
+                "    display_name: Fireworks AI",
+                concat!(
+                    "    display_name: Fireworks AI\n",
+                    "    public_display_name: Seren Inference\n",
+                    "    public_tag: seren"
+                ),
+            )
+            .replace(
+                "        input_price_per_mtok: \"0.90\"",
+                concat!(
+                    "        input_price_per_mtok: \"0.90\"\n",
+                    "        cached_input_price_per_mtok: \"0.09\""
+                ),
+            );
+        let registry: Registry = serde_yaml::from_str(&yaml).unwrap();
+        registry.validate().unwrap();
+
+        assert_eq!(
+            registry.providers[1].catalog_display_name(),
+            "Seren Inference"
+        );
+        assert_eq!(registry.providers[1].catalog_tag(), "seren");
+        assert_eq!(
+            registry.providers[1].models[0].cached_input_price_per_mtok,
+            Some("0.09".parse().unwrap())
+        );
+
+        let serialized = serde_yaml::to_string(&registry).unwrap();
+        let reparsed: Registry = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, registry);
+    }
+
+    #[test]
+    fn optional_request_constraints_round_trip() {
+        let yaml = TWO_PROVIDER_YAML.replace(
+            "        output_price_per_mtok: \"0.90\"",
+            concat!(
+                "        output_price_per_mtok: \"0.90\"\n",
+                "        request_constraints:\n",
+                "          endpoints: [chat]\n",
+                "          supports_streaming: false\n",
+                "          top_p:\n",
+                "            min: \"0.95\"\n",
+                "            max: \"1\""
+            ),
+        );
+        let registry: Registry = serde_yaml::from_str(&yaml).unwrap();
+        registry.validate().unwrap();
+
+        assert_eq!(
+            registry.providers[1].models[0].request_constraints,
+            RequestConstraints {
+                endpoints: BTreeSet::from([CompletionEndpoint::Chat]),
+                supports_streaming: false,
+                top_p: Some(TopPBounds {
+                    min: "0.95".parse().unwrap(),
+                    max: Decimal::ONE,
+                }),
+            }
+        );
+
+        let serialized = serde_yaml::to_string(&registry).unwrap();
+        let reparsed: Registry = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, registry);
     }
 
     #[test]
@@ -301,6 +537,44 @@ providers:
     }
 
     #[test]
+    fn empty_model_completion_endpoints_are_rejected() {
+        let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
+        registry.providers[0].models[0]
+            .request_constraints
+            .endpoints
+            .clear();
+
+        assert_eq!(
+            registry.validate(),
+            Err(RegistryValidationError::EmptyModelCompletionEndpoints {
+                provider_id: "openrouter".to_owned(),
+                slug: "meta-llama/llama-3.3-70b-instruct".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_model_top_p_bounds_are_rejected() {
+        for (min, max) in [("-0.01", "1"), ("0.6", "0.5"), ("0", "1.01")] {
+            let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
+            let min = min.parse().unwrap();
+            let max = max.parse().unwrap();
+            registry.providers[0].models[0].request_constraints.top_p =
+                Some(TopPBounds { min, max });
+
+            assert_eq!(
+                registry.validate(),
+                Err(RegistryValidationError::InvalidModelTopPBounds {
+                    provider_id: "openrouter".to_owned(),
+                    slug: "meta-llama/llama-3.3-70b-instruct".to_owned(),
+                    min,
+                    max,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn empty_provider_profiles_are_rejected() {
         let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
         registry.providers[0].profiles.clear();
@@ -311,5 +585,56 @@ providers:
                 "openrouter".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn blank_public_catalog_aliases_are_rejected() {
+        let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
+        registry.providers[0].public_display_name = Some(" \t".to_owned());
+        registry.providers[0].public_tag = Some("seren".to_owned());
+        assert_eq!(
+            registry.validate(),
+            Err(RegistryValidationError::EmptyProviderPublicDisplayName(
+                "openrouter".to_owned()
+            ))
+        );
+
+        registry.providers[0].public_display_name = None;
+        registry.providers[0].public_tag = Some("\n".to_owned());
+        assert_eq!(
+            registry.validate(),
+            Err(RegistryValidationError::IncompleteProviderPublicAliases(
+                "openrouter".to_owned()
+            ))
+        );
+
+        registry.providers[0].public_display_name = Some("Seren Inference".to_owned());
+        assert_eq!(
+            registry.validate(),
+            Err(RegistryValidationError::EmptyProviderPublicTag(
+                "openrouter".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn public_catalog_aliases_must_be_configured_together() {
+        for (public_display_name, public_tag) in [
+            (Some("Seren Inference".to_owned()), None),
+            (None, Some("seren".to_owned())),
+        ] {
+            let mut registry: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
+            registry.providers[0].public_display_name = public_display_name;
+            registry.providers[0].public_tag = public_tag;
+
+            assert_eq!(
+                registry.validate(),
+                Err(RegistryValidationError::IncompleteProviderPublicAliases(
+                    "openrouter".to_owned()
+                ))
+            );
+            assert_eq!(registry.providers[0].catalog_display_name(), "OpenRouter");
+            assert_eq!(registry.providers[0].catalog_tag(), "openrouter");
+        }
     }
 }

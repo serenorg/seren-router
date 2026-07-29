@@ -199,7 +199,11 @@ impl<'a> EndpointCandidate<'a> {
 
     fn into_endpoint(self) -> CatalogEndpoint {
         CatalogEndpoint {
-            name: format!("{}: {}", self.provider.display_name, self.mapping.name),
+            name: format!(
+                "{}: {}",
+                self.provider.catalog_display_name(),
+                self.mapping.name
+            ),
             model_id: self.mapping.slug.clone(),
             model_name: self.mapping.name.clone(),
             context_length: self.mapping.context_length,
@@ -207,8 +211,8 @@ impl<'a> EndpointCandidate<'a> {
                 prompt: per_token_price(self.sell_price.input_price_per_mtok),
                 completion: per_token_price(self.sell_price.output_price_per_mtok),
             },
-            provider_name: self.provider.display_name.clone(),
-            tag: self.provider.id.clone(),
+            provider_name: self.provider.catalog_display_name().to_owned(),
+            tag: self.provider.catalog_tag().to_owned(),
         }
     }
 }
@@ -400,5 +404,81 @@ mod tests {
         assert!(!production.contains("openai/gpt-5-mini"));
         assert!(beta.contains("openai/gpt-5-mini"));
         assert!(!production.contains("Cheap Input Provider"));
+    }
+
+    #[test]
+    fn endpoint_catalog_uses_public_aliases_without_changing_internal_provider_id() {
+        let mut registry: Registry =
+            serde_yaml::from_str(include_str!("../tests/fixtures/catalog_registry.yaml")).unwrap();
+        registry.providers[0].public_display_name = Some("Seren Inference".to_owned());
+        registry.providers[0].public_tag = Some("seren".to_owned());
+        registry.validate().unwrap();
+
+        let catalog = Catalog::from_registry(&registry);
+        let endpoint = &catalog
+            .snapshot(RoutingProfile::Production)
+            .endpoints_by_slug["anthropic/claude-opus-5-fast"]
+            .data
+            .endpoints[0];
+
+        assert_eq!(endpoint.name, "Seren Inference: Claude Opus 5 (Fast)");
+        assert_eq!(endpoint.provider_name, "Seren Inference");
+        assert_eq!(endpoint.tag, "seren");
+        assert_eq!(registry.providers[0].id, "balanced");
+    }
+
+    #[test]
+    fn checked_modal_route_is_neutral_in_beta_and_absent_from_production() {
+        let mut registry: Registry =
+            serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap();
+        registry.validate().unwrap();
+        let modal = registry
+            .providers
+            .iter()
+            .find(|provider| provider.id == "modal")
+            .expect("the checked registry must carry the reviewed Modal beta candidate");
+        assert_eq!(modal.id, "modal");
+        assert!(!modal.enabled);
+        assert_eq!(modal.profiles, [RoutingProfile::Beta].into_iter().collect());
+        registry
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == "modal")
+            .unwrap()
+            .enabled = true;
+
+        let catalog = Catalog::from_registry(&registry);
+        let production = &catalog
+            .snapshot(RoutingProfile::Production)
+            .endpoints_by_slug["moonshotai/kimi-k3"];
+        assert_eq!(production.data.endpoints.len(), 1);
+        assert_eq!(production.data.endpoints[0].provider_name, "OpenRouter");
+        assert_eq!(production.data.endpoints[0].tag, "openrouter");
+
+        let beta = &catalog.snapshot(RoutingProfile::Beta).endpoints_by_slug["moonshotai/kimi-k3"];
+        assert_eq!(beta.data.endpoints.len(), 2);
+        let neutral = beta
+            .data
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.provider_name == "Seren Inference")
+            .expect("beta catalog must publish the neutral provider alias");
+        assert_eq!(neutral.name, "Seren Inference: MoonshotAI Kimi K3");
+        assert_eq!(neutral.tag, "seren");
+
+        let serialized = serde_json::to_string(beta).unwrap().to_ascii_lowercase();
+        assert!(
+            !serialized.contains("modal"),
+            "the beta endpoint catalog must not disclose its internal provider"
+        );
+        assert_eq!(
+            registry
+                .providers
+                .iter()
+                .find(|provider| provider.id == "modal")
+                .unwrap()
+                .id,
+            "modal"
+        );
     }
 }

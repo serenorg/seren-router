@@ -68,7 +68,7 @@ impl Settings {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
-        let registry = production_registry();
+        let registry = openrouter_only_registry();
         let prices = PriceTable::from_registry(&registry)
             .unwrap()
             .get("openrouter", &model)
@@ -194,7 +194,7 @@ struct ParityHarness {
 
 impl ParityHarness {
     async fn start(openrouter_key: &str) -> Self {
-        let registry = production_registry();
+        let registry = openrouter_only_registry();
         assert_only_openrouter_is_enabled(&registry);
         let ports = Ports::allocate();
         let runtime_ports = ports.owned_runtime_ports();
@@ -247,7 +247,7 @@ impl ParityHarness {
         let app = router_app(
             &format!("http://127.0.0.1:{}", ports.llm),
             &registry,
-            Ledger::new(pool),
+            Ledger::new(pool).with_public_provider_aliases(&registry),
         );
         let (router_shutdown, shutdown) = oneshot::channel();
         let router_task = tokio::spawn(async move {
@@ -852,8 +852,13 @@ fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
-fn production_registry() -> Registry {
-    serde_yaml::from_str(include_str!("../../registry/providers.yaml")).unwrap()
+fn openrouter_only_registry() -> Registry {
+    let mut registry: Registry =
+        serde_yaml::from_str(include_str!("../../registry/providers.yaml")).unwrap();
+    for provider in &mut registry.providers {
+        provider.enabled = provider.id == "openrouter";
+    }
+    registry
 }
 
 fn assert_only_openrouter_is_enabled(registry: &Registry) {
@@ -1033,7 +1038,7 @@ mod tests {
 
     #[test]
     fn full_soak_estimate_for_the_default_model_is_below_ten_cents() {
-        let registry = production_registry();
+        let registry = openrouter_only_registry();
         let prices = PriceTable::from_registry(&registry)
             .unwrap()
             .get("openrouter", DEFAULT_MODEL)

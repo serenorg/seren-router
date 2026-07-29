@@ -14,15 +14,19 @@ initial sell prices equal the incumbent OpenRouter rates. A cheaper direct route
 therefore leaves the customer's documented price unchanged and converts the removed
 middleman spread into Seren router gross margin.
 
-Provider cost remains exact and separate. It is never substituted for the sell price,
-and it is never discarded.
+Provider cost remains exact and separate. It is never substituted for the sell price
+or estimated. When the upstream response lacks details required for exact provider
+cost, the sell subtotal is still recorded and `provider_cost_usd` is persisted as
+null for reconciliation.
 
 ## The three amounts
 
 For one successful generation:
 
 1. **Provider cost** is the served provider's reviewed input/output cost multiplied by
-   actual token usage.
+   actual token usage. When a provider publishes a distinct cached-input rate,
+   reported cached prompt tokens use that rate and the remaining prompt tokens use
+   the ordinary input rate.
 2. **Sell subtotal** is the canonical model's reviewed input/output sell price
    multiplied by the same token usage.
 3. **Gateway fee** is the existing 5% fee applied by Seren Gateway to the sell
@@ -31,6 +35,27 @@ For one successful generation:
 All router arithmetic uses `rust_decimal`, divides per-million-token rates by exactly
 `1_000_000`, rounds once to ten decimal places with midpoint-away-from-zero, and
 stores `NUMERIC(18, 10)`. No binary floating-point value enters billing.
+
+For a provider mapping with a cached-input price:
+
+```text
+uncached_prompt_tokens = prompt_tokens - cached_prompt_tokens
+provider_cost_usd =
+  (
+    uncached_prompt_tokens × input_price_per_mtok
+    + cached_prompt_tokens × cached_input_price_per_mtok
+    + completion_tokens × output_price_per_mtok
+  ) / 1_000_000
+```
+
+The upstream response must supply
+`usage.prompt_tokens_details.cached_tokens`, and that count must not exceed
+`usage.prompt_tokens`. Customer sell pricing continues to apply the canonical
+input rate to all prompt tokens. If a provider mapping declares a cached-input
+rate but the exact count is missing or invalid, the router still injects the
+exact sell subtotal and records the generation with a null provider cost. It
+never guesses the provider cost; reconciliation and provider activation gates
+must treat that null as unresolved.
 
 The router reports only the sell subtotal at `usage.cost`. Gateway continues to read
 `upstream_cost_response_path: "usage.cost"` and add its 5% exactly once. The router
@@ -88,16 +113,20 @@ For non-streaming responses, the router injects the computed sell subtotal into
 `usage.cost`. For streaming responses it injects the same value into the terminal
 usage event before `[DONE]`.
 
-Both paths retain the provider cost internally and persist both amounts under the
-provider response ID. `GET /api/v1/generation?id=` returns the sell subtotal as
-`data.total_cost`, matching the metered response. It does not expose the internal
-provider cost.
+Both paths persist the exact sell subtotal under the provider response ID. They also
+persist exact provider cost when it can be calculated; otherwise
+`provider_cost_usd` remains null and is never estimated. `GET
+/api/v1/generation?id=` returns the sell subtotal as `data.total_cost`, matching the
+metered response. It does not expose the internal provider cost. When a provider has
+public catalog aliases, generation metadata uses its public display name while the
+ledger retains the immutable internal provider ID for reconciliation.
 
 ## Ledger and mixed-version safety
 
 New rows contain:
 
-- `provider_cost_usd`: exact cost expected from the served provider;
+- `provider_cost_usd`: exact cost expected from the served provider, or null when
+  required upstream usage detail is unresolved;
 - `sell_price_usd`: exact pre-Gateway customer subtotal;
 - `cost_usd`: a rollback-compatible mirror of `sell_price_usd`.
 
@@ -137,6 +166,10 @@ then reconcile `sell_price_usd` against Gateway upstream-cost metering. Investig
 - negative router gross margin;
 - catalog sell prices that differ from the checked-in registry; and
 - any Gateway charge that applies the 5% fee more than once.
+
+Promotional credits do not reduce request-level provider cost. The ledger records
+gross published or contracted provider cost; billing reconciliation records credit
+consumption separately so temporary grants do not masquerade as durable margin.
 
 No prompt, response body, customer identifier, authorization header, or credential is
 needed for this reconciliation.

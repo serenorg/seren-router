@@ -78,6 +78,30 @@ providers:
         input_price_per_mtok: "3.00"
         output_price_per_mtok: "15.00"
 
+  - id: modal
+    display_name: Modal
+    public_display_name: Seren Inference
+    public_tag: seren
+    base_url: https://inference.us-west.modal.direct/v1
+    secret_env: SEREN_ROUTER_KEY_MODAL
+    enabled: false
+    priority: 0
+    profiles: [beta]
+    models:
+      - slug: moonshotai/kimi-k3
+        name: MoonshotAI Kimi K3
+        context_length: 1048576
+        provider_model_id: serendb--ep-seren-kimi-k3-beta-server.us-west.modal.direct
+        input_price_per_mtok: "3.00"
+        cached_input_price_per_mtok: "0.30"
+        output_price_per_mtok: "15.00"
+        request_constraints:
+          endpoints: [chat]
+          supports_streaming: false
+          top_p:
+            min: "0.95"
+            max: "1"
+
   - id: deepinfra
     display_name: DeepInfra
     base_url: https://api.deepinfra.com/v1/openai

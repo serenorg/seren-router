@@ -13,7 +13,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::config::RoutingConfig;
-use crate::registry::Registry;
+pub use crate::registry::CompletionEndpoint;
+use crate::registry::{Registry, RequestConstraints};
 use crate::routing_profile::RoutingProfile;
 
 use super::measurements::MeasurementStore;
@@ -34,6 +35,7 @@ struct RouteDescriptor {
     input_price_per_mtok: rust_decimal::Decimal,
     output_price_per_mtok: rust_decimal::Decimal,
     priority: u8,
+    request_constraints: RequestConstraints,
 }
 
 struct RoutingState {
@@ -46,7 +48,7 @@ pub struct RouteDecision {
     pub profile: RoutingProfile,
     pub canonical_model: String,
     pub selected_provider: String,
-    pub fallback_model: String,
+    pub fallback_model: Option<String>,
     pub has_alternatives: bool,
 }
 
@@ -95,6 +97,7 @@ impl RoutingPolicy {
                             input_price_per_mtok: model.input_price_per_mtok,
                             output_price_per_mtok: model.output_price_per_mtok,
                             priority: provider.priority,
+                            request_constraints: model.request_constraints.clone(),
                         });
                 }
             }
@@ -123,7 +126,18 @@ impl RoutingPolicy {
         profile: RoutingProfile,
         request: &mut Value,
     ) -> Result<RouteDecision, RouteRequestError> {
+        self.route_for_endpoint(profile, CompletionEndpoint::Chat, request)
+    }
+
+    pub fn route_for_endpoint(
+        &self,
+        profile: RoutingProfile,
+        endpoint: CompletionEndpoint,
+        request: &mut Value,
+    ) -> Result<RouteDecision, RouteRequestError> {
         reject_provider_overrides(request)?;
+        let top_p = parse_top_p(request)?;
+        let stream = parse_stream(request)?;
         let parsed = parse_request(request)?;
         consume_routing_sort(request);
         let route_key = (profile, parsed.canonical_model.clone());
@@ -133,6 +147,11 @@ impl RoutingPolicy {
             .ok_or(RouteRequestError::UnknownModel)?;
         let candidates: Vec<_> = descriptors
             .iter()
+            .filter(|route| {
+                route.request_constraints.supports_endpoint(endpoint)
+                    && route.request_constraints.permits_streaming(stream)
+                    && route.request_constraints.permits_top_p(top_p)
+            })
             .map(|route| {
                 Candidate::new(
                     &route.provider_id,
@@ -146,7 +165,9 @@ impl RoutingPolicy {
                 .expect("registry candidates were validated during routing-policy construction")
             })
             .collect();
-
+        if candidates.is_empty() {
+            return Err(RouteRequestError::NoEligibleRoute);
+        }
         let mut state = self.state.lock().expect("routing state lock poisoned");
         let mut recent_share = state.shares.remove(&route_key).unwrap_or_else(|| {
             ShareTracker::new(self.config.share_window())
@@ -163,6 +184,22 @@ impl RoutingPolicy {
             return Err(RouteRequestError::NoEligibleRoute);
         };
         let selected_provider = selected.provider_id().to_owned();
+        let fallback_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.provider_id() != selected_provider)
+            .cloned()
+            .collect();
+        // Planning a fallback must not perturb the process RNG used for primary
+        // traffic selection when the fallback is never exercised.
+        let mut fallback_rng = StdRng::seed_from_u64(0x5e_e7_fa_11_ba_c0);
+        let fallback_model = select_route(
+            &fallback_candidates,
+            parsed.preference,
+            &self.config.policy(),
+            &recent_share,
+            &mut fallback_rng,
+        )
+        .map(|candidate| format!("{}/{}", candidate.provider_id(), parsed.canonical_model));
         recent_share.record(selected_provider.clone());
         state.shares.insert(route_key, recent_share);
         drop(state);
@@ -171,10 +208,10 @@ impl RoutingPolicy {
 
         Ok(RouteDecision {
             profile,
-            fallback_model: profile.sidecar_alias(&parsed.canonical_model),
+            fallback_model: fallback_model.clone(),
             canonical_model: parsed.canonical_model,
             selected_provider,
-            has_alternatives: candidates.len() > 1,
+            has_alternatives: fallback_model.is_some(),
         })
     }
 
@@ -212,6 +249,31 @@ fn reject_provider_overrides(request: &Value) -> Result<(), RouteRequestError> {
     Ok(())
 }
 
+fn parse_top_p(request: &Value) -> Result<Option<rust_decimal::Decimal>, RouteRequestError> {
+    let Some(top_p) = request.get("top_p") else {
+        return Ok(None);
+    };
+    if top_p.is_null() {
+        return Ok(None);
+    }
+    let number = top_p.as_number().ok_or(RouteRequestError::InvalidTopP)?;
+    number
+        .to_string()
+        .parse()
+        .map(Some)
+        .map_err(|_| RouteRequestError::InvalidTopP)
+}
+
+fn parse_stream(request: &Value) -> Result<bool, RouteRequestError> {
+    let Some(stream) = request.get("stream") else {
+        return Ok(false);
+    };
+    if stream.is_null() {
+        return Ok(false);
+    }
+    stream.as_bool().ok_or(RouteRequestError::InvalidStream)
+}
+
 #[derive(Debug, Error)]
 pub enum RoutingPolicyError {
     #[error(transparent)]
@@ -228,6 +290,10 @@ pub enum RouteRequestError {
     NoEligibleRoute,
     #[error("provider.only, provider.ignore, and provider.order are not supported")]
     UnsupportedProviderOverride,
+    #[error("top_p must be a JSON number or null")]
+    InvalidTopP,
+    #[error("stream must be a JSON boolean or null")]
+    InvalidStream,
 }
 
 impl IntoResponse for RouteRequestError {
@@ -238,7 +304,9 @@ impl IntoResponse for RouteRequestError {
         let status = match self {
             Self::UnknownModel => StatusCode::NOT_FOUND,
             Self::NoEligibleRoute => StatusCode::SERVICE_UNAVAILABLE,
-            Self::UnsupportedProviderOverride => StatusCode::BAD_REQUEST,
+            Self::UnsupportedProviderOverride | Self::InvalidTopP | Self::InvalidStream => {
+                StatusCode::BAD_REQUEST
+            }
             Self::InvalidPreference(_) => unreachable!("handled above"),
         };
 
@@ -266,7 +334,7 @@ mod tests {
 
     use super::*;
     use crate::policy::measurements::{MeasurementStore, Observation};
-    use crate::registry::{ModelMapping, Provider};
+    use crate::registry::{ModelMapping, Provider, RequestConstraints, TopPBounds};
 
     #[test]
     fn request_routing_uses_live_measurements_and_consumes_sort() {
@@ -299,7 +367,7 @@ mod tests {
                 profile: RoutingProfile::Production,
                 canonical_model: "vendor/model".to_owned(),
                 selected_provider: "fast".to_owned(),
-                fallback_model: "seren-profile-production/vendor/model".to_owned(),
+                fallback_model: Some("cheap/vendor/model".to_owned()),
                 has_alternatives: true,
             }
         );
@@ -378,23 +446,223 @@ mod tests {
         assert_eq!(beta["model"], "beta-only/vendor/model");
     }
 
+    #[test]
+    fn endpoint_top_p_and_stream_constraints_filter_primary_and_fallback_routes() {
+        let mut constrained = provider("constrained", 0, "0.1");
+        constrained.models[0].request_constraints = RequestConstraints {
+            endpoints: BTreeSet::from([CompletionEndpoint::Chat]),
+            supports_streaming: false,
+            top_p: Some(TopPBounds {
+                min: "0.95".parse().unwrap(),
+                max: Decimal::ONE,
+            }),
+        };
+        let routing = routing_for_providers(vec![
+            constrained,
+            provider("compatible-a", 1, "1.0"),
+            provider("compatible-b", 2, "2.0"),
+        ]);
+
+        for top_p in [None, Some(Value::Null), Some(json!(0.95)), Some(json!(1))] {
+            let mut request = json!({
+                "model": "vendor/model",
+                "provider": {"sort": "price"},
+                "stream": false
+            });
+            if let Some(top_p) = top_p {
+                request["top_p"] = top_p;
+            }
+
+            let decision = routing
+                .route_for_endpoint(
+                    RoutingProfile::Production,
+                    CompletionEndpoint::Chat,
+                    &mut request,
+                )
+                .unwrap();
+
+            assert_eq!(decision.selected_provider, "constrained");
+            assert_eq!(
+                decision.fallback_model.as_deref(),
+                Some("compatible-a/vendor/model")
+            );
+            assert!(decision.has_alternatives);
+        }
+
+        for (endpoint, top_p) in [
+            (CompletionEndpoint::Chat, json!(0.949)),
+            (CompletionEndpoint::Legacy, json!(0.95)),
+        ] {
+            let mut request = json!({
+                "model": "vendor/model",
+                "provider": {"sort": "price"},
+                "top_p": top_p,
+            });
+
+            let decision = routing
+                .route_for_endpoint(RoutingProfile::Production, endpoint, &mut request)
+                .unwrap();
+
+            assert_eq!(decision.selected_provider, "compatible-a");
+            assert_eq!(
+                decision.fallback_model.as_deref(),
+                Some("compatible-b/vendor/model")
+            );
+            assert!(decision.has_alternatives);
+        }
+
+        let mut streaming = json!({
+            "model": "vendor/model",
+            "provider": {"sort": "price"},
+            "stream": true,
+            "top_p": 0.95,
+        });
+        let decision = routing
+            .route_for_endpoint(
+                RoutingProfile::Production,
+                CompletionEndpoint::Chat,
+                &mut streaming,
+            )
+            .unwrap();
+        assert_eq!(decision.selected_provider, "compatible-a");
+        assert_eq!(
+            decision.fallback_model.as_deref(),
+            Some("compatible-b/vendor/model")
+        );
+        assert!(decision.has_alternatives);
+    }
+
+    #[tokio::test]
+    async fn nonnumeric_nonnull_top_p_fails_locally() {
+        let routing = test_routing(MeasurementStore::default());
+
+        for invalid in [json!("0.95"), json!(true), json!({}), json!([])] {
+            let mut request = json!({
+                "model": "vendor/model:nitro",
+                "top_p": invalid,
+            });
+
+            let error = routing
+                .route(RoutingProfile::Production, &mut request)
+                .unwrap_err();
+            assert_eq!(error, RouteRequestError::InvalidTopP);
+            assert_eq!(request["model"], "vendor/model:nitro");
+
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap()
+                )
+                .unwrap(),
+                json!({
+                    "error": {
+                        "code": 400,
+                        "message": "top_p must be a JSON number or null"
+                    }
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nonboolean_nonnull_stream_fails_locally() {
+        let routing = test_routing(MeasurementStore::default());
+
+        for invalid in [json!("true"), json!(1), json!({}), json!([])] {
+            let mut request = json!({
+                "model": "vendor/model:nitro",
+                "stream": invalid,
+            });
+
+            let error = routing
+                .route(RoutingProfile::Production, &mut request)
+                .unwrap_err();
+            assert_eq!(error, RouteRequestError::InvalidStream);
+            assert_eq!(request["model"], "vendor/model:nitro");
+
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap()
+                )
+                .unwrap(),
+                json!({
+                    "error": {
+                        "code": 400,
+                        "message": "stream must be a JSON boolean or null"
+                    }
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_only_route_reports_no_eligible_provider() {
+        let mut constrained = provider("constrained", 0, "0.1");
+        constrained.models[0].request_constraints = RequestConstraints {
+            endpoints: BTreeSet::from([CompletionEndpoint::Chat]),
+            supports_streaming: true,
+            top_p: Some(TopPBounds {
+                min: "0.95".parse().unwrap(),
+                max: Decimal::ONE,
+            }),
+        };
+        let routing = routing_for_providers(vec![constrained]);
+        let mut request = json!({"model": "vendor/model", "top_p": 0.94});
+
+        assert_eq!(
+            routing
+                .route(RoutingProfile::Production, &mut request)
+                .unwrap_err(),
+            RouteRequestError::NoEligibleRoute
+        );
+    }
+
+    #[test]
+    fn fallback_obeys_the_same_default_price_policy() {
+        let routing = routing_for_providers(vec![
+            provider("preferred", 0, "1.0"),
+            provider("over-ceiling", 1, "20.0"),
+            provider("eligible", 2, "2.0"),
+        ]);
+        let mut request = json!({"model": "vendor/model"});
+
+        let decision = routing
+            .route(RoutingProfile::Production, &mut request)
+            .unwrap();
+
+        assert_eq!(decision.selected_provider, "preferred");
+        assert_eq!(
+            decision.fallback_model.as_deref(),
+            Some("eligible/vendor/model")
+        );
+        assert!(decision.has_alternatives);
+    }
+
     fn test_routing(measurements: MeasurementStore) -> RoutingPolicy {
         let mut disabled = provider("disabled", 0, "0.1");
         disabled.enabled = false;
+        let mut routing = routing_for_providers(vec![
+            disabled,
+            provider("cheap", 1, "1.0"),
+            provider("fast", 2, "2.0"),
+        ]);
+        routing.measurements = measurements;
+        routing
+    }
+
+    fn routing_for_providers(providers: Vec<Provider>) -> RoutingPolicy {
         let registry = Registry {
             sell_prices: vec![],
-            providers: vec![
-                disabled,
-                provider("cheap", 1, "1.0"),
-                provider("fast", 2, "2.0"),
-            ],
+            providers,
         };
         let config = RoutingConfig::new("10".parse().unwrap(), 0.1, Decimal::ONE, 100).unwrap();
-
         RoutingPolicy::from_registry_with_rng(
             &registry,
             config,
-            measurements,
+            MeasurementStore::default(),
             StdRng::seed_from_u64(7),
         )
         .unwrap()
@@ -413,6 +681,8 @@ mod tests {
         Provider {
             id: id.to_owned(),
             display_name: id.to_owned(),
+            public_display_name: None,
+            public_tag: None,
             base_url: "http://127.0.0.1:1234/v1".to_owned(),
             secret_env: format!("KEY_{}", id.to_uppercase()),
             enabled: true,
@@ -424,7 +694,9 @@ mod tests {
                 context_length: 1,
                 provider_model_id: "upstream".to_owned(),
                 input_price_per_mtok: price.parse().unwrap(),
+                cached_input_price_per_mtok: None,
                 output_price_per_mtok: Decimal::ZERO,
+                request_constraints: RequestConstraints::default(),
             }],
         }
     }

@@ -83,6 +83,7 @@ fn production_registry_validates_with_pinned_sidecar() {
         .arg("-f")
         .arg(config.path())
         .arg("--validate-only")
+        .env("SEREN_ROUTER_KEY_MODAL", "fixture-only-modal-key")
         .env("SEREN_ROUTER_KEY_OPENROUTER", "fixture-only-openrouter-key")
         .output()
         .unwrap_or_else(|error| panic!("failed to execute {}: {error}", binary.display()));

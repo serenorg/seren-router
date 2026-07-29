@@ -6,24 +6,50 @@ use serde_json::Value;
 use crate::pricing::BillingPrices;
 #[cfg(test)]
 use crate::pricing::ModelPrices;
-use crate::usage_cost::{CostedUsage, inject_usage_cost_value};
+use crate::usage_cost::{CostedUsage, inject_usage_cost_value, sanitize_public_completion_value};
 
 pub(crate) struct UsageCostTransformer {
     pending: Vec<u8>,
-    prices: BillingPrices,
+    prices: Option<BillingPrices>,
+    response_model: Option<String>,
     costed_usage: Option<CostedUsage>,
+    closed: bool,
 }
 
 impl UsageCostTransformer {
     pub(crate) fn new(prices: BillingPrices) -> Self {
         Self {
             pending: Vec::new(),
-            prices,
+            prices: Some(prices),
+            response_model: None,
             costed_usage: None,
+            closed: false,
         }
     }
 
+    pub(crate) fn model_only(response_model: &str) -> Self {
+        Self {
+            pending: Vec::new(),
+            prices: None,
+            response_model: Some(response_model.to_owned()),
+            costed_usage: None,
+            closed: false,
+        }
+    }
+
+    pub(crate) fn with_response_model(mut self, response_model: &str) -> Self {
+        self.response_model = Some(response_model.to_owned());
+        self
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     pub(crate) fn transform(mut self, bytes: &[u8]) -> (Self, Vec<u8>, Option<CostedUsage>) {
+        if self.closed {
+            return (self, Vec::new(), None);
+        }
         self.pending.extend_from_slice(bytes);
         let mut output = Vec::with_capacity(self.pending.len());
         let mut completed = None;
@@ -35,17 +61,34 @@ impl UsageCostTransformer {
             if event_completion.is_some() {
                 completed = event_completion;
             }
+            if self.closed {
+                self.pending.clear();
+                break;
+            }
         }
 
         (self, output, completed)
     }
 
     pub(crate) fn finish(mut self) -> (Vec<u8>, Option<CostedUsage>) {
+        if self.closed {
+            return (Vec::new(), None);
+        }
         let final_line = self
             .pending
             .strip_suffix(b"\r\n")
             .or_else(|| self.pending.strip_suffix(b"\n"))
             .unwrap_or(&self.pending);
+        if let Some(response_model) = self.response_model.as_deref() {
+            if single_data_line(final_line).is_some_and(|(_, data)| data == b"[DONE]") {
+                if self.prices.is_some() && self.costed_usage.is_none() {
+                    return (generic_upstream_error_event(response_model), None);
+                }
+                return (self.pending, self.costed_usage.take());
+            }
+            self.costed_usage = None;
+            return (generic_upstream_error_event(response_model), None);
+        }
         let completed = single_data_line(final_line)
             .filter(|(_, data)| *data == b"[DONE]")
             .and_then(|_| self.costed_usage.take());
@@ -54,6 +97,56 @@ impl UsageCostTransformer {
     }
 
     fn transform_event(&mut self, event: &[u8]) -> (Vec<u8>, Option<CostedUsage>) {
+        if let Some(response_model) = self.response_model.clone() {
+            return self.transform_public_event(event, &response_model);
+        }
+
+        self.transform_internal_event(event)
+    }
+
+    fn transform_public_event(
+        &mut self,
+        event: &[u8],
+        response_model: &str,
+    ) -> (Vec<u8>, Option<CostedUsage>) {
+        let (body, separator) = split_separator(event);
+        let Some((data_prefix, data)) = single_data_line(body) else {
+            return self.close_with_generic_error(response_model);
+        };
+        if data == b"[DONE]" {
+            if self.prices.is_some() && self.costed_usage.is_none() {
+                return self.close_with_generic_error(response_model);
+            }
+            self.closed = true;
+            return (event.to_vec(), self.costed_usage.take());
+        }
+
+        let Ok(mut value) = serde_json::from_slice::<Value>(data) else {
+            return self.close_with_generic_error(response_model);
+        };
+        if sanitize_public_completion_value(&mut value, response_model).is_err() {
+            return self.close_with_generic_error(response_model);
+        }
+        let costed_usage = self.prices.as_ref().and_then(|prices| {
+            is_terminal_usage_event(&value)
+                .then(|| inject_usage_cost_value(&mut value, prices).ok())
+                .flatten()
+        });
+
+        let Ok(json) = serde_json::to_vec(&value) else {
+            return self.close_with_generic_error(response_model);
+        };
+        if let Some(costed_usage) = costed_usage {
+            self.costed_usage = Some(costed_usage);
+        }
+        let mut transformed = Vec::with_capacity(data_prefix.len() + json.len() + separator.len());
+        transformed.extend_from_slice(data_prefix);
+        transformed.extend_from_slice(&json);
+        transformed.extend_from_slice(separator);
+        (transformed, None)
+    }
+
+    fn transform_internal_event(&mut self, event: &[u8]) -> (Vec<u8>, Option<CostedUsage>) {
         let (body, separator) = split_separator(event);
         let Some((data_prefix, data)) = single_data_line(body) else {
             return (event.to_vec(), None);
@@ -65,24 +158,53 @@ impl UsageCostTransformer {
         let Ok(mut value) = serde_json::from_slice::<Value>(data) else {
             return (event.to_vec(), None);
         };
-        if !is_terminal_usage_event(&value) {
+        let costed_usage = self.prices.as_ref().and_then(|prices| {
+            is_terminal_usage_event(&value)
+                .then(|| inject_usage_cost_value(&mut value, prices).ok())
+                .flatten()
+        });
+        let Some(costed_usage) = costed_usage else {
             return (event.to_vec(), None);
-        }
-        let Ok(costed_usage) = inject_usage_cost_value(&mut value, &self.prices) else {
+        };
+
+        let Ok(json) = serde_json::to_vec(&value) else {
             return (event.to_vec(), None);
         };
         self.costed_usage = Some(costed_usage);
-
-        let Ok(json) = serde_json::to_vec(&value) else {
-            self.costed_usage = None;
-            return (event.to_vec(), None);
-        };
         let mut transformed = Vec::with_capacity(data_prefix.len() + json.len() + separator.len());
         transformed.extend_from_slice(data_prefix);
         transformed.extend_from_slice(&json);
         transformed.extend_from_slice(separator);
         (transformed, None)
     }
+
+    fn close_with_generic_error(&mut self, response_model: &str) -> (Vec<u8>, Option<CostedUsage>) {
+        self.closed = true;
+        self.costed_usage = None;
+        (generic_upstream_error_event(response_model), None)
+    }
+}
+
+fn generic_upstream_error(canonical_model: &str) -> Value {
+    serde_json::json!({
+        "error": {
+            "code": "upstream_error",
+            "message": "upstream request failed",
+            "metadata": {
+                "model": canonical_model
+            }
+        }
+    })
+}
+
+fn generic_upstream_error_event(canonical_model: &str) -> Vec<u8> {
+    let error = serde_json::to_vec(&generic_upstream_error(canonical_model))
+        .expect("static error serializes");
+    let mut event = Vec::with_capacity(error.len() + 31);
+    event.extend_from_slice(b"data: ");
+    event.extend_from_slice(&error);
+    event.extend_from_slice(b"\n\ndata: [DONE]\n\n");
+    event
 }
 
 fn is_terminal_usage_event(value: &Value) -> bool {
@@ -185,9 +307,219 @@ mod tests {
         );
     }
 
-    fn assert_every_boundary(input: &[u8], expected: &[u8], expected_usage: Option<CostedUsage>) {
+    #[test]
+    fn cached_prompt_usage_requires_exact_terminal_details() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl-cached\",\"choices\":[],\"usage\":",
+            "{\"prompt_tokens\":100,\"completion_tokens\":10,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[],\"id\":\"chatcmpl-cached\",\"usage\":",
+            "{\"completion_tokens\":10,\"cost\":0.0006000000,\"prompt_tokens\":100,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_every_boundary_with_prices(
+            input.as_bytes(),
+            expected.as_bytes(),
+            Some(CostedUsage {
+                response_id: Some("chatcmpl-cached".to_owned()),
+                usage: crate::pricing::Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 10,
+                },
+                provider_cost_usd: Some("0.0003420000".parse().unwrap()),
+                sell_price_usd: "0.0006000000".parse().unwrap(),
+            }),
+            cached_test_prices(),
+        );
+
+        let missing_details = concat!(
+            "data: {\"id\":\"chatcmpl-cached\",\"choices\":[],\"usage\":",
+            "{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected_missing_details = concat!(
+            "data: {\"choices\":[],\"id\":\"chatcmpl-cached\",\"usage\":",
+            "{\"completion_tokens\":10,\"cost\":0.0006000000,\"prompt_tokens\":100}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_every_boundary_with_prices(
+            missing_details.as_bytes(),
+            expected_missing_details.as_bytes(),
+            Some(CostedUsage {
+                response_id: Some("chatcmpl-cached".to_owned()),
+                usage: crate::pricing::Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 10,
+                },
+                provider_cost_usd: None,
+                sell_price_usd: "0.0006000000".parse().unwrap(),
+            }),
+            cached_test_prices(),
+        );
+    }
+
+    #[test]
+    fn public_stream_keeps_standard_fields_and_strips_private_metadata() {
+        let input = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}],",
+            "\"id\":\"chatcmpl-private\",\"object\":\"chat.completion.chunk\",",
+            "\"provider\":\"private-vendor\",\"account\":\"private-account\"}\n\n",
+            "data: {\"choices\":[],\"id\":\"chatcmpl-private\",",
+            "\"model\":\"private-endpoint\",\"object\":\"chat.completion.chunk\",",
+            "\"metadata\":{\"provider\":\"private-vendor\"},\"usage\":",
+            "{\"completion_tokens\":3,\"prompt_tokens\":16}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}],",
+            "\"id\":\"chatcmpl-private\",\"model\":\"canonical/model\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[],\"id\":\"chatcmpl-private\",",
+            "\"model\":\"canonical/model\",\"object\":\"chat.completion.chunk\",",
+            "\"usage\":{\"completion_tokens\":3,",
+            "\"cost\":0.0000088000,\"prompt_tokens\":16}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_options(
+            input.as_bytes(),
+            expected.as_bytes(),
+            Some(CostedUsage {
+                response_id: Some("chatcmpl-private".to_owned()),
+                ..test_usage()
+            }),
+            test_prices(),
+            Some("canonical/model"),
+        );
+        let output = String::from_utf8(expected.as_bytes().to_vec()).unwrap();
+        for private_identifier in ["private-vendor", "private-account", "private-endpoint"] {
+            assert!(!output.contains(private_identifier));
+        }
+    }
+
+    #[test]
+    fn public_stream_replaces_provider_error_events_without_pricing() {
+        let input = concat!(
+            "data: {\"error\":{\"message\":\"Modal account acme failed\",",
+            "\"metadata\":{\"provider\":\"modal\"},\"type\":\"provider_error\"},",
+            "\"id\":\"req-modal-acme\",\"model\":\"account.modal.direct\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"error\":{\"code\":\"upstream_error\",",
+            "\"message\":\"upstream request failed\",",
+            "\"metadata\":{\"model\":\"canonical/model\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
         for split in 0..=input.len() {
-            let transformer = UsageCostTransformer::new(test_prices());
+            let transformer = UsageCostTransformer::model_only("canonical/model");
+            let (transformer, first, first_usage) =
+                transformer.transform(&input.as_bytes()[..split]);
+            let (transformer, second, second_usage) =
+                transformer.transform(&input.as_bytes()[split..]);
+            let (remainder, final_usage) = transformer.finish();
+            let output = [first, second, remainder].concat();
+
+            assert_eq!(output, expected.as_bytes(), "split at byte {split}");
+            assert_eq!(first_usage.or(second_usage).or(final_usage), None);
+            let output = String::from_utf8(output).unwrap();
+            for private_identifier in ["Modal", "modal", "acme", "req-modal-acme"] {
+                assert!(
+                    !output.contains(private_identifier),
+                    "private identifier {private_identifier:?} leaked at byte {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_priced_stream_fails_closed_when_done_has_no_usage() {
+        let input = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}],",
+            "\"id\":\"chatcmpl-private\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}],",
+            "\"id\":\"chatcmpl-private\",\"model\":\"canonical/model\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"error\":{\"code\":\"upstream_error\",",
+            "\"message\":\"upstream request failed\",",
+            "\"metadata\":{\"model\":\"canonical/model\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_options(
+            input.as_bytes(),
+            expected.as_bytes(),
+            None,
+            test_prices(),
+            Some("canonical/model"),
+        );
+    }
+
+    #[test]
+    fn public_stream_fails_closed_for_malformed_multiline_and_unrecognized_events() {
+        let expected = concat!(
+            "data: {\"error\":{\"code\":\"upstream_error\",",
+            "\"message\":\"upstream request failed\",",
+            "\"metadata\":{\"model\":\"canonical/model\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        for input in [
+            "data: not-json\n\ndata: {\"provider\":\"private-after-error\"}\n\n",
+            concat!(
+                "event: chunk\n",
+                "data: {\"id\":\"chatcmpl-private\",\"object\":\"chat.completion.chunk\",",
+                "\"choices\":[],\"provider\":\"private-multiline\"}\n\n"
+            ),
+            concat!(
+                "data: {\"id\":\"chatcmpl-private\",\"object\":\"chat.completion.chunk\",",
+                "\"provider\":\"private-unrecognized\"}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            concat!(
+                "data: {\"id\":\"chatcmpl-private\",\"object\":\"chat.completion.chunk\",",
+                "\"choices\":[],\"provider\":\"private-incomplete\"}"
+            ),
+        ] {
+            assert_every_boundary_with_options(
+                input.as_bytes(),
+                expected.as_bytes(),
+                None,
+                test_prices(),
+                Some("canonical/model"),
+            );
+        }
+    }
+
+    fn assert_every_boundary(input: &[u8], expected: &[u8], expected_usage: Option<CostedUsage>) {
+        assert_every_boundary_with_prices(input, expected, expected_usage, test_prices());
+    }
+
+    fn assert_every_boundary_with_prices(
+        input: &[u8],
+        expected: &[u8],
+        expected_usage: Option<CostedUsage>,
+        prices: BillingPrices,
+    ) {
+        assert_every_boundary_with_options(input, expected, expected_usage, prices, None);
+    }
+
+    fn assert_every_boundary_with_options(
+        input: &[u8],
+        expected: &[u8],
+        expected_usage: Option<CostedUsage>,
+        prices: BillingPrices,
+        response_model: Option<&str>,
+    ) {
+        for split in 0..=input.len() {
+            let transformer = transformer(prices.clone(), response_model);
             let (transformer, first, first_usage) = transformer.transform(&input[..split]);
             let (transformer, second, second_usage) = transformer.transform(&input[split..]);
             let mut output = first;
@@ -202,7 +534,7 @@ mod tests {
             );
         }
 
-        let mut transformer = UsageCostTransformer::new(test_prices());
+        let mut transformer = transformer(prices, response_model);
         let mut output = Vec::new();
         let mut completed = None;
         for byte in input {
@@ -223,15 +555,39 @@ mod tests {
         );
     }
 
+    fn transformer(prices: BillingPrices, response_model: Option<&str>) -> UsageCostTransformer {
+        match response_model {
+            Some(response_model) => {
+                UsageCostTransformer::new(prices).with_response_model(response_model)
+            }
+            None => UsageCostTransformer::new(prices),
+        }
+    }
+
     fn test_prices() -> BillingPrices {
         BillingPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: Decimal::new(10, 2),
                 output_price_per_mtok: Decimal::new(20, 2),
             },
+            provider_cached_input_price_per_mtok: None,
             sell_price: ModelPrices {
                 input_price_per_mtok: Decimal::new(40, 2),
                 output_price_per_mtok: Decimal::new(80, 2),
+            },
+        }
+    }
+
+    fn cached_test_prices() -> BillingPrices {
+        BillingPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: "3.00".parse().unwrap(),
+                output_price_per_mtok: "15.00".parse().unwrap(),
+            },
+            provider_cached_input_price_per_mtok: Some("0.30".parse().unwrap()),
+            sell_price: ModelPrices {
+                input_price_per_mtok: "4.00".parse().unwrap(),
+                output_price_per_mtok: "20.00".parse().unwrap(),
             },
         }
     }
@@ -243,7 +599,7 @@ mod tests {
                 prompt_tokens: 16,
                 completion_tokens: 3,
             },
-            provider_cost_usd: "0.0000022000".parse().unwrap(),
+            provider_cost_usd: Some("0.0000022000".parse().unwrap()),
             sell_price_usd: "0.0000088000".parse().unwrap(),
         }
     }

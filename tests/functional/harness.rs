@@ -21,7 +21,7 @@ use seren_router::ledger::Ledger;
 use seren_router::policy::measurements::{MeasurementStore, Observation};
 use seren_router::pricing::{PriceTable, Usage, cost_usd};
 use seren_router::proxy::ProxyState;
-use seren_router::registry::{ModelMapping, Provider, Registry, SellPrice};
+use seren_router::registry::{ModelMapping, Provider, Registry, RequestConstraints, SellPrice};
 use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 use seren_router::{routes, server};
@@ -235,7 +235,8 @@ impl FunctionalHarness {
             }
         };
         let measurements = MeasurementStore::default();
-        let ledger = Ledger::with_health(pool, database_health.clone());
+        let ledger = Ledger::with_health(pool, database_health.clone())
+            .with_public_provider_aliases(&registry);
         let app = router_app(&sidecar_url, &registry, ledger, measurements.clone()).merge(
             server::health_router(
                 database_health.clone(),
@@ -668,17 +669,22 @@ fn functional_registry(upstream_url: &str, model: &str, dead_port: u16) -> Regis
                 "0.20",
                 [RoutingProfile::Beta],
             ),
-            functional_provider_for(
-                "beta-local",
-                upstream_url.to_owned(),
-                "SEREN_TEST_KEY_BETA_LOCAL",
-                1,
-                model,
-                BETA_VIRTUAL_MODEL,
-                "0.40",
-                "0.80",
-                [RoutingProfile::Beta],
-            ),
+            {
+                let mut provider = functional_provider_for(
+                    "beta-local",
+                    upstream_url.to_owned(),
+                    "SEREN_TEST_KEY_BETA_LOCAL",
+                    1,
+                    model,
+                    BETA_VIRTUAL_MODEL,
+                    "0.40",
+                    "0.80",
+                    [RoutingProfile::Beta],
+                );
+                provider.public_display_name = Some("Seren Inference".to_owned());
+                provider.public_tag = Some("seren".to_owned());
+                provider
+            },
         ],
     }
 }
@@ -720,6 +726,8 @@ fn functional_provider_for(
     Provider {
         id: id.to_owned(),
         display_name: format!("Functional {id}"),
+        public_display_name: None,
+        public_tag: None,
         base_url,
         secret_env: secret_env.to_owned(),
         enabled: true,
@@ -731,7 +739,9 @@ fn functional_provider_for(
             context_length: 131_072,
             provider_model_id: model.to_owned(),
             input_price_per_mtok: input_price_per_mtok.parse().unwrap(),
+            cached_input_price_per_mtok: None,
             output_price_per_mtok: output_price_per_mtok.parse().unwrap(),
+            request_constraints: RequestConstraints::default(),
         }],
     }
 }
@@ -986,6 +996,7 @@ async fn functional_credentials_isolate_production_and_beta_providers() {
     assert_eq!(beta.status(), StatusCode::OK);
     let beta_body = beta.json::<Value>().await.unwrap();
     assert_local_usage_cost(&beta_body);
+    assert_eq!(beta_body["model"], BETA_VIRTUAL_MODEL);
     let beta_generation_id = beta_body["id"]
         .as_str()
         .expect("beta completion must include a provider response id");
@@ -995,7 +1006,7 @@ async fn functional_credentials_isolate_production_and_beta_providers() {
         &beta_generation,
         &beta_body,
         BETA_VIRTUAL_MODEL,
-        "beta-local",
+        "Seren Inference",
     );
     assert_eq!(
         harness.generation(beta_generation_id).await.status(),
@@ -1025,9 +1036,26 @@ async fn functional_credentials_isolate_production_and_beta_providers() {
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
         .collect();
-    let beta_usage = beta_stream_events
+    let beta_json_events: Vec<Value> = beta_stream_events
         .iter()
         .filter_map(|event| serde_json::from_str::<Value>(event).ok())
+        .collect();
+    let modeled_events: Vec<&Value> = beta_json_events
+        .iter()
+        .filter(|event| event.get("model").is_some())
+        .collect();
+    assert!(
+        !modeled_events.is_empty(),
+        "beta stream must contain at least one modeled JSON event"
+    );
+    assert!(
+        modeled_events
+            .iter()
+            .all(|event| event["model"] == BETA_VIRTUAL_MODEL),
+        "every modeled beta SSE event must expose only the canonical model"
+    );
+    let beta_usage = beta_json_events
+        .iter()
         .find(|event| {
             event["choices"]
                 .as_array()
@@ -1035,7 +1063,7 @@ async fn functional_credentials_isolate_production_and_beta_providers() {
                 && event["usage"]["cost"].is_number()
         })
         .expect("beta stream must contain a terminal costed usage event");
-    assert_local_usage_cost(&beta_usage);
+    assert_local_usage_cost(beta_usage);
     assert_eq!(beta_stream_events.last(), Some(&"[DONE]"));
 
     let production = harness.chat(VIRTUAL_MODEL, false).await;
@@ -1516,6 +1544,23 @@ async fn functional_invalid_requests_stay_local() {
         json!({
             "error": {
                 "message": "provider.sort must be one of: price, throughput, latency"
+            }
+        })
+    );
+
+    let invalid_top_p = harness
+        .raw_completion(
+            "/api/v1/chat/completions",
+            r#"{"model":"functional-model","top_p":"0.95"}"#,
+        )
+        .await;
+    assert_eq!(invalid_top_p.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_top_p.json::<Value>().await.unwrap(),
+        json!({
+            "error": {
+                "code": 400,
+                "message": "top_p must be a JSON number or null"
             }
         })
     );
