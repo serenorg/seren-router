@@ -13,9 +13,11 @@ gate.
 
 The account-provisioned route is checked in as a disabled `beta` candidate. Its first
 bounded live run proved non-streaming JSON and cache telemetry, but Modal returned no
-terminal usage object for the successful streaming request. The router therefore
-blocked activation. Production and beta both remain OpenRouter-only; no deployment
-secret, customer traffic, or publisher changed.
+terminal usage object for the successful streaming request. The revised two-JSON gate
+then passed with exact cached-token accounting. The candidate remains deliberately
+disabled because deployment activation and customer-serving permission are separate
+decisions. Production and beta both remain OpenRouter-only; no deployment secret,
+customer traffic, or publisher changed.
 
 Modal remains the immutable internal provider ID for routing, health, metrics, ledger
 rows, and invoice reconciliation. Customer-facing endpoint and generation metadata use
@@ -164,13 +166,38 @@ third request was sent.
 
 Because Modal's public Shared API documentation does not promise terminal streaming
 usage, the candidate now declares `supports_streaming: false`. A future enabled beta
-configuration will route `stream: true` to OpenRouter directly. The candidate remains
-disabled until the revised two-JSON gate passes.
+configuration will route `stream: true` to OpenRouter directly.
 
 Tool calling and strict structured output remain manual capability probes until their
 deterministic activation fixtures are approved. Cross-provider failover remains
 covered by the non-paid functional harness; the paid gate isolates Modal so its spend
 and attribution cannot be confused with OpenRouter traffic.
+
+### Revised JSON-only run: passed
+
+After a fresh authenticated billing review and explicit operator approval, the second
+2026-07-29 run retained another `$0.0740880000` worst-case reservation and sent exactly
+two identical non-streaming JSON requests. The gate passed every assertion:
+
+- 2 logical requests and no errors;
+- 3,804 prompt tokens, including 1,920 exactly reported cached tokens;
+- 8 completion tokens;
+- `$0.0063480000` exact gross provider cost;
+- `$0.0115320000` invariant customer sell subtotal;
+- 1,760.282 ms and 2,050.619 ms end-to-end request latency;
+- exact internal provider attribution with neutral public catalog, response, and
+  generation metadata; and
+- production-profile exclusion plus exact beta ledger rows.
+
+The authenticated Modal billing summary increased from `$0.00645254` to `$0.01280054`.
+The `$0.00634800` delta was entirely LLM-token cost; deployed-app cost remained
+`$0.00010454`, credits offset the full total, and billed cost remained `$0`. The two
+retained reservations now total `$0.1481760000` against the approved cumulative `$5`
+ceiling. They remain durable even though observed spend was lower.
+
+This passing gate completes the disabled provider integration contract. It does not
+authorize a deployment secret, enable the checked registry row, establish the larger
+reported promotional grant, or provide written customer-serving permission.
 
 ## Rollout and rollback
 

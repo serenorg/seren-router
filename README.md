@@ -38,10 +38,10 @@ as of 2026-07-25. The service uses the standard Seren Rust chassis and is built 
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
 verified evaluation). The OpenRouter-only image was deployed to the existing production
 environment and passed its bounded canary on 2026-07-26. The repository also carries
-a disabled, credential-isolated Kimi K3 candidate for the beta profile. Its first
-bounded live gate found that Modal streaming omitted terminal usage, so streaming is
-ineligible and activation remains blocked pending the revised JSON-only live gate.
-Production and beta both remain OpenRouter-only.
+a disabled, credential-isolated Kimi K3 candidate for the beta profile. Its revised
+JSON-only live gate passed on 2026-07-29 with exact cached-token accounting; streaming
+remains ineligible because the first bounded run omitted terminal streaming usage.
+The candidate is not deployed, so production and beta both remain OpenRouter-only.
 
 ## Service development
 
