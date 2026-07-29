@@ -48,9 +48,11 @@ Phased so each step is independently shippable and reversible. The guiding princ
   and a credential-bound live gate (`docs/12`, 2026-07-29). It is not deployed.
 - [x] Approve and implement route-independent sell pricing with separately
   reconciled provider cost (`docs/04`, 2026-07-27).
-- [ ] Pass the revised JSON-only Modal live gate, obtain written customer-serving
-  permission, and verify promotional-credit terms before any beta deployment. The
-  first bounded run blocked because Modal's SSE omitted terminal usage.
+- [x] Pass the revised JSON-only Modal live gate with exact cached-token accounting
+  and neutral public attribution (`docs/12`, 2026-07-29).
+- [ ] Obtain written customer-serving permission and reconcile the reported
+  promotional-credit grant before any customer-serving deployment. The checked
+  Modal candidate remains disabled.
 - [ ] Activate DeepInfra after the remaining `docs/11` gates: written provider
   consent, scoped key, live compatibility test, and spend cap.
 - [ ] Confirm lower provider cost, invariant sell-price `usage.cost`, and
