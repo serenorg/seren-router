@@ -41,9 +41,10 @@ environment and passed its bounded canary on 2026-07-26. The repository also car
 a credential-isolated Kimi K3 route for the beta profile. Its revised
 JSON-only live gate passed on 2026-07-29 with exact cached-token accounting; streaming
 remains ineligible because the first bounded run omitted terminal streaming usage.
-Taariq confirmed Modal permission and approved beta activation on 2026-07-30. The
-checked route is enabled only for credential-bound beta traffic; production remains
-OpenRouter-only.
+Taariq confirmed Modal permission and approved beta activation and a bounded production
+canary on 2026-07-30. The checked route is enabled for production and credential-bound
+beta traffic. Compatible non-streaming Kimi K3 requests select Modal first, while
+OpenRouter remains the lowest-priority fallback in both profiles.
 
 ## Service development
 

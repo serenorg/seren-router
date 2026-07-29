@@ -15,7 +15,7 @@ use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 
 #[test]
-fn checked_registry_activates_modal_only_for_beta() {
+fn checked_registry_activates_modal_for_production_and_beta() {
     let registry = checked_registry();
     registry.validate().unwrap();
 
@@ -31,8 +31,12 @@ fn checked_registry_activates_modal_only_for_beta() {
         .copied()
         .filter(|provider| provider.supports(RoutingProfile::Production))
         .collect();
-    assert_eq!(production_enabled.len(), 1);
-    let openrouter = production_enabled[0];
+    assert_eq!(production_enabled.len(), 2);
+    let openrouter = production_enabled
+        .iter()
+        .copied()
+        .find(|provider| provider.id == "openrouter")
+        .expect("OpenRouter must remain the production fallback");
     assert_eq!(openrouter.id, "openrouter");
     assert_eq!(openrouter.base_url, "https://openrouter.ai/api/v1");
     assert_eq!(openrouter.secret_env, "SEREN_ROUTER_KEY_OPENROUTER");
@@ -48,11 +52,8 @@ fn checked_registry_activates_modal_only_for_beta() {
         .providers
         .iter()
         .find(|provider| provider.id == "modal")
-        .expect("the checked registry must carry the reviewed Modal beta candidate");
-    assert!(
-        modal.enabled,
-        "the approved Modal beta route must be enabled"
-    );
+        .expect("the checked registry must carry the reviewed Modal route");
+    assert!(modal.enabled, "the approved Modal route must be enabled");
     assert_eq!(modal.display_name, "Modal");
     assert_eq!(
         modal.public_display_name.as_deref(),
@@ -62,8 +63,13 @@ fn checked_registry_activates_modal_only_for_beta() {
     assert_eq!(modal.base_url, "https://inference.us-west.modal.direct/v1");
     assert_eq!(modal.secret_env, "SEREN_ROUTER_KEY_MODAL");
     assert_eq!(modal.priority, 0);
-    assert_eq!(modal.profiles, [RoutingProfile::Beta].into_iter().collect());
-    assert!(!modal.supports(RoutingProfile::Production));
+    assert_eq!(
+        modal.profiles,
+        [RoutingProfile::Production, RoutingProfile::Beta]
+            .into_iter()
+            .collect()
+    );
+    assert!(modal.supports(RoutingProfile::Production));
     assert_eq!(modal.models.len(), 1);
 
     let modal_kimi = &modal.models[0];
@@ -268,7 +274,7 @@ fn kimi_cached_provider_cost_is_exact_and_provider_independent() {
 }
 
 #[test]
-fn routing_policy_keeps_modal_beta_only_and_rejects_provider_selection() {
+fn routing_policy_selects_modal_in_both_profiles_and_rejects_provider_selection() {
     let registry = modal_beta_registry();
     let routing = RoutingPolicy::from_registry(
         &registry,
@@ -287,8 +293,12 @@ fn routing_policy_keeps_modal_beta_only_and_rejects_provider_selection() {
         .unwrap();
     let beta_decision = routing.route(RoutingProfile::Beta, &mut beta).unwrap();
 
-    assert_eq!(production_decision.selected_provider, "openrouter");
-    assert_eq!(production["model"], "openrouter/moonshotai/kimi-k3");
+    assert_eq!(production_decision.selected_provider, "modal");
+    assert_eq!(production["model"], "modal/moonshotai/kimi-k3");
+    assert_eq!(
+        production_decision.fallback_model.as_deref(),
+        Some("openrouter/moonshotai/kimi-k3")
+    );
     assert_eq!(beta_decision.selected_provider, "modal");
     assert_eq!(beta["model"], "modal/moonshotai/kimi-k3");
     assert_eq!(
@@ -360,7 +370,7 @@ fn routing_policy_keeps_modal_beta_only_and_rejects_provider_selection() {
 }
 
 #[test]
-fn compiled_sidecar_keeps_modal_internal_and_beta_scoped() {
+fn compiled_sidecar_keeps_modal_internal_with_openrouter_fallback() {
     let registry = modal_beta_registry();
     let modal_model = &registry
         .providers
@@ -404,6 +414,8 @@ fn compiled_sidecar_keeps_modal_internal_and_beta_scoped() {
         production["routing"]["failover"]["targets"],
         serde_yaml::from_str::<Value>(
             r#"
+- model: modal/moonshotai/kimi-k3
+  priority: 0
 - model: openrouter/moonshotai/kimi-k3
   priority: 255
 "#
