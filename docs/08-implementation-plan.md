@@ -43,8 +43,14 @@ Phased so each step is independently shippable and reversible. The guiding princ
 - [x] Select the first direct provider engineering canary: DeepInfra Llama 3.3
   70B Turbo (`docs/11`, 2026-07-27). The registry entry is disabled and
   beta-only; legal, credential, and spend gates remain.
+- [x] Add the disabled Modal Kimi K3 Shared API candidate with neutral public
+  attribution, exact cached-input accounting, non-streaming-only beta constraints,
+  and a credential-bound live gate (`docs/12`, 2026-07-29). It is not deployed.
 - [x] Approve and implement route-independent sell pricing with separately
   reconciled provider cost (`docs/04`, 2026-07-27).
+- [ ] Pass the revised JSON-only Modal live gate, obtain written customer-serving
+  permission, and verify promotional-credit terms before any beta deployment. The
+  first bounded run blocked because Modal's SSE omitted terminal usage.
 - [ ] Activate DeepInfra after the remaining `docs/11` gates: written provider
   consent, scoped key, live compatibility test, and spend cap.
 - [ ] Confirm lower provider cost, invariant sell-price `usage.cost`, and

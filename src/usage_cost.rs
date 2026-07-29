@@ -7,13 +7,13 @@ use std::str::FromStr;
 use serde_json::{Number, Value};
 
 use crate::attribution::ServedProvider;
-use crate::pricing::{BillingPrices, PriceTable, Usage, cost_usd};
+use crate::pricing::{BillingPrices, PriceTable, Usage, cost_usd, provider_cost_usd};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CostedUsage {
     pub(crate) response_id: Option<String>,
     pub(crate) usage: Usage,
-    pub(crate) provider_cost_usd: rust_decimal::Decimal,
+    pub(crate) provider_cost_usd: Option<rust_decimal::Decimal>,
     pub(crate) sell_price_usd: rust_decimal::Decimal,
 }
 
@@ -28,6 +28,25 @@ pub(crate) enum CostOmission {
     MissingUsage,
     InvalidUsage,
     UnknownPrice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicResponseRejection {
+    InvalidJson,
+    EmbeddedError,
+    UnrecognizedShape,
+}
+
+impl fmt::Display for PublicResponseRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJson => formatter.write_str("response is not valid JSON"),
+            Self::EmbeddedError => formatter.write_str("successful response contains an error"),
+            Self::UnrecognizedShape => {
+                formatter.write_str("response is not an OpenAI completion object")
+            }
+        }
+    }
 }
 
 impl fmt::Display for CostOmission {
@@ -89,7 +108,12 @@ pub(crate) fn inject_usage_cost_value(
             .and_then(Value::as_u64)
             .ok_or(CostOmission::InvalidUsage)?,
     };
-    let provider_cost = cost_usd(&prices.provider_cost, &token_usage);
+    let cached_prompt_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    let provider_cost = provider_cost_usd(prices, &token_usage, cached_prompt_tokens);
     let sell_price = cost_usd(&prices.sell_price, &token_usage);
     let cost_number = Number::from_str(&sell_price.to_string())
         .expect("Decimal always serializes as a JSON number");
@@ -101,6 +125,54 @@ pub(crate) fn inject_usage_cost_value(
         provider_cost_usd: provider_cost,
         sell_price_usd: sell_price,
     })
+}
+
+pub(crate) fn sanitize_public_completion_value(
+    response: &mut Value,
+    canonical_model: &str,
+) -> Result<(), PublicResponseRejection> {
+    let response = response
+        .as_object_mut()
+        .ok_or(PublicResponseRejection::UnrecognizedShape)?;
+    if response
+        .get("error")
+        .is_some_and(|upstream_error| !upstream_error.is_null())
+    {
+        return Err(PublicResponseRejection::EmbeddedError);
+    }
+    let object = response.get("object").and_then(Value::as_str);
+    if response
+        .get("id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || !object.is_some_and(|object| {
+            matches!(
+                object,
+                "chat.completion" | "chat.completion.chunk" | "text_completion"
+            )
+        })
+        || !response.get("choices").is_some_and(Value::is_array)
+    {
+        return Err(PublicResponseRejection::UnrecognizedShape);
+    }
+
+    response.retain(|field, _| {
+        matches!(
+            field.as_str(),
+            "id" | "object"
+                | "created"
+                | "model"
+                | "choices"
+                | "usage"
+                | "service_tier"
+                | "system_fingerprint"
+        )
+    });
+    response.insert(
+        "model".to_owned(),
+        Value::String(canonical_model.to_owned()),
+    );
+    Ok(())
 }
 
 pub(crate) fn canonical_slug<'a>(requested_model: &'a str, served_provider: &str) -> &'a str {

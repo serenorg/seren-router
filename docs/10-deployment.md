@@ -29,7 +29,9 @@ One Kubernetes pod contains two long-running containers and one init container:
    ```
 
    It receives provider-key environment variables from Kubernetes Secrets and listens
-   on localhost ports 4000 (LLM) and 19001 (readiness).
+   on localhost ports 4000 (LLM) and 19001 (readiness). The checked-in production
+   fallback uses `SEREN_ROUTER_KEY_OPENROUTER`; a deployment that enables the beta Kimi
+   route also supplies `SEREN_ROUTER_KEY_MODAL`.
 
 3. **seren-router app** — the production image runs its default command on port 8000,
    receives the Gateway key and database URL from Secrets, and reads the same registry
@@ -40,6 +42,10 @@ mounted into the renderer and app. Provider credentials are mounted only into
 AgentGateway; `SEREN_ROUTER_GATEWAY_KEY` and `DATABASE_URL` are mounted only into the
 app. When beta validation is enabled, the app also receives the distinct
 `SEREN_ROUTER_BETA_GATEWAY_KEY`; it is never mounted into AgentGateway.
+`SEREN_ROUTER_KEY_MODAL` is a dot-joined Modal proxy credential. Environment scope
+requires Modal workspace RBAC; the authenticated Starter workspace currently reports
+the beta token as workspace-wide. The credential is never mounted into the app,
+returned by a catalog route, or written into the rendered YAML.
 
 The exact security context, service account, namespace, resource requests, replica
 count, disruption budget, topology spread, and secret references belong in the
@@ -80,6 +86,11 @@ different from `SEREN_ROUTER_GATEWAY_KEY`.
 Removing it and disabling beta-only registry rows is the beta isolation rollback; it
 does not alter the production OpenRouter route set.
 
+The sidecar additionally requires the environment variables named by every enabled
+provider row. For the checked-in registry that is only
+`SEREN_ROUTER_KEY_OPENROUTER`. `SEREN_ROUTER_KEY_MODAL` becomes required only after an
+approved deployment enables the disabled beta candidate.
+
 The readiness URL accepts only HTTP(S), must have a host, and rejects credentials,
 queries, and fragments.
 
@@ -111,8 +122,10 @@ network namespace between app and sidecar to reproduce pod-localhost behavior:
 ```
 
 It verifies renderer exit status, secret references without resolved values,
-PostgreSQL migrations, inference `/readyz`, dependency-free `/livez`, and production
-`/metrics`. It uses fixture-only credentials and sends no provider request.
+PostgreSQL migrations, inference `/readyz`, dependency-free `/livez`, production
+`/metrics`, and production and beta catalogs containing only active OpenRouter routes.
+Candidate-only tests enable Modal in memory to verify its neutral public alias. The
+deployment smoke uses fixture-only credentials and sends no provider request.
 
 Production metrics also expose
 `seren_router_proxy_segment_duration_seconds{endpoint,profile,provider,segment}` for successful

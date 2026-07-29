@@ -164,3 +164,69 @@ higher; the unnormalized raw p95 difference remains in the report for auditabili
 
 The registry prices were refreshed from the live `seren-models` catalog on 2026-07-25.
 Refresh and review them before rerunning M6 after any OpenRouter price or model change.
+
+## Paid Modal Kimi K3 beta contract
+
+`tests/modal_contract.rs` is a separate, ignored activation gate for the checked-in,
+disabled Kimi K3 beta candidate. It enables only the internal `modal` row in its
+private fixture, starts the real pinned AgentGateway and router, and uses a disposable
+PostgreSQL 17 schema. It never runs in ordinary tests or CI and does not deploy
+anything.
+
+Requirements:
+
+- authenticate against Seren's existing Modal workspace and verify the current
+  promotional balance plus any visible expiry, restrictions, and Shared API
+  eligibility in the account;
+- export a short-lived, dot-joined proxy credential as
+  `SEREN_ROUTER_KEY_MODAL` from an approved secret boundary;
+- record whether Modal workspace RBAC actually enforces environment scope; without
+  RBAC, the credential is workspace-wide and must be treated accordingly;
+- set `DATABASE_URL` to a disposable PostgreSQL 17 database;
+- set `SEREN_MODAL_MAX_SPEND_USD` to a positive decimal no greater than `5`; and
+- set `SEREN_MODAL_BILLING_REVIEW_ID` to a fresh UUID created only after reviewing
+  current Modal billing; the gate durably consumes it so a failed or timed-out run
+  cannot be repeated without another billing review;
+- set `SEREN_MODAL_BILLING_STATE_DIR` to an absolute, durable, operator-private
+  directory outside both the repository and the system temporary directory. Every
+  run records its worst-case reservation there before provider access, and all
+  retained reservations count against the cumulative $5 approval; and
+- fetch the pinned sidecar with `./scripts/fetch-sidecar.sh`.
+
+Run the gate serially:
+
+```bash
+SEREN_MODAL_MAX_SPEND_USD=0.10 \
+SEREN_MODAL_BILLING_REVIEW_ID=<fresh-uuid-after-billing-review> \
+SEREN_MODAL_BILLING_STATE_DIR=<durable-private-state-dir> \
+  cargo test --test modal_contract modal::modal_kimi_beta_contract \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The harness must print `running 1 test`; abort if it reports zero tests.
+The gate preflights each request against a conservative uncached-token estimate,
+reserving an initial call plus both configured AgentGateway retries for each of its two
+logical requests. All six possible provider attempts remain charged against the local
+hard cap even when the request succeeds, because failed or timed-out attempts may not
+return usage. The durable reservation is not released automatically; reconcile it
+against account billing before changing or retiring the state directory. It sends the
+same deterministic prompt through JSON Chat Completions twice and requires the repeat
+to report a positive exact cache-hit count. Streaming is excluded: the first bounded
+account run showed that Modal completed an SSE request but omitted the terminal usage
+object, so the registry makes `stream: true` ineligible for Modal and routes it to a
+compatible beta provider. No automatic third probe is allowed; review account billing
+and use a fresh review UUID before rerunning a failed gate.
+Both responses must preserve the reviewed customer sell subtotal and neutral public
+model/provider naming. A cold response without cache detail must persist provider cost
+as null; a response with exact detail must persist the exact gross provider cost.
+The test also proves the database retains the internal provider ID while
+`/generation` returns only the neutral alias.
+
+Tool calling and strict structured output are documented Modal capabilities but remain
+manual probes until deterministic fixtures and activation criteria are approved.
+Cross-provider failover remains covered by the non-paid functional harness; this paid
+gate intentionally isolates Modal so its spend and attribution cannot be confused with
+OpenRouter traffic. Its report distinguishes resolved provider cost from the reserved
+gross-cost ceiling; account credit consumption is reconciled separately from the
+authenticated Credits and billing views. Delete the short-lived proxy token after the
+gate unless an approved beta deployment secret has been created separately.

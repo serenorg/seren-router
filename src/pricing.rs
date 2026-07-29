@@ -21,6 +21,7 @@ pub struct ModelPrices {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BillingPrices {
     pub provider_cost: ModelPrices,
+    pub provider_cached_input_price_per_mtok: Option<Decimal>,
     pub sell_price: ModelPrices,
 }
 
@@ -73,9 +74,13 @@ impl PriceTable {
 
             for model in &provider.models {
                 for (price_side, price) in [
-                    (PriceSide::Input, model.input_price_per_mtok),
-                    (PriceSide::Output, model.output_price_per_mtok),
-                ] {
+                    (PriceSide::Input, Some(model.input_price_per_mtok)),
+                    (PriceSide::CachedInput, model.cached_input_price_per_mtok),
+                    (PriceSide::Output, Some(model.output_price_per_mtok)),
+                ]
+                .into_iter()
+                .filter_map(|(price_side, price)| price.map(|price| (price_side, price)))
+                {
                     if price < Decimal::ZERO {
                         return Err(PriceTableError::NegativePrice {
                             provider_id: provider.id.clone(),
@@ -93,6 +98,7 @@ impl PriceTable {
                         input_price_per_mtok: model.input_price_per_mtok,
                         output_price_per_mtok: model.output_price_per_mtok,
                     },
+                    provider_cached_input_price_per_mtok: model.cached_input_price_per_mtok,
                     sell_price: ModelPrices {
                         input_price_per_mtok: sell_price.input_price_per_mtok,
                         output_price_per_mtok: sell_price.output_price_per_mtok,
@@ -125,7 +131,30 @@ pub fn cost_usd(prices: &ModelPrices, usage: &Usage) -> Decimal {
     let prompt_cost = Decimal::from(usage.prompt_tokens) * prices.input_price_per_mtok;
     let completion_cost = Decimal::from(usage.completion_tokens) * prices.output_price_per_mtok;
 
-    let mut cost = ((prompt_cost + completion_cost) / Decimal::from(TOKENS_PER_MILLION))
+    rounded_cost(prompt_cost + completion_cost)
+}
+
+pub fn provider_cost_usd(
+    prices: &BillingPrices,
+    usage: &Usage,
+    cached_prompt_tokens: Option<u64>,
+) -> Option<Decimal> {
+    let Some(cached_input_price) = prices.provider_cached_input_price_per_mtok else {
+        return Some(cost_usd(&prices.provider_cost, usage));
+    };
+    let cached_prompt_tokens = cached_prompt_tokens?;
+    let uncached_prompt_tokens = usage.prompt_tokens.checked_sub(cached_prompt_tokens)?;
+    let prompt_cost = Decimal::from(uncached_prompt_tokens)
+        * prices.provider_cost.input_price_per_mtok
+        + Decimal::from(cached_prompt_tokens) * cached_input_price;
+    let completion_cost =
+        Decimal::from(usage.completion_tokens) * prices.provider_cost.output_price_per_mtok;
+
+    Some(rounded_cost(prompt_cost + completion_cost))
+}
+
+fn rounded_cost(cost_per_million: Decimal) -> Decimal {
+    let mut cost = (cost_per_million / Decimal::from(TOKENS_PER_MILLION))
         .round_dp_with_strategy(COST_SCALE, RoundingStrategy::MidpointAwayFromZero);
     cost.rescale(COST_SCALE);
     cost
@@ -184,6 +213,7 @@ providers:
                     input_price_per_mtok: "0.1234500".parse().unwrap(),
                     output_price_per_mtok: "0.80".parse().unwrap(),
                 },
+                provider_cached_input_price_per_mtok: None,
                 sell_price: ModelPrices {
                     input_price_per_mtok: "1.00".parse().unwrap(),
                     output_price_per_mtok: "2.00".parse().unwrap(),
@@ -210,13 +240,16 @@ providers:
     }
 
     #[test]
-    fn negative_input_or_output_price_is_rejected() {
-        for (price_side, input_price, output_price) in [
-            (PriceSide::Input, "-0.01", "0"),
-            (PriceSide::Output, "0", "-0.01"),
+    fn negative_provider_prices_are_rejected() {
+        for (price_side, input_price, cached_input_price, output_price) in [
+            (PriceSide::Input, "-0.01", None, "0"),
+            (PriceSide::CachedInput, "0", Some("-0.01"), "0"),
+            (PriceSide::Output, "0", None, "-0.01"),
         ] {
             let mut registry: Registry = serde_yaml::from_str(PRICE_REGISTRY).unwrap();
             registry.providers[0].models[0].input_price_per_mtok = input_price.parse().unwrap();
+            registry.providers[0].models[0].cached_input_price_per_mtok =
+                cached_input_price.map(|price| price.parse().unwrap());
             registry.providers[0].models[0].output_price_per_mtok = output_price.parse().unwrap();
 
             assert_eq!(
@@ -307,5 +340,38 @@ providers:
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn cached_prompt_provider_cost_is_exact_and_requires_valid_usage() {
+        let prices = BillingPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: "3.00".parse().unwrap(),
+                output_price_per_mtok: "15.00".parse().unwrap(),
+            },
+            provider_cached_input_price_per_mtok: Some("0.30".parse().unwrap()),
+            sell_price: ModelPrices {
+                input_price_per_mtok: "4.00".parse().unwrap(),
+                output_price_per_mtok: "20.00".parse().unwrap(),
+            },
+        };
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+        };
+
+        // (60 × $3.00 + 40 × $0.30 + 10 × $15.00) / 1,000,000.
+        assert_eq!(
+            provider_cost_usd(&prices, &usage, Some(40))
+                .unwrap()
+                .to_string(),
+            "0.0003420000"
+        );
+        assert_eq!(
+            cost_usd(&prices.sell_price, &usage).to_string(),
+            "0.0006000000"
+        );
+        assert_eq!(provider_cost_usd(&prices, &usage, None), None);
+        assert_eq!(provider_cost_usd(&prices, &usage, Some(101)), None);
     }
 }

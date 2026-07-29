@@ -88,15 +88,23 @@ experiments cannot steer production selection.
 ## Failover
 
 Before response bytes are committed, a transport error, `429`, or `5xx` from the
-selected concrete route causes one retry through a credential-bound internal virtual
-model. Production and beta have distinct aliases, each compiled only from providers
-allowed for that authenticated routing profile; failover cannot cross the boundary.
-The profile comes from the matched Gateway credential, never from a client header.
-Priority tiers remain owned by agentgateway. The sidecar also has a two-attempt retry
-policy on its generated LLM route so the first request survives a newly dead target.
+selected concrete route causes one retry to the next-priority eligible concrete
+route. Selecting the fallback from the already-filtered candidate set preserves
+served-provider attribution and cannot reintroduce an incompatible provider. The
+profile comes from the matched Gateway credential, never from a client header. The
+sidecar also has a two-attempt retry policy on each generated LLM route so each
+concrete request survives a transient upstream failure.
 Once streaming bytes have been committed, neither a malformed event nor a later stream
 error is replayed: doing so could duplicate billable output or concatenate two
 providers into one response.
+
+Before ranking, the router also filters provider/model routes against the requested
+Chat or legacy completion endpoint, streaming support, and any declared `top_p`
+interval. A non-null `top_p` must be a JSON number and a non-null `stream` must be a
+JSON boolean, or the router returns `400` without contacting a provider. The fallback
+is chosen only from the filtered routes under the same preference and price policy.
+Generated profile aliases remain available for AgentGateway configuration validation
+but are never used to bypass request compatibility.
 
 ## Health / circuit-breaking
 

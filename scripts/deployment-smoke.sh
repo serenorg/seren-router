@@ -92,9 +92,42 @@ grep -q '^seren_router_' <<<"$metrics" || die "Prometheus metrics prefix is miss
 rendered="$SEREN_ROUTER_SMOKE_CONFIG_DIR/agentgateway.yaml"
 [[ -f "$rendered" ]] || die "renderer did not create AgentGateway configuration"
 grep -Fq '$SEREN_ROUTER_KEY_OPENROUTER' "$rendered" \
-    || die "rendered configuration omitted the provider environment reference"
-if grep -Fq 'deployment-smoke-only' "$rendered"; then
+    || die "rendered configuration omitted the OpenRouter environment reference"
+if grep -Fq '$SEREN_ROUTER_KEY_MODAL' "$rendered"; then
+    die "rendered production configuration included the disabled Modal candidate"
+fi
+if grep -Fq 'deployment-smoke-only' "$rendered" \
+    || grep -Fq 'deployment-smoke-beta-only' "$rendered"; then
     die "rendered configuration resolved a secret value"
+fi
+
+production_kimi="$(
+    curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        --header 'Authorization: Bearer deployment-smoke-only' \
+        "http://${published}/api/v1/models/moonshotai/kimi-k3/endpoints"
+)"
+grep -Fq '"provider_name":"OpenRouter"' <<<"$production_kimi" \
+    || die "production Kimi catalog omitted the OpenRouter fallback"
+if grep -Fq '"provider_name":"Seren Inference"' <<<"$production_kimi"; then
+    die "production Kimi catalog exposed the beta provider"
+fi
+
+beta_kimi="$(
+    curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        --header 'Authorization: Bearer deployment-smoke-beta-only' \
+        "http://${published}/api/v1/models/moonshotai/kimi-k3/endpoints"
+)"
+grep -Fq '"provider_name":"OpenRouter"' <<<"$beta_kimi" \
+    || die "beta Kimi catalog omitted the active OpenRouter route"
+if grep -Fq '"provider_name":"Seren Inference"' <<<"$beta_kimi" \
+    || grep -iq 'modal' <<<"$beta_kimi"; then
+    die "beta Kimi catalog exposed the disabled provider candidate"
 fi
 
 renderer_id="$(
