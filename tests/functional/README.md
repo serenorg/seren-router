@@ -167,17 +167,15 @@ Refresh and review them before rerunning M6 after any OpenRouter price or model 
 
 ## Paid Modal Kimi K3 beta contract
 
-`tests/modal_contract.rs` is a separate, ignored activation gate for the checked-in,
-disabled Kimi K3 beta candidate. It enables only the internal `modal` row in its
-private fixture, starts the real pinned AgentGateway and router, and uses a disposable
-PostgreSQL 17 schema. It never runs in ordinary tests or CI and does not deploy
-anything.
+`tests/modal_contract.rs` is a separate, ignored paid contract gate for the checked-in
+Kimi K3 beta route. It isolates the internal `modal` row in its private fixture,
+starts the real pinned AgentGateway and router, and uses a disposable PostgreSQL 17
+schema. It never runs in ordinary tests or CI and does not deploy anything.
 
 Requirements:
 
-- authenticate against Seren's existing Modal workspace and verify the current
-  promotional balance plus any visible expiry, restrictions, and Shared API
-  eligibility in the account;
+- authenticate against Seren's existing Modal workspace and verify the displayed
+  balance against the cumulative approved validation ceiling;
 - export a short-lived, dot-joined proxy credential as
   `SEREN_ROUTER_KEY_MODAL` from an approved secret boundary;
 - record whether Modal workspace RBAC actually enforces environment scope; without

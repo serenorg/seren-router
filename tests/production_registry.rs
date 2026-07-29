@@ -15,7 +15,7 @@ use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 
 #[test]
-fn checked_registry_keeps_modal_beta_candidate_disabled() {
+fn checked_registry_activates_modal_only_for_beta() {
     let registry = checked_registry();
     registry.validate().unwrap();
 
@@ -24,7 +24,7 @@ fn checked_registry_keeps_modal_beta_candidate_disabled() {
         .iter()
         .filter(|provider| provider.enabled)
         .collect();
-    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled.len(), 2);
 
     let production_enabled: Vec<_> = enabled
         .iter()
@@ -50,8 +50,8 @@ fn checked_registry_keeps_modal_beta_candidate_disabled() {
         .find(|provider| provider.id == "modal")
         .expect("the checked registry must carry the reviewed Modal beta candidate");
     assert!(
-        !modal.enabled,
-        "the Modal candidate must remain disabled until the revised live gate passes"
+        modal.enabled,
+        "the approved Modal beta route must be enabled"
     );
     assert_eq!(modal.display_name, "Modal");
     assert_eq!(
@@ -215,14 +215,14 @@ fn checked_registry_keeps_modal_beta_candidate_disabled() {
         "disabled provider prices must not enter the live price table"
     );
     assert!(
-        prices.get("modal", "moonshotai/kimi-k3").is_none(),
-        "the blocked Modal candidate must not enter the live price table"
+        prices.get("modal", "moonshotai/kimi-k3").is_some(),
+        "the enabled Modal beta route must enter the live price table"
     );
 }
 
 #[test]
 fn kimi_cached_provider_cost_is_exact_and_provider_independent() {
-    let registry = modal_candidate_registry();
+    let registry = modal_beta_registry();
     let prices = PriceTable::from_registry(&registry).unwrap();
     let slug = "moonshotai/kimi-k3";
     let modal = prices.get("modal", slug).unwrap();
@@ -269,7 +269,7 @@ fn kimi_cached_provider_cost_is_exact_and_provider_independent() {
 
 #[test]
 fn routing_policy_keeps_modal_beta_only_and_rejects_provider_selection() {
-    let registry = modal_candidate_registry();
+    let registry = modal_beta_registry();
     let routing = RoutingPolicy::from_registry(
         &registry,
         RoutingConfig::new(Decimal::new(100, 0), 0.1, Decimal::ONE, 100).unwrap(),
@@ -361,7 +361,7 @@ fn routing_policy_keeps_modal_beta_only_and_rejects_provider_selection() {
 
 #[test]
 fn compiled_sidecar_keeps_modal_internal_and_beta_scoped() {
-    let registry = modal_candidate_registry();
+    let registry = modal_beta_registry();
     let modal_model = &registry
         .providers
         .iter()
@@ -469,15 +469,8 @@ fn checked_registry() -> Registry {
     serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap()
 }
 
-fn modal_candidate_registry() -> Registry {
-    let mut registry = checked_registry();
-    registry
-        .providers
-        .iter_mut()
-        .find(|provider| provider.id == "modal")
-        .expect("the checked registry must contain the Modal candidate")
-        .enabled = true;
-    registry
+fn modal_beta_registry() -> Registry {
+    checked_registry()
 }
 
 fn assert_modal_endpoint_hostname(hostname: &str) {
