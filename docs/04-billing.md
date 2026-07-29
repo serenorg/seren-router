@@ -85,6 +85,14 @@ If a reliability fallback costs more than the reviewed sell price, the customer 
 does not rise. Reconciliation reports negative router margin and operations must
 review or disable that route.
 
+For Kimi K3, the reviewed OpenRouter and Modal mappings both declare `$3.00/MTok`
+uncached input, `$0.30/MTok` cached input, and `$15.00/MTok` output. Identical token
+usage and exact cache telemetry therefore produce identical gross provider cost on
+either route. The single canonical sell row remains `$3.00/MTok` input and
+`$15.00/MTok` output, so routing does not change customer `usage.cost`. If either
+provider omits or reports invalid cached-token detail, its provider cost remains
+unresolved rather than treating the cache hit as full-price input.
+
 ## Registry and catalog contract
 
 `registry/providers.yaml` has two independent price sources:

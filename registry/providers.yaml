@@ -76,6 +76,7 @@ providers:
         context_length: 1048576
         provider_model_id: moonshotai/kimi-k3
         input_price_per_mtok: "3.00"
+        cached_input_price_per_mtok: "0.30"
         output_price_per_mtok: "15.00"
 
   - id: modal

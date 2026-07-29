@@ -221,13 +221,17 @@ fn checked_registry_keeps_modal_beta_candidate_disabled() {
 }
 
 #[test]
-fn modal_cached_provider_cost_is_exact_without_changing_customer_sell_price() {
+fn kimi_cached_provider_cost_is_exact_and_provider_independent() {
     let registry = modal_candidate_registry();
     let prices = PriceTable::from_registry(&registry).unwrap();
     let slug = "moonshotai/kimi-k3";
     let modal = prices.get("modal", slug).unwrap();
     let openrouter = prices.get("openrouter", slug).unwrap();
 
+    assert_eq!(
+        openrouter, modal,
+        "OpenRouter and Modal publish the same reviewed Kimi K3 gross rates"
+    );
     assert_eq!(
         modal,
         &BillingPrices {
@@ -242,7 +246,6 @@ fn modal_cached_provider_cost_is_exact_without_changing_customer_sell_price() {
             },
         }
     );
-    assert_eq!(modal.sell_price, openrouter.sell_price);
 
     let usage = Usage {
         prompt_tokens: 1_000,
@@ -252,13 +255,16 @@ fn modal_cached_provider_cost_is_exact_without_changing_customer_sell_price() {
         cost_usd(&modal.sell_price, &usage).to_string(),
         "0.0045000000"
     );
-    assert_eq!(
-        provider_cost_usd(modal, &usage, Some(600))
-            .unwrap()
-            .to_string(),
-        "0.0028800000"
-    );
-    assert_eq!(provider_cost_usd(modal, &usage, None), None);
+    for provider in [openrouter, modal] {
+        assert_eq!(
+            provider_cost_usd(provider, &usage, Some(600))
+                .unwrap()
+                .to_string(),
+            "0.0028800000"
+        );
+        assert_eq!(provider_cost_usd(provider, &usage, None), None);
+        assert_eq!(provider_cost_usd(provider, &usage, Some(1_001)), None);
+    }
 }
 
 #[test]
