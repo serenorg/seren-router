@@ -197,6 +197,35 @@ This passing gate completed the provider integration contract. Taariq subsequent
 confirmed permission and authorized the deployment secret, checked beta enablement,
 and bounded production validation on 2026-07-30.
 
+### Production canary: passed
+
+The first ten-request production window returned ten successful responses but failed
+the precommitted latency gate when its cold request took 22.147 seconds. The production
+publisher was immediately and atomically restored to direct OpenRouter. Both rollback
+JSON and SSE requests passed, including terminal streaming usage and `[DONE]`.
+
+After one 1.114-second pre-warm through the isolated beta publisher, production was
+atomically restored to seren-router and a fresh ten-request window passed without
+changing the threshold:
+
+- 10 requests, 10 HTTP 200 responses, and no provider or request errors;
+- 3.130-second p95 latency against the 15-second ceiling;
+- 30,420 prompt tokens, including 30,080 cached tokens, and 40 completion tokens;
+- `$0.0106440000` exact gross provider cost and `$0.0918600000` invariant sell
+  subtotal;
+- ten production ledger rows attributed internally to `modal` and exposed publicly as
+  `Seren Inference`; and
+- an exact Modal billing increase from `$0.04689314` to `$0.05753714`, with billed
+  cost remaining `$0`.
+
+Streaming, Legacy Completions, and `top_p=0.949` probes each selected OpenRouter,
+returned HTTP 200, and wrote OpenRouter-attributed production ledger rows. Modal
+billing did not change during those probes. Both router replicas remained Ready in
+separate zones with zero restarts, zero CPU throttling, healthy PDB and EndpointSlice
+state, and successful public health checks. The production publisher finished on
+seren-router; its tested atomic direct-OpenRouter restoration remains the immediate
+publisher rollback.
+
 ## Rollout and rollback
 
 The approved deployment uses distinct production and beta Gateway credentials and one

@@ -63,8 +63,8 @@ Phased so each step is independently shippable and reversible. The guiding princ
 - [x] Enable the Modal route for credential-bound beta traffic, then admit it to a
   bounded production canary while preserving OpenRouter as the compatible fallback
   in both profiles.
-- [ ] Pass the bounded production request, cost, latency, readiness, fallback, and
-  publisher-rollback gates tracked in #57.
+- [x] Pass the bounded production request, cost, latency, readiness, fallback, and
+  publisher-rollback gates tracked in #57 (2026-07-30).
 - [ ] Activate DeepInfra after the remaining `docs/11` gates: written provider
   consent, scoped key, live compatibility test, and spend cap.
 - [ ] Confirm lower provider cost, invariant sell-price `usage.cost`, and
