@@ -27,7 +27,7 @@ use crate::routing_profile::RoutingProfile;
 use crate::sse::UsageCostTransformer;
 use crate::usage_cost::{
     CostedUsage, PublicResponseRejection, inject_usage_cost, prices_for_request,
-    sanitize_public_completion_value,
+    provider_reported_cost_policy, sanitize_public_completion_value,
 };
 
 const CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
@@ -292,8 +292,9 @@ async fn forward(
             ),
             endpoint.label(),
         );
-        let transformer =
-            UsageCostTransformer::new(prices).with_response_model(&decision.canonical_model);
+        let transformer = UsageCostTransformer::new(prices)
+            .with_provider_cost_policy(provider_reported_cost_policy(served_provider))
+            .with_response_model(&decision.canonical_model);
         let body = Body::from_stream(stream_with_response_transformer(
             response.bytes_stream(),
             transformer,
@@ -913,7 +914,7 @@ mod tests {
 
     use super::*;
     use crate::registry::{ModelMapping, Provider, Registry};
-    use crate::usage_cost::CostOmission;
+    use crate::usage_cost::{CostOmission, ProviderReportedCostPolicy};
 
     #[tokio::test]
     async fn selected_request_retries_every_compatible_fallback_in_order() {
@@ -1098,6 +1099,164 @@ mod tests {
     }
 
     #[test]
+    fn deepinfra_estimated_cost_is_exactly_scoped_normalized_and_sanitized() {
+        let body = br#"{
+            "id":"chatcmpl-deepinfra",
+            "usage":{
+                "prompt_tokens":21,
+                "completion_tokens":16,
+                "prompt_tokens_details":null,
+                "estimated_cost":0.000054149999999999995
+            }
+        }"#;
+        let price_table = test_price_table_for_provider_with_cached_price(
+            "deepinfra-glm",
+            Some("0.14".parse().unwrap()),
+        );
+
+        let transformed = inject_usage_cost(
+            body,
+            "deepinfra-glm/functional-model",
+            &served_provider("deepinfra-glm"),
+            &price_table,
+        )
+        .unwrap();
+        let response: Value = serde_json::from_slice(&transformed.body).unwrap();
+
+        assert_eq!(
+            response["usage"]["cost"].as_number().unwrap().to_string(),
+            "0.0000541500"
+        );
+        assert!(response["usage"].get("estimated_cost").is_none());
+        assert_eq!(
+            transformed.usage,
+            CostedUsage {
+                response_id: Some("chatcmpl-deepinfra".to_owned()),
+                usage: crate::pricing::Usage {
+                    prompt_tokens: 21,
+                    completion_tokens: 16,
+                },
+                cost_usd: "0.0000541500".parse().unwrap(),
+            }
+        );
+        assert_eq!(
+            provider_reported_cost_policy(&served_provider("deepinfra")),
+            ProviderReportedCostPolicy::DeepInfraEstimatedCost
+        );
+        assert_eq!(
+            provider_reported_cost_policy(&served_provider("deepinfra-glm")),
+            ProviderReportedCostPolicy::DeepInfraEstimatedCost
+        );
+        for provider in ["deepinfra-glm-shadow", "openrouter", "blackbox", "local"] {
+            assert_eq!(
+                provider_reported_cost_policy(&served_provider(provider)),
+                ProviderReportedCostPolicy::UsageCostOnly,
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepinfra_usage_cost_precedes_conflicting_estimated_cost() {
+        let body = br#"{
+            "id":"chatcmpl-deepinfra",
+            "usage":{
+                "prompt_tokens":21,
+                "completion_tokens":16,
+                "cost":0.00005415,
+                "estimated_cost":-1
+            }
+        }"#;
+        let price_table = test_price_table_for_provider_with_cached_price(
+            "deepinfra-glm",
+            Some("0.14".parse().unwrap()),
+        );
+
+        let transformed = inject_usage_cost(
+            body,
+            "deepinfra-glm/functional-model",
+            &served_provider("deepinfra-glm"),
+            &price_table,
+        )
+        .unwrap();
+        let response: Value = serde_json::from_slice(&transformed.body).unwrap();
+
+        assert_eq!(
+            response["usage"]["cost"].as_number().unwrap().to_string(),
+            "0.0000541500"
+        );
+        assert!(response["usage"].get("estimated_cost").is_none());
+        assert_eq!(transformed.usage.cost_usd.to_string(), "0.0000541500");
+    }
+
+    #[test]
+    fn deepinfra_invalid_or_missing_estimated_cost_fails_closed() {
+        let deepinfra_prices = test_price_table_for_provider_with_cached_price(
+            "deepinfra-glm",
+            Some("0.14".parse().unwrap()),
+        );
+        let local_prices = test_price_table_with_cached_price(Some("0.14".parse().unwrap()));
+        let valid_estimate =
+            br#"{"usage":{"prompt_tokens":21,"completion_tokens":16,"estimated_cost":0.00005415}}"#;
+
+        assert_eq!(
+            inject_usage_cost(
+                valid_estimate,
+                "local/functional-model",
+                &served_provider("local"),
+                &local_prices,
+            )
+            .err(),
+            Some(CostOmission::UnresolvedProviderCost),
+            "non-DeepInfra providers must not trust usage.estimated_cost"
+        );
+
+        for (name, body, expected) in [
+            (
+                "missing estimated cost",
+                br#"{"usage":{"prompt_tokens":21,"completion_tokens":16}}"#.as_slice(),
+                CostOmission::UnresolvedProviderCost,
+            ),
+            (
+                "null estimated cost",
+                br#"{"usage":{"prompt_tokens":21,"completion_tokens":16,"estimated_cost":null}}"#
+                    .as_slice(),
+                CostOmission::UnresolvedProviderCost,
+            ),
+            (
+                "nonnumeric estimated cost",
+                br#"{"usage":{"prompt_tokens":21,"completion_tokens":16,"estimated_cost":"0.00005415"}}"#
+                    .as_slice(),
+                CostOmission::InvalidProviderCost,
+            ),
+            (
+                "negative estimated cost",
+                br#"{"usage":{"prompt_tokens":21,"completion_tokens":16,"estimated_cost":-0.00005415}}"#
+                    .as_slice(),
+                CostOmission::InvalidProviderCost,
+            ),
+            (
+                "invalid usage cost despite valid estimated cost",
+                br#"{"usage":{"prompt_tokens":21,"completion_tokens":16,"cost":"invalid","estimated_cost":0.00005415}}"#
+                    .as_slice(),
+                CostOmission::InvalidProviderCost,
+            ),
+        ] {
+            assert_eq!(
+                inject_usage_cost(
+                    body,
+                    "deepinfra-glm/functional-model",
+                    &served_provider("deepinfra-glm"),
+                    &deepinfra_prices,
+                )
+                .err(),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn unresolved_cached_prompt_usage_fails_closed() {
         let price_table = test_price_table_with_cached_price(Some(Decimal::new(30, 2)));
         let served_provider = served_provider("local");
@@ -1172,9 +1331,16 @@ mod tests {
     fn test_price_table_with_cached_price(
         cached_input_price_per_mtok: Option<Decimal>,
     ) -> PriceTable {
+        test_price_table_for_provider_with_cached_price("local", cached_input_price_per_mtok)
+    }
+
+    fn test_price_table_for_provider_with_cached_price(
+        provider_id: &str,
+        cached_input_price_per_mtok: Option<Decimal>,
+    ) -> PriceTable {
         PriceTable::from_registry(&Registry {
             providers: vec![Provider {
-                id: "local".to_owned(),
+                id: provider_id.to_owned(),
                 display_name: "Local".to_owned(),
                 public_display_name: None,
                 public_tag: None,
