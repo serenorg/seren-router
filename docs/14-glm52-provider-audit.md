@@ -17,8 +17,8 @@ Blackbox was not the cheapest or fastest GLM 5.2 route in this sample.
 
 The checked production and beta default order is therefore DeepInfra, Blackbox, then
 OpenRouter. Explicit `provider.sort: price` selects OpenRouter. All three remain
-eligible Chat Completions routes. Issue #78 retains the deployed canary, failover,
-health, and immutable rollback gate for this revised route set.
+eligible Chat Completions routes. The funded deployment gate passed with exact
+provider-cost identity across JSON, SSE, generation metadata, and the raw ledger.
 
 ## Reviewed prices
 
@@ -86,3 +86,37 @@ USD/MTok was:
 This ratio is a routing comparison, not a billing unit. Token price and throughput
 remain separate measurements: OpenRouter is cheapest per token; DeepInfra delivered
 the strongest median speed per published output price in this bounded run.
+
+## Deployed gate
+
+The reviewed source `1ab4671383d247ec83fd86daf8982f9d31f3deee` was deployed as
+Linux ARM64 image
+`sha256:e1d7023d11f0c545501c70c1e0d48829c957de13798bb5cf85d745160dea4b36`
+through GitOps revision `185bc658f69d35e208e5432a73d49a40557ecc1e`.
+Only the router Deployment, registry ConfigMap, ExternalSecret, PDB, and keep-warm
+CronJob were selectively synced.
+
+The final bounded gate made six routed requests:
+
+- production and beta JSON selected `deepinfra-glm`;
+- production and beta SSE selected `deepinfra-glm`, each returning exactly one
+  terminal usage event and one `[DONE]`;
+- every DeepInfra GLM response reported 17 prompt tokens, 8 completion tokens, and
+  exact provider cost `$0.0000319500`;
+- no public response leaked `estimated_cost`;
+- production `provider.sort: price` selected OpenRouter and recorded exact provider
+  cost `$0.0000322800`; and
+- production Llama selected DeepInfra and recorded exact provider cost
+  `$0.0000021400`.
+
+All six generation metadata lookups matched the response cost. The six raw ledger
+rows recorded the expected provider and routing profile with
+`cost_usd = provider_cost_usd`, `sell_price_usd IS NULL`, and status 200. The full
+same-request GLM fallback chain remains DeepInfra, Blackbox, then OpenRouter. Two
+earlier selective rollback exercises restored the preceding OpenRouter-safe image
+and catalog before the final corrected restore.
+
+Final runtime evidence was 2/2 Ready across `us-east-1a` and `us-east-1c`, zero
+container restarts, healthy PDB and EndpointSlices, public health 200/200, database
+availability metric 1, successful keep-warm execution, a Ready ExternalSecret, zero
+serious router or AgentGateway log lines, and no router Warning events.
