@@ -21,7 +21,7 @@ providers:
     display_name: DeepInfra
     base_url: https://api.deepinfra.com/v1/openai
     secret_env: SEREN_ROUTER_KEY_DEEPINFRA # name only — never the key
-    enabled: false
+    enabled: true
     priority: 0
     profiles: [beta]
     models:
@@ -31,6 +31,8 @@ providers:
         provider_model_id: meta-llama/Llama-3.3-70B-Instruct-Turbo
         input_price_per_mtok: "0.10"  # exact provider cost
         output_price_per_mtok: "0.32"
+        request_constraints:
+          endpoints: [chat]
 ```
 
 Key points:

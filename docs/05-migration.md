@@ -27,8 +27,8 @@ That makes seren-router an immediate *superset* of today's behavior. We can repo
 
 ## Peel providers off incrementally
 
-1. Validate DeepInfra Llama 3.3 through the credential-bound beta profile after
-   the contractual and pricing-policy gates in `docs/11`.
+1. Validate DeepInfra Llama 3.3 through the credential-bound beta profile under
+   the scoped credential, bounded-spend, and compatibility gates in `docs/11`.
 2. Enable it only if compatibility, cost, and reliability remain green.
 3. Re-evaluate Fireworks and Together after their documented no-go conditions
    change.

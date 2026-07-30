@@ -95,9 +95,12 @@ grep -Fq '$SEREN_ROUTER_KEY_OPENROUTER' "$rendered" \
     || die "rendered configuration omitted the OpenRouter environment reference"
 grep -Fq '$SEREN_ROUTER_KEY_MODAL' "$rendered" \
     || die "rendered configuration omitted the Modal environment reference"
+grep -Fq '$SEREN_ROUTER_KEY_DEEPINFRA' "$rendered" \
+    || die "rendered configuration omitted the DeepInfra environment reference"
 if grep -Fq 'deployment-smoke-only' "$rendered" \
     || grep -Fq 'deployment-smoke-beta-only' "$rendered" \
-    || grep -Fq 'deployment-smoke-modal-only' "$rendered"; then
+    || grep -Fq 'deployment-smoke-modal-only' "$rendered" \
+    || grep -Fq 'deployment-smoke-deepinfra-only' "$rendered"; then
     die "rendered configuration resolved a secret value"
 fi
 
@@ -132,6 +135,33 @@ grep -Fq '"provider_name":"Seren Inference"' <<<"$beta_kimi" \
 if grep -iq 'modal' <<<"$beta_kimi"; then
     die "beta Kimi catalog exposed the internal provider brand"
 fi
+
+production_llama="$(
+    curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        --header 'Authorization: Bearer deployment-smoke-only' \
+        "http://${published}/api/v1/models/meta-llama/llama-3.3-70b-instruct/endpoints"
+)"
+grep -Fq '"provider_name":"OpenRouter"' <<<"$production_llama" \
+    || die "production Llama catalog omitted the OpenRouter route"
+if grep -Fq '"provider_name":"DeepInfra"' <<<"$production_llama"; then
+    die "production Llama catalog exposed the beta-only DeepInfra route"
+fi
+
+beta_llama="$(
+    curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        --header 'Authorization: Bearer deployment-smoke-beta-only' \
+        "http://${published}/api/v1/models/meta-llama/llama-3.3-70b-instruct/endpoints"
+)"
+grep -Fq '"provider_name":"DeepInfra"' <<<"$beta_llama" \
+    || die "beta Llama catalog omitted the DeepInfra direct route"
+grep -Fq '"provider_name":"OpenRouter"' <<<"$beta_llama" \
+    || die "beta Llama catalog omitted the OpenRouter fallback"
 
 renderer_id="$(
     docker compose \
