@@ -15,7 +15,7 @@ use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 
 #[test]
-fn checked_registry_activates_modal_and_isolates_deepinfra_to_beta() {
+fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
     let registry = checked_registry();
     registry.validate().unwrap();
 
@@ -24,7 +24,7 @@ fn checked_registry_activates_modal_and_isolates_deepinfra_to_beta() {
         .iter()
         .filter(|provider| provider.enabled)
         .collect();
-    assert_eq!(enabled.len(), 3);
+    assert_eq!(enabled.len(), 4);
 
     let production_enabled: Vec<_> = enabled
         .iter()
@@ -37,7 +37,7 @@ fn checked_registry_activates_modal_and_isolates_deepinfra_to_beta() {
         .copied()
         .filter(|provider| provider.supports(RoutingProfile::Beta))
         .collect();
-    assert_eq!(beta_enabled.len(), 3);
+    assert_eq!(beta_enabled.len(), 4);
     let openrouter = production_enabled
         .iter()
         .copied()
@@ -141,6 +141,36 @@ fn checked_registry_activates_modal_and_isolates_deepinfra_to_beta() {
         [CompletionEndpoint::Chat].into_iter().collect()
     );
 
+    let blackbox = registry
+        .providers
+        .iter()
+        .find(|provider| provider.id == "blackbox")
+        .unwrap();
+    assert!(blackbox.enabled);
+    assert_eq!(
+        blackbox.profiles,
+        [RoutingProfile::Beta].into_iter().collect()
+    );
+    assert_eq!(blackbox.base_url, "https://api.blackbox.ai/v1");
+    assert_eq!(blackbox.secret_env, "SEREN_ROUTER_KEY_BLACKBOX");
+    assert_eq!(blackbox.priority, 0);
+    assert_eq!(blackbox.models.len(), 1);
+    let blackbox_glm = &blackbox.models[0];
+    assert_eq!(blackbox_glm.slug, "z-ai/glm-5.2");
+    assert_eq!(blackbox_glm.provider_model_id, "z-ai/glm-5.2");
+    assert_eq!(blackbox_glm.context_length, 1_000_000);
+    assert_eq!(blackbox_glm.input_price_per_mtok, Decimal::new(140, 2));
+    assert_eq!(
+        blackbox_glm.cached_input_price_per_mtok,
+        Some(Decimal::new(14, 2))
+    );
+    assert_eq!(blackbox_glm.output_price_per_mtok, Decimal::new(440, 2));
+    assert_eq!(
+        blackbox_glm.request_constraints.endpoints,
+        [CompletionEndpoint::Chat].into_iter().collect()
+    );
+    assert!(blackbox_glm.request_constraints.supports_streaming);
+
     let actual: Vec<_> = openrouter
         .models
         .iter()
@@ -241,6 +271,10 @@ fn checked_registry_activates_modal_and_isolates_deepinfra_to_beta() {
     assert!(
         prices.get("modal", "moonshotai/kimi-k3").is_some(),
         "the enabled Modal beta route must enter the live price table"
+    );
+    assert!(
+        prices.get("blackbox", "z-ai/glm-5.2").is_some(),
+        "the enabled Blackbox beta route must enter the live price table"
     );
 }
 
@@ -451,6 +485,121 @@ fn routing_policy_selects_deepinfra_only_for_beta_with_openrouter_fallback() {
 }
 
 #[test]
+fn blackbox_glm_cost_is_exact_and_sell_price_remains_route_independent() {
+    let registry = checked_registry();
+    let prices = PriceTable::from_registry(&registry).unwrap();
+    let slug = "z-ai/glm-5.2";
+    let blackbox = prices.get("blackbox", slug).unwrap();
+    let openrouter = prices.get("openrouter", slug).unwrap();
+
+    assert_eq!(blackbox.sell_price, openrouter.sell_price);
+    assert_eq!(
+        blackbox,
+        &BillingPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: Decimal::new(140, 2),
+                output_price_per_mtok: Decimal::new(440, 2),
+            },
+            provider_cached_input_price_per_mtok: Some(Decimal::new(14, 2)),
+            sell_price: ModelPrices {
+                input_price_per_mtok: Decimal::new(70, 2),
+                output_price_per_mtok: Decimal::new(220, 2),
+            },
+        }
+    );
+
+    let repeated_paid_probe = Usage {
+        prompt_tokens: 17,
+        completion_tokens: 4,
+    };
+    assert_eq!(
+        provider_cost_usd(blackbox, &repeated_paid_probe, Some(16))
+            .unwrap()
+            .to_string(),
+        "0.0000212400"
+    );
+    assert_eq!(
+        cost_usd(&blackbox.sell_price, &repeated_paid_probe).to_string(),
+        "0.0000207000"
+    );
+    assert_eq!(
+        provider_cost_usd(blackbox, &repeated_paid_probe, None),
+        None,
+        "cached pricing requires exact cached-token telemetry"
+    );
+    assert_eq!(
+        provider_cost_usd(blackbox, &repeated_paid_probe, Some(18)),
+        None,
+        "cached tokens must not exceed total prompt tokens"
+    );
+}
+
+#[test]
+fn routing_policy_selects_blackbox_only_for_default_beta_requests() {
+    let registry = checked_registry();
+    let routing = RoutingPolicy::from_registry(
+        &registry,
+        RoutingConfig::new(Decimal::new(100, 0), 0.1, Decimal::ONE, 100).unwrap(),
+        MeasurementStore::default(),
+    )
+    .unwrap();
+    let slug = "z-ai/glm-5.2";
+    let mut production = json!({"model": slug});
+    let mut beta = production.clone();
+
+    let production_decision = routing
+        .route(RoutingProfile::Production, &mut production)
+        .unwrap();
+    assert_eq!(production_decision.selected_provider, "openrouter");
+    assert_eq!(production["model"], "openrouter/z-ai/glm-5.2");
+    assert_eq!(production_decision.fallback_model, None);
+
+    let beta_decision = routing.route(RoutingProfile::Beta, &mut beta).unwrap();
+    assert_eq!(beta_decision.selected_provider, "blackbox");
+    assert_eq!(beta["model"], "blackbox/z-ai/glm-5.2");
+    assert_eq!(
+        beta_decision.fallback_model.as_deref(),
+        Some("openrouter/z-ai/glm-5.2")
+    );
+
+    let mut explicit_price = json!({
+        "model": slug,
+        "provider": {"sort": "price"}
+    });
+    let price_decision = routing
+        .route(RoutingProfile::Beta, &mut explicit_price)
+        .unwrap();
+    assert_eq!(price_decision.selected_provider, "openrouter");
+    assert_eq!(explicit_price["model"], "openrouter/z-ai/glm-5.2");
+    assert_eq!(
+        price_decision.fallback_model.as_deref(),
+        Some("blackbox/z-ai/glm-5.2")
+    );
+
+    let mut legacy = json!({"model": slug});
+    let legacy_decision = routing
+        .route_for_endpoint(
+            RoutingProfile::Beta,
+            CompletionEndpoint::Legacy,
+            &mut legacy,
+        )
+        .unwrap();
+    assert_eq!(legacy_decision.selected_provider, "openrouter");
+    assert_eq!(legacy["model"], "openrouter/z-ai/glm-5.2");
+    assert_eq!(legacy_decision.fallback_model, None);
+
+    let mut production_forged = json!({
+        "model": slug,
+        "routing_profile": "beta"
+    });
+    let forged_decision = routing
+        .route(RoutingProfile::Production, &mut production_forged)
+        .unwrap();
+    assert_eq!(forged_decision.selected_provider, "openrouter");
+    assert_eq!(production_forged["model"], "openrouter/z-ai/glm-5.2");
+}
+
+#[test]
 fn compiled_sidecar_keeps_modal_internal_with_openrouter_fallback() {
     let registry = modal_beta_registry();
     let modal_model = &registry
@@ -570,6 +719,51 @@ fn compiled_sidecar_keeps_deepinfra_beta_only_with_openrouter_fallback() {
 - model: deepinfra/meta-llama/llama-3.3-70b-instruct
   priority: 0
 - model: openrouter/meta-llama/llama-3.3-70b-instruct
+  priority: 255
+"#
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn compiled_sidecar_keeps_blackbox_beta_only_with_openrouter_fallback() {
+    let registry = checked_registry();
+    let compiled = compile(&registry, SidecarConfigOptions::default()).unwrap();
+    let config: Value = serde_yaml::from_slice(&compiled).unwrap();
+    let models = config["llm"]["models"].as_sequence().unwrap();
+    let direct = named_entry(models, "blackbox/z-ai/glm-5.2");
+
+    assert_eq!(direct["provider"], "openAI");
+    assert_eq!(direct["params"]["baseUrl"], "https://api.blackbox.ai/v1");
+    assert_eq!(direct["params"]["model"], "z-ai/glm-5.2");
+    assert_eq!(direct["overrides"]["model"], "z-ai/glm-5.2");
+    assert_eq!(direct["params"]["apiKey"], "$SEREN_ROUTER_KEY_BLACKBOX");
+    assert_eq!(
+        direct["responseHeaders"]["set"]["x-seren-served-provider"],
+        "blackbox"
+    );
+
+    let virtual_models = config["llm"]["virtualModels"].as_sequence().unwrap();
+    let production = named_entry(virtual_models, "seren-profile-production/z-ai/glm-5.2");
+    let beta = named_entry(virtual_models, "seren-profile-beta/z-ai/glm-5.2");
+    assert_eq!(
+        production["routing"]["failover"]["targets"],
+        serde_yaml::from_str::<Value>(
+            r#"
+- model: openrouter/z-ai/glm-5.2
+  priority: 255
+"#
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        beta["routing"]["failover"]["targets"],
+        serde_yaml::from_str::<Value>(
+            r#"
+- model: blackbox/z-ai/glm-5.2
+  priority: 0
+- model: openrouter/z-ai/glm-5.2
   priority: 255
 "#
         )

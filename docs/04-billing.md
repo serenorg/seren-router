@@ -93,6 +93,15 @@ either route. The single canonical sell row remains `$3.00/MTok` input and
 provider omits or reports invalid cached-token detail, its provider cost remains
 unresolved rather than treating the cache hit as full-price input.
 
+For Blackbox GLM 5.2, repeated funded responses proved `$1.40/MTok` uncached
+input, `$0.14/MTok` cached input, and `$4.40/MTok` output. The canonical sell row
+remains `$0.70/MTok` input and `$2.20/MTok` output. This route therefore has
+negative gross margin for uncached input and completion tokens, even before the
+Gateway fee. Promotional credits do not change that gross-cost fact. The route is
+restricted to the internal beta profile for resilience validation and must not be
+enabled for customer traffic without both written commercial permission and a
+sustainable pricing decision.
+
 ## Registry and catalog contract
 
 `registry/providers.yaml` has two independent price sources:

@@ -83,6 +83,7 @@ fn production_registry_validates_with_pinned_sidecar() {
         .arg("-f")
         .arg(config.path())
         .arg("--validate-only")
+        .env("SEREN_ROUTER_KEY_BLACKBOX", "fixture-only-blackbox-key")
         .env("SEREN_ROUTER_KEY_DEEPINFRA", "fixture-only-deepinfra-key")
         .env("SEREN_ROUTER_KEY_MODAL", "fixture-only-modal-key")
         .env("SEREN_ROUTER_KEY_OPENROUTER", "fixture-only-openrouter-key")

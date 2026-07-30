@@ -74,7 +74,10 @@ Phased so each step is independently shippable and reversible. The guiding princ
 - [x] Confirm lower provider cost and invariant sell-price `usage.cost`; make
   DeepInfra the beta-primary Llama route while retaining OpenRouter as the
   immediate fallback (2026-07-30).
-- [ ] Repeat: Fireworks, Blackbox, Novita, Baseten, … (prioritize by traffic volume × margin gain).
+- [x] Add Blackbox GLM 5.2 as an internal-beta-only route using a `$1`-capped
+  credential; preserve OpenRouter-only production routing, exact metered provider
+  cost, and the invariant canonical sell row (`docs/13`, 2026-07-30).
+- [ ] Repeat: Fireworks, Novita, Baseten, … (prioritize by traffic volume × margin gain).
 - [ ] Implement the routing policy in full (`docs/02`): outage gate, inverse-square price weighting, `sort` modes, `:nitro`/`:floor`, failover.
 - [x] Stand up the per-request provider-cost/sell-price ledger and reconciliation
   contract (`docs/04`, 2026-07-27).

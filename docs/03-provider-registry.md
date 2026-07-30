@@ -54,6 +54,11 @@ Key points:
   completion usage. It requires the upstream usage object to report an exact
   cached-token count to record provider cost; missing or invalid detail persists
   `provider_cost_usd` as null rather than estimating it.
+  Blackbox GLM 5.2 is a concrete example: repeated paid JSON responses on
+  2026-07-30 metered cache reads at `$0.14/MTok`, so the beta mapping pins that
+  exact rate even though the public provider page currently displays `$0.26/MTok`.
+  The discrepancy remains a documented reconciliation item and never changes the
+  canonical sell row.
 - **Request compatibility is declarative per provider/model.** Omitted
   `request_constraints` accepts both Chat Completions and legacy Completions, with
   streaming enabled and any numeric `top_p`. A narrower OpenAI-compatible route can
