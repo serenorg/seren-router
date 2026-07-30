@@ -84,6 +84,12 @@ For non-streaming responses, the router injects provider cost at `usage.cost`. F
 streaming responses, it injects the same amount into the terminal usage event before
 exactly one `[DONE]`.
 
+DeepInfra streams may attach token counts with a null estimate to the final choice,
+then send the numeric estimate in a separate empty-choices usage event. The exact
+DeepInfra policy preserves that choice while normalizing its preliminary `usage` to
+null, waits for the final estimate, and records only the final costed usage event.
+`[DONE]` without a valid final estimate fails closed.
+
 Both paths write:
 
 - the credential-selected routing profile;
