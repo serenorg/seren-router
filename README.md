@@ -54,8 +54,10 @@ traffic. The earlier DeepInfra Llama and Blackbox beta canaries passed exact
 provider-cost, compatibility, failover, and rollback/restore gates. A subsequent
 five-request-per-provider GLM audit measured DeepInfra as the best stable
 price/throughput route, so the checked default GLM order is DeepInfra, Blackbox, then
-OpenRouter; explicit price sorting selects OpenRouter. Issue #78 retains the revised
-production deployment, canary, and rollback evidence gate.
+OpenRouter; explicit price sorting selects OpenRouter. The revised production gate
+passed on 2026-07-30 across both routing profiles and both JSON/SSE modes, with exact
+response, generation-metadata, and raw-ledger provider-cost identity. Two selective
+rollback exercises proved OpenRouter continuity before the final healthy restore.
 
 ## Service development
 

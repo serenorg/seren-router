@@ -83,9 +83,9 @@ Phased so each step is independently shippable and reversible. The guiding princ
   Blackbox, DeepInfra, and OpenRouter with five interleaved SSE requests each, and
   make DeepInfra the checked default stable price/throughput route (`docs/14`,
   2026-07-30).
-- [ ] Deploy the revised production route set and prove exact JSON/SSE provider cost,
+- [x] Deploy the revised production route set and prove exact JSON/SSE provider cost,
   production/beta selection, OpenRouter price routing, failover, health, and immutable
-  rollback (#78).
+  rollback (`docs/14`, #78, 2026-07-30).
 - [ ] Repeat: Fireworks, Novita, Baseten, … (prioritize by traffic volume, cost, and
   measured performance).
 - [ ] Implement the routing policy in full (`docs/02`): outage gate, inverse-square price weighting, `sort` modes, `:nitro`/`:floor`, failover.
