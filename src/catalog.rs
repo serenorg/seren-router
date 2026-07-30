@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_modal_route_is_neutral_in_beta_and_absent_from_production() {
+    fn checked_modal_route_is_neutral_in_production_and_beta() {
         let registry: Registry =
             serde_yaml::from_str(include_str!("../registry/providers.yaml")).unwrap();
         registry.validate().unwrap();
@@ -436,18 +436,47 @@ mod tests {
             .providers
             .iter()
             .find(|provider| provider.id == "modal")
-            .expect("the checked registry must carry the reviewed Modal beta candidate");
+            .expect("the checked registry must carry the reviewed Modal route");
         assert_eq!(modal.id, "modal");
         assert!(modal.enabled);
-        assert_eq!(modal.profiles, [RoutingProfile::Beta].into_iter().collect());
+        assert_eq!(
+            modal.profiles,
+            [RoutingProfile::Production, RoutingProfile::Beta]
+                .into_iter()
+                .collect()
+        );
 
         let catalog = Catalog::from_registry(&registry);
         let production = &catalog
             .snapshot(RoutingProfile::Production)
             .endpoints_by_slug["moonshotai/kimi-k3"];
-        assert_eq!(production.data.endpoints.len(), 1);
-        assert_eq!(production.data.endpoints[0].provider_name, "OpenRouter");
-        assert_eq!(production.data.endpoints[0].tag, "openrouter");
+        assert_eq!(production.data.endpoints.len(), 2);
+        let production_neutral = production
+            .data
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.provider_name == "Seren Inference")
+            .expect("production catalog must publish the neutral direct provider alias");
+        assert_eq!(
+            production_neutral.name,
+            "Seren Inference: MoonshotAI Kimi K3"
+        );
+        assert_eq!(production_neutral.tag, "seren");
+        assert!(
+            production
+                .data
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.provider_name == "OpenRouter"),
+            "production catalog must retain the OpenRouter fallback"
+        );
+        let production_serialized = serde_json::to_string(production)
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            !production_serialized.contains("modal"),
+            "the production endpoint catalog must not disclose its internal provider"
+        );
 
         let beta = &catalog.snapshot(RoutingProfile::Beta).endpoints_by_slug["moonshotai/kimi-k3"];
         assert_eq!(beta.data.endpoints.len(), 2);

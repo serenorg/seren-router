@@ -28,15 +28,22 @@ Phased so each step is independently shippable and reversible. The guiding princ
 
 ## Phase 2 — Canary the passthrough
 
-- [ ] Stand up a beta publisher slug (or percentage split) pointing at seren-router.
-- [ ] Run real traffic through the passthrough; compare latency, error rate, and `usage.cost` parity vs direct OpenRouter.
-- [ ] **Gate:** parity confirmed on the models users actually call (checked against recent `seren-models` usage).
+- [x] Stand up the credential-bound `seren-models-beta` publisher pointing at
+  seren-router (2026-07-30).
+- [x] Run bounded real traffic through the passthrough and compare latency, errors,
+  attribution, and `usage.cost` with direct OpenRouter (2026-07-25 through
+  2026-07-30).
+- [x] **Gate:** JSON/SSE parity and the 100-request-per-path OpenRouter soak passed;
+  beta/production credential isolation and rollback were reverified on 2026-07-30.
 
 ## Phase 3 — Cutover (still OpenRouter underneath)
 
-- [ ] Repoint `seren-models.api_url` → seren-router; swap the key (`docs/05`).
-- [ ] Monitor. **Instant revert = restore `api_url`.**
-- [ ] **Gate:** production stable on seren-router with OpenRouter as the only (fallback) provider.
+- [x] Repoint `seren-models.api_url` to seren-router and swap the key (`docs/05`,
+  completed before the 2026-07-29 HA rollout).
+- [x] Monitor and exercise the atomic direct-OpenRouter publisher restoration on
+  2026-07-30.
+- [x] **Gate:** production is stable on seren-router; OpenRouter remains enabled as
+  the lowest-priority compatible fallback.
 
 ## Phase 4 — Direct providers (peel off)
 
@@ -53,8 +60,11 @@ Phased so each step is independently shippable and reversible. The guiding princ
 - [x] Record Taariq's confirmation of Modal permission and approval for beta and
   production validation (`docs/12`, 2026-07-30). The authenticated balance is
   sufficient; no promotional-grant reconciliation is required.
-- [x] Enable the Modal route only for credential-bound beta traffic while preserving
-  OpenRouter as the production route and compatible beta fallback.
+- [x] Enable the Modal route for credential-bound beta traffic, then admit it to a
+  bounded production canary while preserving OpenRouter as the compatible fallback
+  in both profiles.
+- [ ] Pass the bounded production request, cost, latency, readiness, fallback, and
+  publisher-rollback gates tracked in #57.
 - [ ] Activate DeepInfra after the remaining `docs/11` gates: written provider
   consent, scoped key, live compatibility test, and spend cap.
 - [ ] Confirm lower provider cost, invariant sell-price `usage.cost`, and

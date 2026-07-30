@@ -1,7 +1,7 @@
-<!-- ABOUTME: Defines the beta-only Kimi K3 route through Modal's Shared API.
+<!-- ABOUTME: Defines the production and beta Kimi K3 route through Modal's Shared API.
 ABOUTME: Pins neutral public naming, exact billing, credential scope, and activation gates. -->
 
-# 12 — Modal Kimi K3 Beta Route
+# 12 — Modal Kimi K3 Route
 
 ## Decision and scope
 
@@ -10,13 +10,15 @@ provider-spend ceiling on 2026-07-29. On 2026-07-30, Taariq confirmed that Modal
 granted Seren permission and approved both internal beta activation and a subsequent
 bounded production validation.
 
-The account-provisioned route is checked in as an enabled `beta` route. Its first
+The account-provisioned route is checked in as an enabled `production` and `beta`
+route. Its first
 bounded live run proved non-streaming JSON and cache telemetry, but Modal returned no
 terminal usage object for the successful streaming request. The revised two-JSON gate
 then passed with exact cached-token accounting. Streaming remains ineligible and
-routes to OpenRouter. Production remains OpenRouter-only until the separately tracked
-production canary; beta selects Modal first and retains OpenRouter as its compatible
-fallback.
+routes to OpenRouter. Compatible non-streaming Kimi K3 requests select Modal first in
+both profiles and retain OpenRouter as their lowest-priority fallback. The production
+publisher still targets seren-router, so publisher rollback remains an independent,
+atomic restoration of the reviewed direct OpenRouter URL and credential.
 
 Modal remains the immutable internal provider ID for routing, health, metrics, ledger
 rows, and invoice reconciliation. Customer-facing endpoint and generation metadata use
@@ -197,17 +199,20 @@ and bounded production validation on 2026-07-30.
 
 ## Rollout and rollback
 
-The approved beta deployment uses a distinct beta Gateway credential and a new Modal
-credential held by the deployment secret manager. Moving the route into the production
-profile remains a separate bounded rollout tracked independently. Rollback is
-configuration-only:
+The approved deployment uses distinct production and beta Gateway credentials and one
+Modal credential held by the deployment secret manager. Production admission is a
+bounded canary with ten controlled JSON requests, zero request/provider errors, p95
+latency at or below 15 seconds, exact reconciliation of reported cached-token provider
+cost, no readiness loss or restart, and 100% OpenRouter selection for incompatible
+streaming, Legacy Completions, and out-of-range `top_p` probes. Rollback has two
+independent layers:
 
-1. remove `SEREN_ROUTER_BETA_GATEWAY_KEY`;
-2. disable the Modal registry row;
-3. regenerate AgentGateway config and roll back the deployment; and
-4. revoke the Modal proxy token after traffic is confirmed at zero.
+1. atomically restore the production publisher to the reviewed direct OpenRouter URL
+   and encrypted credential; and
+2. remove Modal from the production profile, regenerate AgentGateway config, and roll
+   back the resource-scoped deployment if the route itself must be disabled.
 
-No production publisher or OpenRouter mapping is edited for this trial.
+The beta credential and route remain intact during a production-only rollback.
 
 ## Primary evidence
 

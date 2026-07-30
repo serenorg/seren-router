@@ -101,17 +101,14 @@ impl Settings {
             .find(|provider| provider.id == PROVIDER_ID)
             .cloned()
             .expect("the checked registry must contain the internal modal provider");
-        assert!(
-            modal.enabled,
-            "the checked Modal beta route must be enabled"
-        );
+        assert!(modal.enabled, "the checked Modal route must be enabled");
         assert!(
             modal.supports(RoutingProfile::Beta),
             "the modal provider must support the beta profile"
         );
         assert!(
-            !modal.supports(RoutingProfile::Production),
-            "the modal provider must remain excluded from production"
+            modal.supports(RoutingProfile::Production),
+            "the modal provider must support the production canary"
         );
         assert_eq!(
             modal.secret_env, MODAL_KEY_ENV,

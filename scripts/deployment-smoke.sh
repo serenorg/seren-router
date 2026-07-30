@@ -111,8 +111,10 @@ production_kimi="$(
 )"
 grep -Fq '"provider_name":"OpenRouter"' <<<"$production_kimi" \
     || die "production Kimi catalog omitted the OpenRouter fallback"
-if grep -Fq '"provider_name":"Seren Inference"' <<<"$production_kimi"; then
-    die "production Kimi catalog exposed the beta provider"
+grep -Fq '"provider_name":"Seren Inference"' <<<"$production_kimi" \
+    || die "production Kimi catalog omitted the active neutral direct route"
+if grep -iq 'modal' <<<"$production_kimi"; then
+    die "production Kimi catalog exposed the internal provider brand"
 fi
 
 beta_kimi="$(
