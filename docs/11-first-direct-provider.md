@@ -95,6 +95,36 @@ expiry at `2026-08-29T00:49:43Z`. The credential is stored in the approved priva
 secret boundary and its value is absent from source, rendered configuration, logs,
 and evidence.
 
+## Live activation evidence
+
+The funded gate passed on 2026-07-30 through the credential-bound beta route.
+Two direct preflight requests proved JSON and SSE compatibility before deployment:
+both returned 15 prompt tokens, 2 completion tokens, terminal usage, and exact
+`$0.00000214` provider cost; SSE emitted exactly one `[DONE]`.
+
+The deployed canary then completed 10 valid requests: 5 JSON and 5 SSE, with zero
+errors. The requests used 169 prompt and 47 completion tokens, averaged
+1,174.260 ms, and recorded `$0.0000319400` exact provider cost against
+`$0.0000407700` route-independent sell cost. Every response selected DeepInfra,
+and every generation row recorded `provider_name = deepinfra`. The SSE responses
+all included terminal usage and exactly one `[DONE]`.
+
+The authenticated catalogs remained profile-isolated: production exposed only
+OpenRouter for the Llama slug, while beta exposed DeepInfra first and OpenRouter
+second. Both advertised the invariant `$0.13` input and `$0.40` output sell
+prices per million tokens. A production credential carrying both a forged
+`x-seren-routing-profile: beta` header and a forged request-body profile still
+selected OpenRouter.
+
+Rollback was exercised at the immutable previous GitOps revision. It disabled
+the DeepInfra registry row, removed the runtime secret reference, kept both
+replicas healthy, and caused the beta publisher to serve the same slug through
+OpenRouter. Restoring the approved revision returned the next beta generation
+to DeepInfra at 382 ms. The final deployment has two Ready replicas in separate
+availability zones, zero restarts, healthy PDB and EndpointSlices, successful
+keep-warm execution, 200 liveness/readiness, and no serious router or
+AgentGateway log lines.
+
 ## Candidate no-go decisions
 
 ### Together — no-go for this canary
@@ -130,8 +160,8 @@ Issue #59 owns the following activation record:
    are 200 concurrent requests and 1.1M TPM.
 5. **Resolved in #58:** keep the reviewed OpenRouter-equivalent sell price,
    preserve exact provider cost separately, and let Gateway apply its 5% once.
-6. **Pending funded gate:** run JSON, SSE, schema, usage-cost,
-   provider-attribution, failover, and zero-cross-profile-leakage tests through the
-   beta credential only.
+6. **Satisfied:** JSON, SSE, terminal usage, exact provider/sell cost,
+   provider attribution, profile isolation, bounded canary, failover, and
+   rollback/restore passed through the beta credential.
 7. **Enforced in registry:** OpenRouter stays enabled for both profiles as the
    immediate fallback; the production publisher is not altered by this beta.

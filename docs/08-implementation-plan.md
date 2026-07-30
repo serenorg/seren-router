@@ -68,9 +68,12 @@ Phased so each step is independently shippable and reversible. The guiding princ
   Llama-only credential with a $5 lifetime cap, record the live 200-request /
   1.1M-TPM limits, and enable the route for the credential-bound beta profile
   only (2026-07-30).
-- [ ] Pass the funded live JSON/SSE compatibility and bounded beta canary gate.
-- [ ] Confirm lower provider cost, invariant sell-price `usage.cost`, and
-  equal/better reliability; shift its slugs off the fallback.
+- [x] Pass the funded live JSON/SSE compatibility and bounded beta canary gate:
+  10/10 valid requests, exact provider/sell accounting, terminal SSE usage,
+  profile isolation, OpenRouter failover, and rollback/restore (2026-07-30).
+- [x] Confirm lower provider cost and invariant sell-price `usage.cost`; make
+  DeepInfra the beta-primary Llama route while retaining OpenRouter as the
+  immediate fallback (2026-07-30).
 - [ ] Repeat: Fireworks, Blackbox, Novita, Baseten, … (prioritize by traffic volume × margin gain).
 - [ ] Implement the routing policy in full (`docs/02`): outage gate, inverse-square price weighting, `sort` modes, `:nitro`/`:floor`, failover.
 - [x] Stand up the per-request provider-cost/sell-price ledger and reconciliation
