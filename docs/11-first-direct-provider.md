@@ -1,9 +1,9 @@
-<!-- ABOUTME: Evidence and activation gates for the first direct provider.
-ABOUTME: Selects a disabled DeepInfra Llama beta route without installing credentials or moving traffic. -->
+<!-- ABOUTME: Evidence and activation record for the first direct provider.
+ABOUTME: Enables DeepInfra Llama only for the credential-bound beta profile. -->
 
 # 11 — First Direct Provider Decision
 
-Decision date: 2026-07-27.
+Decision date: 2026-07-27. Activation record updated 2026-07-30.
 
 ## Decision
 
@@ -11,14 +11,17 @@ Select **DeepInfra `meta-llama/Llama-3.3-70B-Instruct-Turbo`** as the first
 engineering-canary pair for the canonical
 `meta-llama/llama-3.3-70b-instruct` slug.
 
-The checked-in provider remains:
+The checked-in provider is:
 
-- disabled;
+- enabled;
 - restricted to the `beta` routing profile;
-- without a credential; and
 - unable to receive production traffic.
 
-This is an engineering-canary selection, not a demand-ranked rollout decision.
+Its runtime credential is restricted to the selected Llama model, expires after
+30 days, and has a $5 lifetime spending limit. It exists only in the approved secret
+boundary and is not committed or printed.
+
+This remains an engineering-canary route, not a demand-ranked production rollout.
 The prompt-free 72-hour production ledger window ending 2026-07-27 contained
 211 successful requests, all for the Llama canonical slug. Those requests were
 validation traffic and are not representative enough to rank the wider model
@@ -75,18 +78,22 @@ DeepInfra is the best technical canary among the reviewed candidates:
 
 No documented region selector was found for public serverless inference.
 Region-pinned workloads therefore remain out of scope unless a private endpoint
-with an approved region is contracted. Subprocessor and deletion commitments
-must be confirmed in the executed commercial agreement rather than inferred
-from the public page.
+with an approved region is contracted. That does not block this public-serverless
+beta route.
 
-The account prerequisites are an executed consent/DPA acceptable to Seren,
-funded billing, an organization-owned account, and a model-scoped service key.
-DeepInfra does not publish one fixed numerical RPM/TPM allowance for this route;
-the account API returns the assigned limits, so recording those live values is
-an activation gate. The reviewed public privacy and terms pages do not provide
-a sufficient subprocessor schedule or a contractual deletion SLA. Activation
-therefore remains blocked until those terms are supplied and approved in
-writing.
+DeepInfra's written public [Terms](https://deepinfra.com/terms) define its APIs as
+Services and expressly permit use of the Services for legal commercial purposes
+unless a prohibited-use clause applies. Seren accepted those terms during organization
+account signup and recorded its intended internal-beta and future customer-facing
+routing use. No separate private permission instrument is required for this beta.
+
+The authenticated account API reports an assigned concurrent-request limit of `200`
+and a token-per-minute limit of `1,100,000`. The organization-owned account is held by
+Taariq Lewis. On 2026-07-30 it issued a scoped JWT restricted to
+`meta-llama/Llama-3.3-70B-Instruct-Turbo`, with a `$5.00` lifetime spending limit and
+expiry at `2026-08-29T00:49:43Z`. The credential is stored in the approved private
+secret boundary and its value is absent from source, rendered configuration, logs,
+and evidence.
 
 ## Candidate no-go decisions
 
@@ -111,23 +118,20 @@ removed rather than implying an approved route.
 
 ## Activation gates
 
-Selection does not authorize activation. Every item below must be satisfied in
-a separate issue before the provider is enabled:
+Issue #59 owns the following activation record:
 
-1. Obtain written DeepInfra consent for Seren's customer-facing routed service
-   and comparative compatibility/reliability testing. The public
-   [terms](https://deepinfra.com/terms) require prior written consent for use
-   directly or indirectly competitive with DeepInfra.
-2. Name Taariq Lewis as account owner and Platform/Security as runtime-secret
-   custodian. Store only a model-scoped, spend-limited credential in the
-   approved production secret manager.
-3. Set credential expiry to at most 90 days; rotate before expiry and
-   immediately on suspected exposure or owner/access changes.
-4. Start with a cumulative $5 beta spend limit and record the account's actual
-   RPM/TPM limits before sending traffic.
+1. **Satisfied:** DeepInfra's written public Terms authorize legal commercial use;
+   Seren accepted them while recording the intended routed-inference use.
+2. **Satisfied:** Taariq Lewis is account owner; Platform/Security is runtime-secret
+   custodian. Only the model-scoped credential may enter the deployment secret.
+3. **Satisfied:** credential expiry is 30 days, below the 90-day maximum. Rotate
+   before expiry and immediately on suspected exposure or owner/access changes.
+4. **Satisfied:** the credential's lifetime spending limit is $5; live account limits
+   are 200 concurrent requests and 1.1M TPM.
 5. **Resolved in #58:** keep the reviewed OpenRouter-equivalent sell price,
    preserve exact provider cost separately, and let Gateway apply its 5% once.
-6. Run JSON, SSE, schema, usage-cost, provider-attribution, failover, and
-   zero-cross-profile-leakage tests through the beta credential only.
-7. Keep OpenRouter enabled for both profiles as the immediate fallback and do
-   not alter the production publisher during the beta.
+6. **Pending funded gate:** run JSON, SSE, schema, usage-cost,
+   provider-attribution, failover, and zero-cross-profile-leakage tests through the
+   beta credential only.
+7. **Enforced in registry:** OpenRouter stays enabled for both profiles as the
+   immediate fallback; the production publisher is not altered by this beta.

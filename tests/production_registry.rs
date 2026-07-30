@@ -15,7 +15,7 @@ use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 
 #[test]
-fn checked_registry_activates_modal_for_production_and_beta() {
+fn checked_registry_activates_modal_and_isolates_deepinfra_to_beta() {
     let registry = checked_registry();
     registry.validate().unwrap();
 
@@ -24,7 +24,7 @@ fn checked_registry_activates_modal_for_production_and_beta() {
         .iter()
         .filter(|provider| provider.enabled)
         .collect();
-    assert_eq!(enabled.len(), 2);
+    assert_eq!(enabled.len(), 3);
 
     let production_enabled: Vec<_> = enabled
         .iter()
@@ -32,6 +32,12 @@ fn checked_registry_activates_modal_for_production_and_beta() {
         .filter(|provider| provider.supports(RoutingProfile::Production))
         .collect();
     assert_eq!(production_enabled.len(), 2);
+    let beta_enabled: Vec<_> = enabled
+        .iter()
+        .copied()
+        .filter(|provider| provider.supports(RoutingProfile::Beta))
+        .collect();
+    assert_eq!(beta_enabled.len(), 3);
     let openrouter = production_enabled
         .iter()
         .copied()
@@ -112,7 +118,7 @@ fn checked_registry_activates_modal_for_production_and_beta() {
         .iter()
         .find(|provider| provider.id == "deepinfra")
         .unwrap();
-    assert!(!deepinfra.enabled);
+    assert!(deepinfra.enabled);
     assert_eq!(
         deepinfra.profiles,
         [RoutingProfile::Beta].into_iter().collect()
@@ -130,6 +136,10 @@ fn checked_registry_activates_modal_for_production_and_beta() {
     assert_eq!(deepinfra_llama.context_length, 131_072);
     assert_eq!(deepinfra_llama.input_price_per_mtok, Decimal::new(10, 2));
     assert_eq!(deepinfra_llama.output_price_per_mtok, Decimal::new(32, 2));
+    assert_eq!(
+        deepinfra_llama.request_constraints.endpoints,
+        [CompletionEndpoint::Chat].into_iter().collect()
+    );
 
     let actual: Vec<_> = openrouter
         .models
@@ -214,11 +224,19 @@ fn checked_registry_activates_modal_for_production_and_beta() {
             },
         })
     );
-    assert!(
-        prices
-            .get("deepinfra", "meta-llama/llama-3.3-70b-instruct")
-            .is_none(),
-        "disabled provider prices must not enter the live price table"
+    assert_eq!(
+        prices.get("deepinfra", "meta-llama/llama-3.3-70b-instruct"),
+        Some(&BillingPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: Decimal::new(10, 2),
+                output_price_per_mtok: Decimal::new(32, 2),
+            },
+            provider_cached_input_price_per_mtok: None,
+            sell_price: ModelPrices {
+                input_price_per_mtok: Decimal::new(13, 2),
+                output_price_per_mtok: Decimal::new(40, 2),
+            },
+        })
     );
     assert!(
         prices.get("modal", "moonshotai/kimi-k3").is_some(),
@@ -370,6 +388,69 @@ fn routing_policy_selects_modal_in_both_profiles_and_rejects_provider_selection(
 }
 
 #[test]
+fn routing_policy_selects_deepinfra_only_for_beta_with_openrouter_fallback() {
+    let registry = checked_registry();
+    let routing = RoutingPolicy::from_registry(
+        &registry,
+        RoutingConfig::new(Decimal::new(100, 0), 0.1, Decimal::ONE, 100).unwrap(),
+        MeasurementStore::default(),
+    )
+    .unwrap();
+    let slug = "meta-llama/llama-3.3-70b-instruct";
+    let mut production = json!({"model": slug, "provider": {"sort": "price"}});
+    let mut beta = production.clone();
+
+    let production_decision = routing
+        .route(RoutingProfile::Production, &mut production)
+        .unwrap();
+    assert_eq!(production_decision.selected_provider, "openrouter");
+    assert_eq!(
+        production["model"],
+        "openrouter/meta-llama/llama-3.3-70b-instruct"
+    );
+    assert_eq!(production_decision.fallback_model, None);
+    assert!(!production_decision.has_alternatives);
+
+    let beta_decision = routing.route(RoutingProfile::Beta, &mut beta).unwrap();
+    assert_eq!(beta_decision.selected_provider, "deepinfra");
+    assert_eq!(beta["model"], "deepinfra/meta-llama/llama-3.3-70b-instruct");
+    assert_eq!(
+        beta_decision.fallback_model.as_deref(),
+        Some("openrouter/meta-llama/llama-3.3-70b-instruct")
+    );
+    assert!(beta_decision.has_alternatives);
+
+    let mut production_forged = json!({
+        "model": slug,
+        "provider": {"sort": "price"},
+        "routing_profile": "beta"
+    });
+    let forged_decision = routing
+        .route(RoutingProfile::Production, &mut production_forged)
+        .unwrap();
+    assert_eq!(forged_decision.selected_provider, "openrouter");
+    assert_eq!(
+        production_forged["model"],
+        "openrouter/meta-llama/llama-3.3-70b-instruct"
+    );
+
+    let mut legacy = json!({"model": slug, "provider": {"sort": "price"}});
+    let legacy_decision = routing
+        .route_for_endpoint(
+            RoutingProfile::Beta,
+            CompletionEndpoint::Legacy,
+            &mut legacy,
+        )
+        .unwrap();
+    assert_eq!(legacy_decision.selected_provider, "openrouter");
+    assert_eq!(
+        legacy["model"],
+        "openrouter/meta-llama/llama-3.3-70b-instruct"
+    );
+    assert_eq!(legacy_decision.fallback_model, None);
+}
+
+#[test]
 fn compiled_sidecar_keeps_modal_internal_with_openrouter_fallback() {
     let registry = modal_beta_registry();
     let modal_model = &registry
@@ -437,14 +518,68 @@ fn compiled_sidecar_keeps_modal_internal_with_openrouter_fallback() {
 }
 
 #[test]
-fn direct_and_fallback_routes_keep_one_reviewed_sell_price_and_separate_costs() {
-    let mut registry = checked_registry();
-    registry
-        .providers
-        .iter_mut()
-        .find(|provider| provider.id == "deepinfra")
+fn compiled_sidecar_keeps_deepinfra_beta_only_with_openrouter_fallback() {
+    let registry = checked_registry();
+    let compiled = compile(&registry, SidecarConfigOptions::default()).unwrap();
+    let config: Value = serde_yaml::from_slice(&compiled).unwrap();
+    let models = config["llm"]["models"].as_sequence().unwrap();
+    let direct = named_entry(models, "deepinfra/meta-llama/llama-3.3-70b-instruct");
+
+    assert_eq!(direct["provider"], "openAI");
+    assert_eq!(
+        direct["params"]["baseUrl"],
+        "https://api.deepinfra.com/v1/openai"
+    );
+    assert_eq!(
+        direct["params"]["model"],
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    );
+    assert_eq!(
+        direct["overrides"]["model"],
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    );
+    assert_eq!(direct["params"]["apiKey"], "$SEREN_ROUTER_KEY_DEEPINFRA");
+    assert_eq!(
+        direct["responseHeaders"]["set"]["x-seren-served-provider"],
+        "deepinfra"
+    );
+
+    let virtual_models = config["llm"]["virtualModels"].as_sequence().unwrap();
+    let production = named_entry(
+        virtual_models,
+        "seren-profile-production/meta-llama/llama-3.3-70b-instruct",
+    );
+    let beta = named_entry(
+        virtual_models,
+        "seren-profile-beta/meta-llama/llama-3.3-70b-instruct",
+    );
+    assert_eq!(
+        production["routing"]["failover"]["targets"],
+        serde_yaml::from_str::<Value>(
+            r#"
+- model: openrouter/meta-llama/llama-3.3-70b-instruct
+  priority: 255
+"#
+        )
         .unwrap()
-        .enabled = true;
+    );
+    assert_eq!(
+        beta["routing"]["failover"]["targets"],
+        serde_yaml::from_str::<Value>(
+            r#"
+- model: deepinfra/meta-llama/llama-3.3-70b-instruct
+  priority: 0
+- model: openrouter/meta-llama/llama-3.3-70b-instruct
+  priority: 255
+"#
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn direct_and_fallback_routes_keep_one_reviewed_sell_price_and_separate_costs() {
+    let registry = checked_registry();
     let prices = PriceTable::from_registry(&registry).unwrap();
     let slug = "meta-llama/llama-3.3-70b-instruct";
     let fallback = prices.get("openrouter", slug).unwrap();

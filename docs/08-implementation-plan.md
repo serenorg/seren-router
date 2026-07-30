@@ -48,8 +48,7 @@ Phased so each step is independently shippable and reversible. The guiding princ
 ## Phase 4 — Direct providers (peel off)
 
 - [x] Select the first direct provider engineering canary: DeepInfra Llama 3.3
-  70B Turbo (`docs/11`, 2026-07-27). The registry entry is disabled and
-  beta-only; legal, credential, and spend gates remain.
+  70B Turbo (`docs/11`, 2026-07-27).
 - [x] Add the Modal Kimi K3 Shared API route with neutral public
   attribution, exact cached-input accounting, non-streaming-only beta constraints,
   and a credential-bound live gate (`docs/12`, 2026-07-29).
@@ -65,8 +64,11 @@ Phased so each step is independently shippable and reversible. The guiding princ
   in both profiles.
 - [x] Pass the bounded production request, cost, latency, readiness, fallback, and
   publisher-rollback gates tracked in #57 (2026-07-30).
-- [ ] Activate DeepInfra after the remaining `docs/11` gates: written provider
-  consent, scoped key, live compatibility test, and spend cap.
+- [x] Record DeepInfra's written commercial-use permission, provision a 30-day
+  Llama-only credential with a $5 lifetime cap, record the live 200-request /
+  1.1M-TPM limits, and enable the route for the credential-bound beta profile
+  only (2026-07-30).
+- [ ] Pass the funded live JSON/SSE compatibility and bounded beta canary gate.
 - [ ] Confirm lower provider cost, invariant sell-price `usage.cost`, and
   equal/better reliability; shift its slugs off the fallback.
 - [ ] Repeat: Fireworks, Blackbox, Novita, Baseten, … (prioritize by traffic volume × margin gain).

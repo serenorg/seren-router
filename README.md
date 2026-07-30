@@ -38,7 +38,7 @@ as of 2026-07-25. The service uses the standard Seren Rust chassis and is built 
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
 verified evaluation). The OpenRouter-only image was deployed to the existing production
 environment and passed its bounded canary on 2026-07-26. The repository also carries
-a credential-isolated Kimi K3 route for the beta profile. Its revised
+a credential-isolated Kimi K3 route. Its revised
 JSON-only live gate passed on 2026-07-29 with exact cached-token accounting; streaming
 remains ineligible because the first bounded run omitted terminal streaming usage.
 Taariq confirmed Modal permission and approved beta activation and a bounded production
@@ -46,7 +46,9 @@ canary on 2026-07-30. The production gate passed after exercising the atomic
 direct-OpenRouter publisher rollback and an isolated beta pre-warm. The checked route
 is enabled for production and credential-bound beta traffic. Compatible non-streaming
 Kimi K3 requests select Modal first, while OpenRouter remains the lowest-priority
-fallback in both profiles.
+fallback in both profiles. DeepInfra Llama 3.3 70B is enabled only for the
+credential-bound beta profile with OpenRouter as its immediate fallback; production
+Llama remains OpenRouter-only.
 
 ## Service development
 
@@ -87,10 +89,10 @@ curl http://127.0.0.1:8000/readyz
 above are required. The router deliberately has no unreviewed production defaults for
 the price ceiling, hysteresis, provider max share, or rolling share-window size.
 The AgentGateway sidecar requires `SEREN_ROUTER_KEY_OPENROUTER` while the checked-in
-OpenRouter fallback provider is enabled. A deployment that enables the checked-in beta
-route also requires `SEREN_ROUTER_KEY_MODAL`. Inject both from the deployment secret
-manager and never store either value in the registry, rendered configuration, or
-seren-router app container.
+OpenRouter fallback provider is enabled. The enabled direct routes also require
+`SEREN_ROUTER_KEY_MODAL` and `SEREN_ROUTER_KEY_DEEPINFRA`. Inject all provider
+credentials from the deployment secret manager into AgentGateway only; never store
+their values in the registry, rendered configuration, or seren-router app container.
 Startup opens a lazy PostgreSQL pool, binds the HTTP listener without waiting for the
 generation ledger, and retries embedded migrations in an event-driven background
 supervisor. `/readyz` requires AgentGateway and reports PostgreSQL as `starting`, `ok`,
