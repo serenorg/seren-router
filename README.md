@@ -48,7 +48,9 @@ is enabled for production and credential-bound beta traffic. Compatible non-stre
 Kimi K3 requests select Modal first, while OpenRouter remains the lowest-priority
 fallback in both profiles. DeepInfra Llama 3.3 70B is enabled only for the
 credential-bound beta profile with OpenRouter as its immediate fallback; production
-Llama remains OpenRouter-only.
+Llama remains OpenRouter-only. Its funded 10-request JSON/SSE canary, exact
+provider/sell accounting, production isolation, OpenRouter failover, and
+rollback/restore gates passed on 2026-07-30.
 
 ## Service development
 
