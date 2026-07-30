@@ -1,5 +1,5 @@
 // ABOUTME: Builds OpenRouter-shaped model and endpoint catalogs from enabled registry mappings.
-// ABOUTME: Serves deterministic snapshots with reviewed customer sell prices.
+// ABOUTME: Serves deterministic snapshots with exact provider prices.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use crate::registry::{ModelMapping, Provider, Registry, SellPrice};
+use crate::registry::{ModelMapping, Provider, Registry};
 use crate::routing_profile::RoutingProfile;
 
 const TOKENS_PER_MILLION: u64 = 1_000_000;
@@ -62,13 +62,9 @@ impl CatalogSnapshot {
             .filter(|provider| provider.enabled && provider.supports(profile))
         {
             for mapping in &provider.models {
-                let sell_price = registry
-                    .sell_price(&mapping.slug)
-                    .expect("validated registry has a sell price for every model");
                 let candidate = CatalogCandidate {
                     provider_id: &provider.id,
                     mapping,
-                    sell_price,
                 };
                 cheapest_by_slug
                     .entry(mapping.slug.clone())
@@ -81,11 +77,7 @@ impl CatalogSnapshot {
                 endpoints_by_slug
                     .entry(mapping.slug.clone())
                     .or_default()
-                    .push(EndpointCandidate {
-                        provider,
-                        mapping,
-                        sell_price,
-                    });
+                    .push(EndpointCandidate { provider, mapping });
             }
         }
 
@@ -151,7 +143,6 @@ impl CatalogSnapshot {
 struct CatalogCandidate<'a> {
     provider_id: &'a str,
     mapping: &'a ModelMapping,
-    sell_price: &'a SellPrice,
 }
 
 impl<'a> CatalogCandidate<'a> {
@@ -174,8 +165,8 @@ impl<'a> CatalogCandidate<'a> {
             name: self.mapping.name.clone(),
             context_length: self.mapping.context_length,
             pricing: CatalogPricing {
-                prompt: per_token_price(self.sell_price.input_price_per_mtok),
-                completion: per_token_price(self.sell_price.output_price_per_mtok),
+                prompt: per_token_price(self.mapping.input_price_per_mtok),
+                completion: per_token_price(self.mapping.output_price_per_mtok),
             },
         }
     }
@@ -185,7 +176,6 @@ impl<'a> CatalogCandidate<'a> {
 struct EndpointCandidate<'a> {
     provider: &'a Provider,
     mapping: &'a ModelMapping,
-    sell_price: &'a SellPrice,
 }
 
 impl<'a> EndpointCandidate<'a> {
@@ -208,8 +198,8 @@ impl<'a> EndpointCandidate<'a> {
             model_name: self.mapping.name.clone(),
             context_length: self.mapping.context_length,
             pricing: CatalogPricing {
-                prompt: per_token_price(self.sell_price.input_price_per_mtok),
-                completion: per_token_price(self.sell_price.output_price_per_mtok),
+                prompt: per_token_price(self.mapping.input_price_per_mtok),
+                completion: per_token_price(self.mapping.output_price_per_mtok),
             },
             provider_name: self.provider.catalog_display_name().to_owned(),
             tag: self.provider.catalog_tag().to_owned(),
@@ -369,8 +359,8 @@ mod tests {
                             "model_name": "Claude Opus 5 Fast Alternate",
                             "context_length": 750000,
                             "pricing": {
-                                "prompt": "0.00001",
-                                "completion": "0.00005"
+                                "prompt": "0.000005",
+                                "completion": "0.00007"
                             },
                             "provider_name": "Cheap Input Provider",
                             "tag": "cheap-input"

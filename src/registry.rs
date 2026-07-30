@@ -1,4 +1,4 @@
-// ABOUTME: Defines providers, their costs, and route-independent customer sell prices.
+// ABOUTME: Defines providers, their exact costs, and compatible request constraints.
 // ABOUTME: Validates reviewable registry metadata before sidecar config compilation.
 
 use std::collections::{BTreeSet, HashSet};
@@ -12,16 +12,7 @@ use crate::routing_profile::RoutingProfile;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
-    pub sell_prices: Vec<SellPrice>,
     pub providers: Vec<Provider>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SellPrice {
-    pub slug: String,
-    pub input_price_per_mtok: Decimal,
-    pub output_price_per_mtok: Decimal,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,12 +108,6 @@ impl RequestConstraints {
 
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum RegistryValidationError {
-    #[error("duplicate sell price for model {0}")]
-    DuplicateSellPrice(String),
-    #[error("negative {price_side} sell price for model {slug}")]
-    NegativeSellPrice { slug: String, price_side: PriceSide },
-    #[error("model {slug} for provider {provider_id} has no reviewed sell price")]
-    MissingSellPrice { provider_id: String, slug: String },
     #[error("duplicate provider id: {0}")]
     DuplicateProviderId(String),
     #[error("provider {0} has an empty public display name")]
@@ -169,26 +154,6 @@ impl std::fmt::Display for PriceSide {
 
 impl Registry {
     pub fn validate(&self) -> Result<(), RegistryValidationError> {
-        let mut sell_price_slugs = HashSet::with_capacity(self.sell_prices.len());
-        for sell_price in &self.sell_prices {
-            if !sell_price_slugs.insert(sell_price.slug.as_str()) {
-                return Err(RegistryValidationError::DuplicateSellPrice(
-                    sell_price.slug.clone(),
-                ));
-            }
-            for (price_side, price) in [
-                (PriceSide::Input, sell_price.input_price_per_mtok),
-                (PriceSide::Output, sell_price.output_price_per_mtok),
-            ] {
-                if price < Decimal::ZERO {
-                    return Err(RegistryValidationError::NegativeSellPrice {
-                        slug: sell_price.slug.clone(),
-                        price_side,
-                    });
-                }
-            }
-        }
-
         let mut provider_ids = HashSet::with_capacity(self.providers.len());
 
         for provider in &self.providers {
@@ -227,12 +192,6 @@ impl Registry {
             }
 
             for mapping in &provider.models {
-                if !sell_price_slugs.contains(mapping.slug.as_str()) {
-                    return Err(RegistryValidationError::MissingSellPrice {
-                        provider_id: provider.id.clone(),
-                        slug: mapping.slug.clone(),
-                    });
-                }
                 if mapping.name.trim().is_empty() {
                     return Err(RegistryValidationError::EmptyModelName {
                         provider_id: provider.id.clone(),
@@ -267,12 +226,6 @@ impl Registry {
         }
 
         Ok(())
-    }
-
-    pub fn sell_price(&self, slug: &str) -> Option<&SellPrice> {
-        self.sell_prices
-            .iter()
-            .find(|sell_price| sell_price.slug == slug)
     }
 }
 
@@ -317,10 +270,6 @@ mod tests {
     use super::*;
 
     const TWO_PROVIDER_YAML: &str = r#"
-sell_prices:
-  - slug: meta-llama/llama-3.3-70b-instruct
-    input_price_per_mtok: "1.00"
-    output_price_per_mtok: "2.00"
 providers:
   - id: openrouter
     display_name: OpenRouter
@@ -473,38 +422,6 @@ providers:
             Err(RegistryValidationError::DuplicateProviderId(
                 "openrouter".to_owned()
             ))
-        );
-    }
-
-    #[test]
-    fn duplicate_negative_and_missing_sell_prices_are_rejected() {
-        let mut duplicate: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
-        duplicate.sell_prices.push(duplicate.sell_prices[0].clone());
-        assert_eq!(
-            duplicate.validate(),
-            Err(RegistryValidationError::DuplicateSellPrice(
-                "meta-llama/llama-3.3-70b-instruct".to_owned()
-            ))
-        );
-
-        let mut negative: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
-        negative.sell_prices[0].output_price_per_mtok = "-0.01".parse().unwrap();
-        assert_eq!(
-            negative.validate(),
-            Err(RegistryValidationError::NegativeSellPrice {
-                slug: "meta-llama/llama-3.3-70b-instruct".to_owned(),
-                price_side: PriceSide::Output,
-            })
-        );
-
-        let mut missing: Registry = serde_yaml::from_str(TWO_PROVIDER_YAML).unwrap();
-        missing.sell_prices.clear();
-        assert_eq!(
-            missing.validate(),
-            Err(RegistryValidationError::MissingSellPrice {
-                provider_id: "openrouter".to_owned(),
-                slug: "meta-llama/llama-3.3-70b-instruct".to_owned(),
-            })
         );
     }
 

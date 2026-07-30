@@ -31,8 +31,8 @@ One Kubernetes pod contains two long-running containers and one init container:
    It receives provider-key environment variables from Kubernetes Secrets and listens
    on localhost ports 4000 (LLM) and 19001 (readiness). The checked-in production
    fallback uses `SEREN_ROUTER_KEY_OPENROUTER`; enabled direct routes also require
-   `SEREN_ROUTER_KEY_MODAL`, `SEREN_ROUTER_KEY_DEEPINFRA`, and
-   `SEREN_ROUTER_KEY_BLACKBOX`.
+   `SEREN_ROUTER_KEY_MODAL`, `SEREN_ROUTER_KEY_DEEPINFRA`,
+   `SEREN_ROUTER_KEY_DEEPINFRA_GLM`, and `SEREN_ROUTER_KEY_BLACKBOX`.
 
 3. **seren-router app** — the production image runs its default command on port 8000,
    receives the Gateway key and database URL from Secrets, and reads the same registry
@@ -51,10 +51,13 @@ returned by a catalog route, or written into the rendered YAML.
 `meta-llama/Llama-3.3-70B-Instruct-Turbo` with a $5 lifetime spending limit. It follows
 the same AgentGateway-only mount boundary and must be rotated before its
 2026-08-29 expiry.
+`SEREN_ROUTER_KEY_DEEPINFRA_GLM` is a separate 30-day scoped JWT restricted to
+`zai-org/GLM-5.2`, also with a $5 lifetime spending limit. DeepInfra does not permit a
+spend-limited token to cover multiple models, so the checked registry uses distinct
+credential boundaries rather than dropping the cap. Rotate it before its 2026-08-29
+expiry.
 `SEREN_ROUTER_KEY_BLACKBOX` is the `$1` monthly-capped key created for the
-credential-bound internal GLM 5.2 beta route. It follows the same AgentGateway-only
-mount boundary. The standard Blackbox account must not be exposed to production or
-customer traffic.
+credential-bound GLM 5.2 route. It follows the same AgentGateway-only mount boundary.
 
 The exact security context, service account, namespace, resource requests, replica
 count, disruption budget, topology spread, and secret references belong in the
@@ -97,8 +100,8 @@ does not alter the production OpenRouter route set.
 
 The sidecar additionally requires the environment variables named by every enabled
 provider row. The checked registry requires `SEREN_ROUTER_KEY_OPENROUTER`,
-`SEREN_ROUTER_KEY_MODAL`, `SEREN_ROUTER_KEY_DEEPINFRA`, and
-`SEREN_ROUTER_KEY_BLACKBOX`.
+`SEREN_ROUTER_KEY_MODAL`, `SEREN_ROUTER_KEY_DEEPINFRA`,
+`SEREN_ROUTER_KEY_DEEPINFRA_GLM`, and `SEREN_ROUTER_KEY_BLACKBOX`.
 
 The readiness URL accepts only HTTP(S), must have a host, and rejects credentials,
 queries, and fragments.
@@ -132,9 +135,9 @@ network namespace between app and sidecar to reproduce pod-localhost behavior:
 
 It verifies renderer exit status, secret references without resolved values,
 PostgreSQL migrations, inference `/readyz`, dependency-free `/livez`, production
-`/metrics`, a production catalog containing only OpenRouter, and a beta catalog
-containing the neutral direct route plus OpenRouter fallback. The deployment smoke
-uses fixture-only credentials and sends no provider request.
+`/metrics`, and production/beta catalogs containing each reviewed direct route plus
+its OpenRouter fallback. The deployment smoke uses fixture-only credentials and sends
+no provider request.
 
 Production metrics also expose
 `seren_router_proxy_segment_duration_seconds{endpoint,profile,provider,segment}` for successful

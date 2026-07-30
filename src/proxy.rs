@@ -1,5 +1,5 @@
 // ABOUTME: Proxies authenticated completion requests through the agentgateway sidecar.
-// ABOUTME: Adds the reviewed customer sell subtotal to JSON and terminal SSE usage.
+// ABOUTME: Adds exact served-provider cost to JSON and terminal SSE usage.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -237,13 +237,7 @@ async fn forward(
             selected_provider = decision.selected_provider,
             "successful sidecar response omitted served-provider attribution"
         );
-        if response_uses_public_alias {
-            return aliased_upstream_error(
-                StatusCode::BAD_GATEWAY,
-                &decision.canonical_model,
-                None,
-            );
-        }
+        return aliased_upstream_error(StatusCode::BAD_GATEWAY, &decision.canonical_model, None);
     }
 
     if !status.is_success() {
@@ -260,63 +254,59 @@ async fn forward(
     }
 
     if stream && is_event_stream {
-        let priced_stream = served_provider.as_ref().and_then(|served_provider| {
-            match prices_for_request(
-                &decision.canonical_model,
-                served_provider,
-                &proxy.price_table,
-            ) {
-                Ok(prices) => Some((served_provider, prices.clone())),
-                Err(reason) => {
-                    tracing::warn!(
-                        reason = %reason,
-                        routing_profile = %decision.profile,
-                        requested_model = decision.canonical_model,
-                        served_provider = served_provider.as_str(),
-                        "streaming response cost was omitted"
-                    );
-                    None
-                }
-            }
-        });
-        let body = match priced_stream {
-            Some((served_provider, prices)) => {
-                let generation = GenerationContext::new(
-                    proxy.ledger.clone(),
-                    proxy.measurements(),
-                    &decision.canonical_model,
-                    served_provider,
-                    status,
-                    GenerationTiming::streaming(
-                        request_started_at,
-                        upstream.attempt_started_at,
-                        upstream.headers_received_at,
-                        profile,
-                    ),
-                    endpoint.label(),
+        let served_provider = served_provider
+            .as_ref()
+            .expect("successful responses without attribution already returned");
+        let prices = match prices_for_request(
+            &decision.canonical_model,
+            served_provider,
+            &proxy.price_table,
+        ) {
+            Ok(prices) => prices.clone(),
+            Err(reason) => {
+                tracing::warn!(
+                    reason = %reason,
+                    routing_profile = %decision.profile,
+                    requested_model = decision.canonical_model,
+                    served_provider = served_provider.as_str(),
+                    "streaming response cost was rejected"
                 );
-                let transformer = if response_uses_public_alias {
-                    UsageCostTransformer::new(prices).with_response_model(&decision.canonical_model)
-                } else {
-                    UsageCostTransformer::new(prices)
-                };
-                Body::from_stream(stream_with_response_transformer(
-                    response.bytes_stream(),
-                    transformer,
-                    Some(generation),
-                ))
+                return aliased_upstream_error(
+                    StatusCode::BAD_GATEWAY,
+                    &decision.canonical_model,
+                    Some(served_provider.clone()),
+                );
             }
-            None if response_uses_public_alias => {
-                Body::from_stream(stream_with_response_transformer(
-                    response.bytes_stream(),
-                    UsageCostTransformer::model_only(&decision.canonical_model),
-                    None,
-                ))
-            }
-            None => Body::from_stream(response.bytes_stream()),
         };
+        let generation = GenerationContext::new(
+            proxy.ledger.clone(),
+            proxy.measurements(),
+            &decision.canonical_model,
+            served_provider,
+            status,
+            GenerationTiming::streaming(
+                request_started_at,
+                upstream.attempt_started_at,
+                upstream.headers_received_at,
+                profile,
+            ),
+            endpoint.label(),
+        );
+        let transformer =
+            UsageCostTransformer::new(prices).with_response_model(&decision.canonical_model);
+        let body = Body::from_stream(stream_with_response_transformer(
+            response.bytes_stream(),
+            transformer,
+            Some(generation),
+        ));
 
-        return downstream_response(status, content_type, generation_id, body, served_provider);
+        return downstream_response(
+            status,
+            content_type,
+            generation_id,
+            body,
+            Some(served_provider.clone()),
+        );
     }
 
     let upstream_body = match response.bytes().await {
@@ -392,14 +382,11 @@ async fn forward(
                         served_provider = served_provider.as_str(),
                         "non-streaming response cost was omitted"
                     );
-                    if response_uses_public_alias {
-                        return aliased_upstream_error(
-                            StatusCode::BAD_GATEWAY,
-                            &decision.canonical_model,
-                            Some(served_provider.clone()),
-                        );
-                    }
-                    upstream_body
+                    return aliased_upstream_error(
+                        StatusCode::BAD_GATEWAY,
+                        &decision.canonical_model,
+                        Some(served_provider.clone()),
+                    );
                 }
             }
         }
@@ -433,28 +420,29 @@ async fn send_selected_then_fallback(
     selected_body: Vec<u8>,
     decision: &RouteDecision,
 ) -> Result<UpstreamResponse, reqwest::Error> {
-    let selected = send_attempt(client, url, selected_body).await;
-    let Some(fallback_model) = decision.fallback_model.as_ref() else {
-        return selected;
-    };
-    let should_fallback = match &selected {
-        Ok(upstream) => retryable_status(upstream.response.status()),
-        Err(_) => true,
-    };
-    if !should_fallback {
-        return selected;
-    }
+    let mut upstream = send_attempt(client, url, selected_body).await;
+    for fallback_model in &decision.fallback_models {
+        let should_fallback = match &upstream {
+            Ok(upstream) => retryable_status(upstream.response.status()),
+            Err(_) => true,
+        };
+        if !should_fallback {
+            return upstream;
+        }
 
-    tracing::warn!(
-        selected_provider = decision.selected_provider,
-        routing_profile = %decision.profile,
-        canonical_model = decision.canonical_model,
-        "selected provider failed before response commit; retrying through sidecar failover"
-    );
-    request["model"] = Value::String(fallback_model.clone());
-    let fallback_body =
-        serde_json::to_vec(&request).expect("a parsed JSON completion request serializes");
-    send_attempt(client, url, fallback_body).await
+        tracing::warn!(
+            failed_model = request["model"].as_str(),
+            fallback_model,
+            routing_profile = %decision.profile,
+            canonical_model = decision.canonical_model,
+            "provider failed before response commit; retrying the next compatible route"
+        );
+        request["model"] = Value::String(fallback_model.clone());
+        let fallback_body =
+            serde_json::to_vec(&request).expect("a parsed JSON completion request serializes");
+        upstream = send_attempt(client, url, fallback_body).await;
+    }
+    upstream
 }
 
 async fn send_attempt(
@@ -752,20 +740,10 @@ impl GenerationContext {
             provider_id: self.provider_id,
             prompt_tokens,
             completion_tokens,
-            provider_cost_usd: costed.provider_cost_usd,
-            sell_price_usd: costed.sell_price_usd,
+            cost_usd: costed.cost_usd,
             latency_ms,
             status: i16::try_from(self.status.as_u16()).expect("HTTP status fits in SMALLINT"),
         };
-        if generation.provider_cost_usd.is_none() {
-            tracing::warn!(
-                generation_id = generation.id,
-                routing_profile = %generation.routing_profile,
-                provider_id = generation.provider_id,
-                canonical_slug = generation.canonical_slug,
-                "generation provider cost is unresolved"
-            );
-        }
         let ledger = self.ledger;
 
         tokio::spawn(async move {
@@ -925,14 +903,70 @@ fn invalid_json_request() -> Response {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
 
+    use axum::Router;
     use axum::body::to_bytes;
+    use axum::routing::post;
     use rust_decimal::Decimal;
     use serde_json::Value;
 
     use super::*;
-    use crate::registry::{ModelMapping, Provider, Registry, SellPrice};
+    use crate::registry::{ModelMapping, Provider, Registry};
     use crate::usage_cost::CostOmission;
+
+    #[tokio::test]
+    async fn selected_request_retries_every_compatible_fallback_in_order() {
+        async fn sequenced_response(
+            State(models): State<Arc<Mutex<Vec<String>>>>,
+            Json(body): Json<Value>,
+        ) -> StatusCode {
+            let mut models = models.lock().unwrap();
+            models.push(body["model"].as_str().unwrap().to_owned());
+            match models.len() {
+                1 => StatusCode::INTERNAL_SERVER_ERROR,
+                2 => StatusCode::BAD_GATEWAY,
+                _ => StatusCode::OK,
+            }
+        }
+
+        let models = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(sequenced_response))
+            .with_state(models.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = Url::parse(&format!("http://{address}/v1/chat/completions")).unwrap();
+        let request = serde_json::json!({"model": "primary/canonical/model"});
+        let selected_body = serde_json::to_vec(&request).unwrap();
+        let decision = RouteDecision {
+            profile: RoutingProfile::Production,
+            canonical_model: "canonical/model".to_owned(),
+            selected_provider: "primary".to_owned(),
+            fallback_models: vec![
+                "secondary/canonical/model".to_owned(),
+                "openrouter/canonical/model".to_owned(),
+            ],
+            has_alternatives: true,
+        };
+
+        let upstream =
+            send_selected_then_fallback(&Client::new(), &url, request, selected_body, &decision)
+                .await
+                .unwrap();
+
+        assert_eq!(upstream.response.status(), StatusCode::OK);
+        assert_eq!(
+            *models.lock().unwrap(),
+            [
+                "primary/canonical/model",
+                "secondary/canonical/model",
+                "openrouter/canonical/model",
+            ]
+        );
+        server.abort();
+    }
 
     #[test]
     fn real_non_streaming_response_gains_exact_usage_cost() {
@@ -964,15 +998,14 @@ mod tests {
                     prompt_tokens: 16,
                     completion_tokens: 3,
                 },
-                provider_cost_usd: Some("0.0000022000".parse().unwrap()),
-                sell_price_usd: "0.0000088000".parse().unwrap(),
+                cost_usd: "0.0000022000".parse().unwrap(),
             }
         );
         assert!(expected.get("provider").is_none());
     }
 
     #[test]
-    fn cached_prompt_response_uses_exact_provider_cost_and_full_sell_price() {
+    fn cached_prompt_response_uses_exact_provider_cost() {
         let body = include_bytes!("../tests/fixtures/nonstreaming_cached_chat_response.json");
         let expected: Value = serde_json::from_slice(include_bytes!(
             "../tests/golden/nonstreaming_cached_chat_cost.json"
@@ -1001,14 +1034,71 @@ mod tests {
                     prompt_tokens: 100,
                     completion_tokens: 10,
                 },
-                provider_cost_usd: Some("0.0003420000".parse().unwrap()),
-                sell_price_usd: "0.0006000000".parse().unwrap(),
+                cost_usd: "0.0003420000".parse().unwrap(),
             }
         );
     }
 
     #[test]
-    fn unresolved_cached_prompt_usage_keeps_exact_sell_price_and_ledger_metadata() {
+    fn exact_provider_reported_cost_takes_precedence_over_registry_estimates() {
+        let body = br#"{
+            "id":"chatcmpl-provider-cost",
+            "usage":{
+                "prompt_tokens":41,
+                "completion_tokens":128,
+                "cost":0.00034092
+            }
+        }"#;
+        let price_table = test_price_table_with_cached_price(Some(Decimal::new(30, 2)));
+        let served_provider = served_provider("local");
+
+        let transformed = inject_usage_cost(
+            body,
+            "local/functional-model",
+            &served_provider,
+            &price_table,
+        )
+        .unwrap();
+        let response: Value = serde_json::from_slice(&transformed.body).unwrap();
+
+        assert_eq!(
+            response["usage"]["cost"]
+                .as_number()
+                .expect("usage.cost must be a JSON number")
+                .to_string(),
+            "0.0003409200"
+        );
+        assert_eq!(
+            transformed.usage.cost_usd.to_string(),
+            "0.0003409200",
+            "the exact provider-reported amount must be preserved at ledger scale"
+        );
+    }
+
+    #[test]
+    fn invalid_provider_reported_cost_fails_closed() {
+        let price_table = test_price_table();
+        let served_provider = served_provider("local");
+
+        for body in [
+            br#"{"usage":{"prompt_tokens":1,"completion_tokens":1,"cost":"0.01"}}"#.as_slice(),
+            br#"{"usage":{"prompt_tokens":1,"completion_tokens":1,"cost":-0.01}}"#.as_slice(),
+        ] {
+            assert_eq!(
+                inject_usage_cost(
+                    body,
+                    "local/functional-model",
+                    &served_provider,
+                    &price_table,
+                )
+                .err(),
+                Some(CostOmission::InvalidProviderCost)
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_cached_prompt_usage_fails_closed() {
         let price_table = test_price_table_with_cached_price(Some(Decimal::new(30, 2)));
         let served_provider = served_provider("local");
 
@@ -1033,24 +1123,15 @@ mod tests {
                     .as_slice(),
             ),
         ] {
-            let transformed = inject_usage_cost(
-                body,
-                "local/functional-model",
-                &served_provider,
-                &price_table,
-            )
-            .unwrap();
-            let response: Value = serde_json::from_slice(&transformed.body).unwrap();
-
             assert_eq!(
-                response["usage"]["cost"].as_number().unwrap().to_string(),
-                "0.0006000000",
-                "{name}"
-            );
-            assert_eq!(transformed.usage.provider_cost_usd, None, "{name}");
-            assert_eq!(
-                transformed.usage.sell_price_usd.to_string(),
-                "0.0006000000",
+                inject_usage_cost(
+                    body,
+                    "local/functional-model",
+                    &served_provider,
+                    &price_table,
+                )
+                .err(),
+                Some(CostOmission::UnresolvedProviderCost),
                 "{name}"
             );
         }
@@ -1092,19 +1173,6 @@ mod tests {
         cached_input_price_per_mtok: Option<Decimal>,
     ) -> PriceTable {
         PriceTable::from_registry(&Registry {
-            sell_prices: vec![SellPrice {
-                slug: "functional-model".to_owned(),
-                input_price_per_mtok: if cached_input_price_per_mtok.is_some() {
-                    Decimal::new(400, 2)
-                } else {
-                    Decimal::new(40, 2)
-                },
-                output_price_per_mtok: if cached_input_price_per_mtok.is_some() {
-                    Decimal::new(2_000, 2)
-                } else {
-                    Decimal::new(80, 2)
-                },
-            }],
             providers: vec![Provider {
                 id: "local".to_owned(),
                 display_name: "Local".to_owned(),

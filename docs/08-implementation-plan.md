@@ -52,8 +52,8 @@ Phased so each step is independently shippable and reversible. The guiding princ
 - [x] Add the Modal Kimi K3 Shared API route with neutral public
   attribution, exact cached-input accounting, non-streaming-only beta constraints,
   and a credential-bound live gate (`docs/12`, 2026-07-29).
-- [x] Approve and implement route-independent sell pricing with separately
-  reconciled provider cost (`docs/04`, 2026-07-27).
+- [x] Remove the superseded route-independent sell-price layer and restore
+  `usage.cost` to the exact served-provider amount (`docs/04`, 2026-07-30).
 - [x] Pass the revised JSON-only Modal live gate with exact cached-token accounting
   and neutral public attribution (`docs/12`, 2026-07-29).
 - [x] Record Taariq's confirmation of Modal permission and approval for beta and
@@ -64,27 +64,33 @@ Phased so each step is independently shippable and reversible. The guiding princ
   in both profiles.
 - [x] Pass the bounded production request, cost, latency, readiness, fallback, and
   publisher-rollback gates tracked in #57 (2026-07-30).
-- [x] Record DeepInfra's written commercial-use permission, provision a 30-day
-  Llama-only credential with a $5 lifetime cap, record the live 200-request /
-  1.1M-TPM limits, and enable the route for the credential-bound beta profile
-  only (2026-07-30).
+- [x] Provision a 30-day Llama-only DeepInfra credential with a $5 lifetime cap,
+  record the live 200-request / 1.1M-TPM limits, and validate the route through the
+  credential-bound beta profile (2026-07-30).
 - [x] Pass the funded live JSON/SSE compatibility and bounded beta canary gate:
-  10/10 valid requests, exact provider/sell accounting, terminal SSE usage,
+  10/10 valid requests, exact provider-cost accounting, terminal SSE usage,
   profile isolation, OpenRouter failover, and rollback/restore (2026-07-30).
-- [x] Confirm lower provider cost and invariant sell-price `usage.cost`; make
-  DeepInfra the beta-primary Llama route while retaining OpenRouter as the
+- [x] Confirm exact provider cost and change the checked registry to make DeepInfra
+  the production and beta primary Llama route while retaining OpenRouter as the
   immediate fallback (2026-07-30).
-- [x] Add Blackbox GLM 5.2 as an internal-beta-only route using a `$1`-capped
-  credential; preserve OpenRouter-only production routing, exact metered provider
-  cost, and the invariant canonical sell row (`docs/13`, 2026-07-30).
+- [x] Add Blackbox GLM 5.2 using a `$1`-capped credential with exact metered
+  provider cost and OpenRouter fallback (`docs/13`, 2026-07-30).
 - [x] Pass the funded Blackbox beta gate: 10/10 JSON/SSE requests, exact cached-token
-  provider/sell accounting, production and price-routing isolation, OpenRouter
+  provider-cost accounting, profile and price-routing checks, OpenRouter
   rollback, approved-state restoration, and final HA/runtime checks (`docs/13`,
   2026-07-30).
-- [ ] Repeat: Fireworks, Novita, Baseten, … (prioritize by traffic volume × margin gain).
+- [x] Add a separately capped DeepInfra GLM 5.2 credential boundary, compare
+  Blackbox, DeepInfra, and OpenRouter with five interleaved SSE requests each, and
+  make DeepInfra the checked default stable price/throughput route (`docs/14`,
+  2026-07-30).
+- [ ] Deploy the revised production route set and prove exact JSON/SSE provider cost,
+  production/beta selection, OpenRouter price routing, failover, health, and immutable
+  rollback (#78).
+- [ ] Repeat: Fireworks, Novita, Baseten, … (prioritize by traffic volume, cost, and
+  measured performance).
 - [ ] Implement the routing policy in full (`docs/02`): outage gate, inverse-square price weighting, `sort` modes, `:nitro`/`:floor`, failover.
-- [x] Stand up the per-request provider-cost/sell-price ledger and reconciliation
-  contract (`docs/04`, 2026-07-27).
+- [x] Stand up the per-request provider-cost ledger and reconciliation contract
+  (`docs/04`, corrected 2026-07-30).
 
 ## Phase 5 — seren-desktop client changes
 

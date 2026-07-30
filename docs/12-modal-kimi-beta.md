@@ -77,11 +77,8 @@ Modal's published Shared API rates are:
 | Completion | $15.00 / MTok |
 | Reasoning | $15.00 / MTok |
 
-The existing canonical Kimi sell price remains $3.00 input and $15.00 output per
-million tokens. No customer price changes when the beta route is added.
-
 The router records gross provider cost before credits. Promotional-credit consumption
-is reconciled separately from request-level cost and margin. The authenticated
+is reconciled separately from request-level cost. The authenticated
 workspace displayed approximately $5,030 in credits on 2026-07-29. Taariq confirmed
 on 2026-07-30 that this displayed balance is sufficient and that no reconciliation to
 a separately reported promotional-grant amount is required. The independent
@@ -90,9 +87,8 @@ cumulative $5 validation ceiling remains the operative spend control.
 Modal's OpenAI-compatible usage may report cache hits at
 `usage.prompt_tokens_details.cached_tokens`. When that exact count is present and no
 greater than total prompt tokens, the router applies the $0.30 cached-input rate to
-those tokens. When it is absent or invalid, the router still records and returns the
-exact reviewed sell subtotal but persists `provider_cost_usd` as null. It never treats
-missing cache detail as zero or estimates gross provider cost.
+those tokens. When it is absent or invalid, the router fails closed. It never treats
+missing cache detail as zero or estimates provider cost.
 
 ## Beta validation gate
 
@@ -111,14 +107,13 @@ Before any request:
 5. Validate the compiled config with the pinned AgentGateway binary.
 
 The revised paid gate sends the same deterministic prompt twice through non-streaming
-JSON Chat Completions. It verifies invariant customer sell price, neutral public
-naming and catalogs, beta-only generation lookup, the correct null provider cost when
-a cold response omits cache detail, and exact cached-token provider cost on the
-repeated request. Its hard cap reserves the uncached upper bound for the initial call
+JSON Chat Completions. It verifies exact provider cost, neutral public naming and
+catalogs, profile-scoped generation lookup, and exact cached-token accounting. Its
+hard cap reserves the uncached upper bound for the initial call
 plus both configured sidecar retries for each logical request; failed attempts are
 never assumed free. The harness reports logical request count, reserved attempt
-ceiling, errors, latency, token totals, resolved gross provider cost, reserved
-gross-cost ceiling, and sell subtotal. Account credit consumption is reconciled
+ceiling, errors, latency, token totals, resolved gross provider cost, and reserved
+gross-cost ceiling. Account credit consumption is reconciled
 separately from the authenticated Credits and billing views. Any unresolved provider
 cost on the cached repeat, public provider-brand or account-identifier leak, profile
 leak, schema drift, or spend-ceiling violation blocks activation.
@@ -181,7 +176,6 @@ two identical non-streaming JSON requests. The gate passed every assertion:
 - 3,804 prompt tokens, including 1,920 exactly reported cached tokens;
 - 8 completion tokens;
 - `$0.0063480000` exact gross provider cost;
-- `$0.0115320000` invariant customer sell subtotal;
 - 1,760.282 ms and 2,050.619 ms end-to-end request latency;
 - exact internal provider attribution with neutral public catalog, response, and
   generation metadata; and
@@ -211,8 +205,7 @@ changing the threshold:
 - 10 requests, 10 HTTP 200 responses, and no provider or request errors;
 - 3.130-second p95 latency against the 15-second ceiling;
 - 30,420 prompt tokens, including 30,080 cached tokens, and 40 completion tokens;
-- `$0.0106440000` exact gross provider cost and `$0.0918600000` invariant sell
-  subtotal;
+- `$0.0106440000` exact gross provider cost;
 - ten production ledger rows attributed internally to `modal` and exposed publicly as
   `Seren Inference`; and
 - an exact Modal billing increase from `$0.04689314` to `$0.05753714`, with billed

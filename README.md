@@ -19,7 +19,7 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/01-architecture.md`](docs/01-architecture.md) | The compatibility seam and the five internal components |
 | [`docs/02-routing.md`](docs/02-routing.md) | Routing & failover — fastest-for-price default (Seren's own), with OpenRouter's algorithm offered as the `balanced` mode |
 | [`docs/03-provider-registry.md`](docs/03-provider-registry.md) | Provider registry, key management, catalog sync |
-| [`docs/04-billing.md`](docs/04-billing.md) | Cost-accounting contract and where margin grows |
+| [`docs/04-billing.md`](docs/04-billing.md) | Exact served-provider cost accounting and Gateway fee boundary |
 | [`docs/05-migration.md`](docs/05-migration.md) | Gateway cutover and the incremental de-risked migration |
 | [`docs/06-desktop-changes.md`](docs/06-desktop-changes.md) | The (small) seren-desktop client footprint |
 | [`docs/07-infra-and-risks.md`](docs/07-infra-and-risks.md) | Repo, infrastructure, and honest risk register |
@@ -29,13 +29,14 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/11-first-direct-provider.md`](docs/11-first-direct-provider.md) | First direct-provider selection, evidence, and activation gates |
 | [`docs/12`](docs/12-modal-kimi-beta.md) | Kimi K3 beta inference contract, neutral naming, and activation gates |
 | [`docs/13`](docs/13-blackbox-glm-beta.md) | Blackbox GLM 5.2 internal-beta contract, metered pricing, and rollout boundary |
+| [`docs/14`](docs/14-glm52-provider-audit.md) | GLM 5.2 provider price and measured throughput audit |
 | [`docs/plans/20260724_plan_seren_router_build.md`](docs/plans/20260724_plan_seren_router_build.md) | The build plan: zero-context, task-by-task implementation guide (M0–M7) with tests and commit points |
 
 ## Status
 
 The Phase 1 compatibility skeleton and live M6 OpenRouter parity/soak gate are complete
 as of 2026-07-25. The service uses the standard Seren Rust chassis and is built as a
-**thin OpenRouter-compatibility, pricing-policy, and cost-accounting layer on
+**thin OpenRouter-compatibility, routing-policy, and cost-accounting layer on
 [agentgateway](https://github.com/agentgateway/agentgateway)** (see `docs/09` for the
 verified evaluation). The OpenRouter-only image was deployed to the existing production
 environment and passed its bounded canary on 2026-07-26. The repository also carries
@@ -47,17 +48,14 @@ canary on 2026-07-30. The production gate passed after exercising the atomic
 direct-OpenRouter publisher rollback and an isolated beta pre-warm. The checked route
 is enabled for production and credential-bound beta traffic. Compatible non-streaming
 Kimi K3 requests select Modal first, while OpenRouter remains the lowest-priority
-fallback in both profiles. DeepInfra Llama 3.3 70B is enabled only for the
-credential-bound beta profile with OpenRouter as its immediate fallback; production
-Llama remains OpenRouter-only. Its funded 10-request JSON/SSE canary, exact
-provider/sell accounting, production isolation, OpenRouter failover, and
-rollback/restore gates passed on 2026-07-30. Blackbox GLM 5.2 is enabled only for
-the credential-bound internal beta profile with OpenRouter fallback. Its standard
-account terms and negative gross margin prohibit customer-facing production routing;
-the checked route records exact paid-meter prices while preserving the canonical
-customer sell price. Its funded 10-request JSON/SSE canary, exact cached-token
-accounting, production isolation, price override, and rollback/restore gates passed
-on 2026-07-30.
+fallback in both profiles. The checked registry now enables DeepInfra Llama 3.3 70B,
+DeepInfra GLM 5.2, and Blackbox GLM 5.2 for production and credential-bound beta
+traffic. The earlier DeepInfra Llama and Blackbox beta canaries passed exact
+provider-cost, compatibility, failover, and rollback/restore gates. A subsequent
+five-request-per-provider GLM audit measured DeepInfra as the best stable
+price/throughput route, so the checked default GLM order is DeepInfra, Blackbox, then
+OpenRouter; explicit price sorting selects OpenRouter. Issue #78 retains the revised
+production deployment, canary, and rollback evidence gate.
 
 ## Service development
 
@@ -99,8 +97,8 @@ above are required. The router deliberately has no unreviewed production default
 the price ceiling, hysteresis, provider max share, or rolling share-window size.
 The AgentGateway sidecar requires `SEREN_ROUTER_KEY_OPENROUTER` while the checked-in
 OpenRouter fallback provider is enabled. The enabled direct routes also require
-`SEREN_ROUTER_KEY_MODAL`, `SEREN_ROUTER_KEY_DEEPINFRA`, and
-`SEREN_ROUTER_KEY_BLACKBOX`. Inject all provider
+`SEREN_ROUTER_KEY_MODAL`, `SEREN_ROUTER_KEY_DEEPINFRA`,
+`SEREN_ROUTER_KEY_DEEPINFRA_GLM`, and `SEREN_ROUTER_KEY_BLACKBOX`. Inject all provider
 credentials from the deployment secret manager into AgentGateway only; never store
 their values in the registry, rendered configuration, or seren-router app container.
 Startup opens a lazy PostgreSQL pool, binds the HTTP listener without waiting for the
@@ -128,11 +126,10 @@ paths:
 All require a Gateway bearer credential. `SEREN_ROUTER_GATEWAY_KEY` is bound to the
 production provider profile; optional `SEREN_ROUTER_BETA_GATEWAY_KEY` is bound to the
 beta profile and must be distinct. Client headers cannot choose or override the
-profile. Completion responses carry exact reviewed sell-price `usage.cost`; successful
-generations always persist the sell subtotal and persist provider cost only when the
-upstream supplies every usage detail required for an exact calculation. An unresolved
-provider cost is stored explicitly as null for reconciliation. The model and endpoint
-catalogs are assembled at
+profile. Completion responses carry the exact serving-provider cost at `usage.cost`;
+successful generations persist that same amount. When no trustworthy upstream cost is
+present, a cached-price route fails closed if the upstream omits usage detail required
+for an exact registry-rate calculation. The model and endpoint catalogs are assembled at
 startup from enabled provider mappings and report exact per-token prices as decimal
 strings. Endpoint responses expose registry metadata only; they never expose provider
 URLs or secret names. The key and credit responses are fixed compatibility metadata

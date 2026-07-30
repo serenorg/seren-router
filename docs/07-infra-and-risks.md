@@ -30,21 +30,20 @@ ABOUTME: Covers the stack decision, deployment shape, and the risks of owning th
 
 1. **Single point of failure.** Post-migration, seren-router fronts *every* model call. It must be at least as reliable as OpenRouter — HA, health checks, a failover tier that does real work. The OpenRouter-as-fallback phase (`docs/05`) hides this early; after we remove that fallback, this is the critical path. **Mitigation:** multi-instance HA, keep a break-glass path to re-point `api_url` back to OpenRouter until the deal closes.
 
-2. **Operational finance.** Paying N providers directly means N billing relationships, N prepay/credit balances, N invoices to reconcile against the ledger (`docs/04`). OpenRouter absorbed this. The margin gain is real but not free. **Mitigation:** start with a small set of high-volume providers; add the reconciliation ledger before scaling provider count.
+2. **Operational finance.** Paying N providers directly means N balances and invoices
+   to reconcile against the ledger (`docs/04`). **Mitigation:** start with a small set
+   of high-volume providers and reconcile exact serving-provider cost before scaling.
 
 3. **Slug/catalog curation** is the ongoing moat *and* the ongoing cost (`docs/03`). **Mitigation:** unmapped provider models are surfaced for review, never silently dropped.
 
-4. **Data privacy & ToS.** Going direct means Seren must vet each provider's
-   data-retention/training policy and confirm their ToS permits reselling inference
-   under Seren's brand. **Verify per provider — do not assume.** Blackbox's standard
-   Terms prohibit reselling, commercially exploiting, or making the service available
-   to third parties. Its Pro privacy page advertises zero data retention and no
-   training, while enterprise service is separately contracted. The standard account
-   is therefore restricted to Seren's credential-bound internal beta profile; written
-   Blackbox permission or an enterprise agreement is required before customer routing.
-
-5. **Feature-parity scope.** OpenRouter also does prompt caching passthrough, structured outputs, moderation, vision/PDF handling, tool-call normalization quirks. Decide which reach parity in the MVP vs later. **Mitigation:** the OpenRouter fallback covers any feature not yet reimplemented, so parity can be incremental.
+4. **Feature-parity scope.** OpenRouter also does prompt caching passthrough,
+   structured outputs, moderation, vision/PDF handling, and tool-call normalization.
+   Decide which reach parity in the MVP vs later. **Mitigation:** the OpenRouter
+   fallback covers any feature not yet implemented, so parity can be incremental.
 
 ## The bet
 
-Owning the router carries real reliability and operational-finance cost. The upside is removing a critical dependency that is being acquired by a payments competitor, and capturing OpenRouter's former margin. Given the strategic exposure, the risk is judged worth taking.
+Owning the router carries real reliability and operational-finance cost. The upside is
+removing a critical dependency that is being acquired by a payments competitor and
+controlling provider selection directly. Given the strategic exposure, the risk is
+judged worth taking.

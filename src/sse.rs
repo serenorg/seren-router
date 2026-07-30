@@ -1,11 +1,11 @@
 // ABOUTME: Frames OpenAI-compatible server-sent events across arbitrary HTTP chunks.
-// ABOUTME: Adds the exact customer sell subtotal to supported terminal usage shapes.
+// ABOUTME: Adds exact served-provider cost to supported terminal usage shapes.
 
 use serde_json::Value;
 
-use crate::pricing::BillingPrices;
 #[cfg(test)]
 use crate::pricing::ModelPrices;
+use crate::pricing::ProviderPrices;
 use crate::usage_cost::{
     CostedUsage, inject_usage_cost_value, sanitize_public_completion_value,
     strip_provider_specific_fields,
@@ -13,14 +13,14 @@ use crate::usage_cost::{
 
 pub(crate) struct UsageCostTransformer {
     pending: Vec<u8>,
-    prices: Option<BillingPrices>,
+    prices: Option<ProviderPrices>,
     response_model: Option<String>,
     costed_usage: Option<CostedUsage>,
     closed: bool,
 }
 
 impl UsageCostTransformer {
-    pub(crate) fn new(prices: BillingPrices) -> Self {
+    pub(crate) fn new(prices: ProviderPrices) -> Self {
         Self {
             pending: Vec::new(),
             prices: Some(prices),
@@ -30,6 +30,7 @@ impl UsageCostTransformer {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn model_only(response_model: &str) -> Self {
         Self {
             pending: Vec::new(),
@@ -291,7 +292,7 @@ mod tests {
         let expected = concat!(
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],",
             "\"id\":\"chatcmpl-final\",\"usage\":{\"completion_tokens\":3,",
-            "\"cost\":0.0000088000,\"prompt_tokens\":16}}\n\n",
+            "\"cost\":0.0000022000,\"prompt_tokens\":16}}\n\n",
             "data: [DONE]\n\n"
         );
 
@@ -315,7 +316,7 @@ mod tests {
         );
         let expected = concat!(
             "data: {\"choices\":[],\"id\":\"chatcmpl-cached\",\"usage\":",
-            "{\"completion_tokens\":10,\"cost\":0.0006000000,\"prompt_tokens\":100,",
+            "{\"completion_tokens\":10,\"cost\":0.0003420000,\"prompt_tokens\":100,",
             "\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\n",
             "data: [DONE]\n\n"
         );
@@ -328,8 +329,7 @@ mod tests {
                     prompt_tokens: 100,
                     completion_tokens: 10,
                 },
-                provider_cost_usd: Some("0.0003420000".parse().unwrap()),
-                sell_price_usd: "0.0006000000".parse().unwrap(),
+                cost_usd: "0.0003420000".parse().unwrap(),
             }),
             cached_test_prices(),
         );
@@ -340,21 +340,43 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let expected_missing_details = concat!(
-            "data: {\"choices\":[],\"id\":\"chatcmpl-cached\",\"usage\":",
-            "{\"completion_tokens\":10,\"cost\":0.0006000000,\"prompt_tokens\":100}}\n\n",
+            "data: {\"error\":{\"code\":\"upstream_error\",",
+            "\"message\":\"upstream request failed\",",
+            "\"metadata\":{\"model\":\"canonical/model\"}}}\n\n",
             "data: [DONE]\n\n"
         );
-        assert_every_boundary_with_prices(
+        assert_every_boundary_with_options(
             missing_details.as_bytes(),
             expected_missing_details.as_bytes(),
+            None,
+            cached_test_prices(),
+            Some("canonical/model"),
+        );
+    }
+
+    #[test]
+    fn terminal_provider_reported_cost_takes_precedence_over_registry_estimates() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl-provider-cost\",\"choices\":[],\"usage\":",
+            "{\"prompt_tokens\":41,\"completion_tokens\":128,\"cost\":0.00034092}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[],\"id\":\"chatcmpl-provider-cost\",\"usage\":",
+            "{\"completion_tokens\":128,\"cost\":0.0003409200,\"prompt_tokens\":41}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_prices(
+            input.as_bytes(),
+            expected.as_bytes(),
             Some(CostedUsage {
-                response_id: Some("chatcmpl-cached".to_owned()),
+                response_id: Some("chatcmpl-provider-cost".to_owned()),
                 usage: crate::pricing::Usage {
-                    prompt_tokens: 100,
-                    completion_tokens: 10,
+                    prompt_tokens: 41,
+                    completion_tokens: 128,
                 },
-                provider_cost_usd: None,
-                sell_price_usd: "0.0006000000".parse().unwrap(),
+                cost_usd: "0.0003409200".parse().unwrap(),
             }),
             cached_test_prices(),
         );
@@ -381,7 +403,7 @@ mod tests {
             "data: {\"choices\":[],\"id\":\"chatcmpl-private\",",
             "\"model\":\"canonical/model\",\"object\":\"chat.completion.chunk\",",
             "\"usage\":{\"completion_tokens\":3,",
-            "\"cost\":0.0000088000,\"prompt_tokens\":16}}\n\n",
+            "\"cost\":0.0000022000,\"prompt_tokens\":16}}\n\n",
             "data: [DONE]\n\n"
         );
 
@@ -425,7 +447,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{},\"index\":0}],",
             "\"id\":\"chatcmpl-private\",",
             "\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,",
-            "\"cost\":0.0000088000,\"prompt_tokens\":16}}\n\n",
+            "\"cost\":0.0000022000,\"prompt_tokens\":16}}\n\n",
             "data: [DONE]\n\n"
         );
 
@@ -546,7 +568,7 @@ mod tests {
         input: &[u8],
         expected: &[u8],
         expected_usage: Option<CostedUsage>,
-        prices: BillingPrices,
+        prices: ProviderPrices,
     ) {
         assert_every_boundary_with_options(input, expected, expected_usage, prices, None);
     }
@@ -555,7 +577,7 @@ mod tests {
         input: &[u8],
         expected: &[u8],
         expected_usage: Option<CostedUsage>,
-        prices: BillingPrices,
+        prices: ProviderPrices,
         response_model: Option<&str>,
     ) {
         for split in 0..=input.len() {
@@ -595,7 +617,7 @@ mod tests {
         );
     }
 
-    fn transformer(prices: BillingPrices, response_model: Option<&str>) -> UsageCostTransformer {
+    fn transformer(prices: ProviderPrices, response_model: Option<&str>) -> UsageCostTransformer {
         match response_model {
             Some(response_model) => {
                 UsageCostTransformer::new(prices).with_response_model(response_model)
@@ -604,31 +626,23 @@ mod tests {
         }
     }
 
-    fn test_prices() -> BillingPrices {
-        BillingPrices {
+    fn test_prices() -> ProviderPrices {
+        ProviderPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: Decimal::new(10, 2),
                 output_price_per_mtok: Decimal::new(20, 2),
             },
             provider_cached_input_price_per_mtok: None,
-            sell_price: ModelPrices {
-                input_price_per_mtok: Decimal::new(40, 2),
-                output_price_per_mtok: Decimal::new(80, 2),
-            },
         }
     }
 
-    fn cached_test_prices() -> BillingPrices {
-        BillingPrices {
+    fn cached_test_prices() -> ProviderPrices {
+        ProviderPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: "3.00".parse().unwrap(),
                 output_price_per_mtok: "15.00".parse().unwrap(),
             },
             provider_cached_input_price_per_mtok: Some("0.30".parse().unwrap()),
-            sell_price: ModelPrices {
-                input_price_per_mtok: "4.00".parse().unwrap(),
-                output_price_per_mtok: "20.00".parse().unwrap(),
-            },
         }
     }
 
@@ -639,8 +653,7 @@ mod tests {
                 prompt_tokens: 16,
                 completion_tokens: 3,
             },
-            provider_cost_usd: Some("0.0000022000".parse().unwrap()),
-            sell_price_usd: "0.0000088000".parse().unwrap(),
+            cost_usd: "0.0000022000".parse().unwrap(),
         }
     }
 }

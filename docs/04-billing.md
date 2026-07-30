@@ -1,42 +1,36 @@
-<!-- ABOUTME: Defines the reviewed sell-price, provider-cost, and Gateway-fee contract.
-ABOUTME: Gives exact reconciliation formulas and rollout-safe ledger semantics. -->
+<!-- ABOUTME: Defines exact provider-cost reporting and Gateway-fee boundaries. -->
+<!-- ABOUTME: Gives reconciliation formulas and mixed-version ledger semantics. -->
 
 # 04 — Billing & Cost Accounting
 
-## Approved policy
+## Money-path contract
 
-Decision date: 2026-07-27. The owner approved a **reviewed sell-price layer** for
-direct-provider routing.
+`usage.cost` is the exact USD cost of the provider that served the response. Seren
+Gateway reads that value through `upstream_cost_response_path: "usage.cost"` and
+applies its configured fee once. The router does not maintain or apply a second sell
+price, markup, or customer-billing policy.
 
-The customer-facing pre-Gateway price for a canonical model stays at its reviewed
-`sell_prices` registry rate regardless of which provider serves the request. The
-initial sell prices equal the incumbent OpenRouter rates. A cheaper direct route
-therefore leaves the customer's documented price unchanged and converts the removed
-middleman spread into Seren router gross margin.
+The served provider, response usage, injected cost, and generation ledger row must
+agree. A trustworthy numeric `usage.cost` returned by the served provider takes
+precedence because it is the provider's metered amount. Otherwise the router computes
+cost from the reviewed registry rates. Every calculation uses
+`rust_decimal::Decimal`, divides per-million-token rates by exactly `1_000_000`, rounds
+once to ten decimal places with midpoint-away-from-zero, and stores
+`NUMERIC(18, 10)`.
 
-Provider cost remains exact and separate. It is never substituted for the sell price
-or estimated. When the upstream response lacks details required for exact provider
-cost, the sell subtotal is still recorded and `provider_cost_usd` is persisted as
-null for reconciliation.
+## Exact formulas
 
-## The three amounts
+For a model without a distinct cache-read price:
 
-For one successful generation:
+```text
+provider_cost_usd =
+  (
+    prompt_tokens × input_price_per_mtok
+    + completion_tokens × output_price_per_mtok
+  ) / 1_000_000
+```
 
-1. **Provider cost** is the served provider's reviewed input/output cost multiplied by
-   actual token usage. When a provider publishes a distinct cached-input rate,
-   reported cached prompt tokens use that rate and the remaining prompt tokens use
-   the ordinary input rate.
-2. **Sell subtotal** is the canonical model's reviewed input/output sell price
-   multiplied by the same token usage.
-3. **Gateway fee** is the existing 5% fee applied by Seren Gateway to the sell
-   subtotal.
-
-All router arithmetic uses `rust_decimal`, divides per-million-token rates by exactly
-`1_000_000`, rounds once to ten decimal places with midpoint-away-from-zero, and
-stores `NUMERIC(18, 10)`. No binary floating-point value enters billing.
-
-For a provider mapping with a cached-input price:
+For a mapping with `cached_input_price_per_mtok`:
 
 ```text
 uncached_prompt_tokens = prompt_tokens - cached_prompt_tokens
@@ -48,114 +42,65 @@ provider_cost_usd =
   ) / 1_000_000
 ```
 
-The upstream response must supply
-`usage.prompt_tokens_details.cached_tokens`, and that count must not exceed
-`usage.prompt_tokens`. Customer sell pricing continues to apply the canonical
-input rate to all prompt tokens. If a provider mapping declares a cached-input
-rate but the exact count is missing or invalid, the router still injects the
-exact sell subtotal and records the generation with a null provider cost. It
-never guesses the provider cost; reconciliation and provider activation gates
-must treat that null as unresolved.
+When registry-rate fallback is required, the cached formula requires an integer
+`usage.prompt_tokens_details.cached_tokens` no greater than
+`usage.prompt_tokens`. If the mapping declares a cache-read price and the response
+omits or corrupts that count, the router fails closed. It does not treat the missing
+count as zero, charge all prompt tokens at one rate, or write an unresolved generation
+row. A trustworthy upstream-reported cost does not require the router to reconstruct
+cache usage.
 
-The router reports only the sell subtotal at `usage.cost`. Gateway continues to read
-`upstream_cost_response_path: "usage.cost"` and add its 5% exactly once. The router
-does not add, estimate, or embed the Gateway fee.
+## Registry and catalog
 
-## Exact Llama example
+Each provider/model mapping in `registry/providers.yaml` contains that route's exact
+input, optional cached-input, and output rates. There is no route-independent price
+table.
 
-The reviewed 72-hour token mix was 3,962 prompt tokens and 214 completion tokens:
+`GET /api/v1/models/{model}/endpoints` exposes the exact per-token price for every
+available provider endpoint. `GET /api/v1/models` has one canonical model row, so it
+deterministically exposes the cheapest enabled endpoint by the existing
+input-plus-output ordering. Route selection remains governed by the routing profile,
+request preference, health, price ceiling, and measurements; the aggregate catalog
+row is not a promise that every request uses that endpoint.
 
-| Route | Sell subtotal | Provider cost | Router gross margin | Gateway fee | Customer total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| OpenRouter fallback | $0.0006006600 | $0.0006006600 | $0.0000000000 | $0.0000300330 | $0.0006306930 |
-| DeepInfra direct | $0.0006006600 | $0.0004646800 | $0.0001359800 | $0.0000300330 | $0.0006306930 |
+## JSON, SSE, and generation metadata
 
-The intended router gross-margin metric is:
+For non-streaming responses, the router injects provider cost at `usage.cost`. For
+streaming responses, it injects the same amount into the terminal usage event before
+exactly one `[DONE]`.
 
-```text
-router_gross_margin_usd = sell_price_usd - provider_cost_usd
-router_gross_margin_percent = router_gross_margin_usd / sell_price_usd × 100
-```
+Both paths write:
 
-For the direct row above, router gross margin is 22.6384310592% of the sell subtotal.
-The Gateway fee is reported separately; combining it with router margin would obscure
-which layer earned the revenue.
+- the credential-selected routing profile;
+- canonical model slug;
+- immutable internal provider ID;
+- prompt and completion tokens;
+- exact provider cost; and
+- latency and response status.
 
-If a reliability fallback costs more than the reviewed sell price, the customer price
-does not rise. Reconciliation reports negative router margin and operations must
-review or disable that route.
+`GET /api/v1/generation?id=` returns that same exact amount as `data.total_cost`.
+Optional public aliases affect only public provider naming; internal attribution and
+reconciliation retain the provider ID.
 
-For Kimi K3, the reviewed OpenRouter and Modal mappings both declare `$3.00/MTok`
-uncached input, `$0.30/MTok` cached input, and `$15.00/MTok` output. Identical token
-usage and exact cache telemetry therefore produce identical gross provider cost on
-either route. The single canonical sell row remains `$3.00/MTok` input and
-`$15.00/MTok` output, so routing does not change customer `usage.cost`. If either
-provider omits or reports invalid cached-token detail, its provider cost remains
-unresolved rather than treating the cache hit as full-price input.
+## Ledger compatibility
 
-For Blackbox GLM 5.2, repeated funded responses proved `$1.40/MTok` uncached
-input, `$0.14/MTok` cached input, and `$4.40/MTok` output. The canonical sell row
-remains `$0.70/MTok` input and `$2.20/MTok` output. This route therefore has
-negative gross margin for uncached input and completion tokens, even before the
-Gateway fee. Promotional credits do not change that gross-cost fact. The route is
-restricted to the internal beta profile for resilience validation and must not be
-enabled for customer traffic without both written commercial permission and a
-sustainable pricing decision.
+Migration `0003_generation_pricing_policy.sql` introduced
+`provider_cost_usd` and `sell_price_usd` during the superseded two-price
+implementation. Those columns remain in place to keep rollback and historical rows
+readable:
 
-## Registry and catalog contract
+- new binaries write the exact provider amount to `cost_usd` and
+  `provider_cost_usd`;
+- new binaries leave the historical `sell_price_usd` column null;
+- historical rows with a non-null `sell_price_usd` continue returning the amount that
+  was originally reported; and
+- legacy rows with only `cost_usd` continue returning that value.
 
-`registry/providers.yaml` has two independent price sources:
-
-- top-level `sell_prices` contains one reviewed pre-Gateway customer price per
-  canonical slug;
-- each provider model mapping contains that provider's input/output cost.
-
-Every provider mapping, including a disabled canary, must reference exactly one
-non-negative sell-price row. Missing, duplicate, or negative sell prices fail registry
-validation. Missing, duplicate, or negative enabled-provider costs fail price-table
-construction.
-
-`GET /api/v1/models` and every model endpoint expose `sell_prices` as per-token
-`pricing.prompt` and `pricing.completion`. Provider cost is intentionally not exposed
-as customer pricing. Consequently, all endpoints for one canonical slug publish the
-same price even when their underlying costs differ.
-
-A sell-price change requires owner review, an exact-decimal fixture update, and a
-coordinated catalog/Gateway review. Enabling or changing a provider cost cannot
-silently change the customer price.
-
-## JSON, streaming, and generation lookup
-
-For non-streaming responses, the router injects the computed sell subtotal into
-`usage.cost`. For streaming responses it injects the same value into the terminal
-usage event before `[DONE]`.
-
-Both paths persist the exact sell subtotal under the provider response ID. They also
-persist exact provider cost when it can be calculated; otherwise
-`provider_cost_usd` remains null and is never estimated. `GET
-/api/v1/generation?id=` returns the sell subtotal as `data.total_cost`, matching the
-metered response. It does not expose the internal provider cost. When a provider has
-public catalog aliases, generation metadata uses its public display name while the
-ledger retains the immutable internal provider ID for reconciliation.
-
-## Ledger and mixed-version safety
-
-New rows contain:
-
-- `provider_cost_usd`: exact cost expected from the served provider, or null when
-  required upstream usage detail is unresolved;
-- `sell_price_usd`: exact pre-Gateway customer subtotal;
-- `cost_usd`: a rollback-compatible mirror of `sell_price_usd`.
-
-Migration `0003_generation_pricing_policy.sql` backfills both new columns from legacy
-`cost_usd`. Before this policy, `cost_usd` was provider cost, so historical backfilled
-rows correctly have zero inferred router margin. New binaries write all three
-columns. An older binary can still write `cost_usd` during rollback without a schema
-failure; such a row has null new columns and must be treated as legacy.
+No migration rewrites historical request amounts.
 
 ## Reconciliation
 
-Aggregate only rows with both new amounts present:
+New provider-cost rows can be aggregated with:
 
 ```sql
 SELECT
@@ -164,29 +109,20 @@ SELECT
     provider_id,
     canonical_slug,
     COUNT(*) AS requests,
-    SUM(provider_cost_usd) AS provider_cost_usd,
-    SUM(sell_price_usd) AS sell_price_usd,
-    SUM(sell_price_usd - provider_cost_usd) AS router_gross_margin_usd
+    SUM(provider_cost_usd) AS provider_cost_usd
 FROM generations
 WHERE provider_cost_usd IS NOT NULL
-  AND sell_price_usd IS NOT NULL
+  AND sell_price_usd IS NULL
 GROUP BY 1, 2, 3, 4
 ORDER BY 1, 2, 3, 4;
 ```
 
-Operations reconcile `provider_cost_usd` against provider usage exports and invoices,
-then reconcile `sell_price_usd` against Gateway upstream-cost metering. Investigate:
+Compare those amounts with provider usage exports or invoices. Investigate missing
+terminal usage, invalid cached-token telemetry, served-provider drift, ledger-write
+failures, registry-price drift, or a Gateway charge that applies its fee more than
+once.
 
-- missing amounts or ledger-write failures;
-- provider invoice drift beyond the provider-specific tolerance;
-- `cost_usd <> sell_price_usd` on new rows;
-- negative router gross margin;
-- catalog sell prices that differ from the checked-in registry; and
-- any Gateway charge that applies the 5% fee more than once.
-
-Promotional credits do not reduce request-level provider cost. The ledger records
-gross published or contracted provider cost; billing reconciliation records credit
-consumption separately so temporary grants do not masquerade as durable margin.
-
-No prompt, response body, customer identifier, authorization header, or credential is
-needed for this reconciliation.
+Credits and grants may reduce the provider's invoice, but they do not change the
+request's metered provider cost. Reconcile credit consumption separately. No prompt,
+response body, customer identifier, authorization header, or credential is needed for
+cost reconciliation.

@@ -97,12 +97,15 @@ grep -Fq '$SEREN_ROUTER_KEY_MODAL' "$rendered" \
     || die "rendered configuration omitted the Modal environment reference"
 grep -Fq '$SEREN_ROUTER_KEY_DEEPINFRA' "$rendered" \
     || die "rendered configuration omitted the DeepInfra environment reference"
+grep -Fq '$SEREN_ROUTER_KEY_DEEPINFRA_GLM' "$rendered" \
+    || die "rendered configuration omitted the DeepInfra GLM environment reference"
 grep -Fq '$SEREN_ROUTER_KEY_BLACKBOX' "$rendered" \
     || die "rendered configuration omitted the Blackbox environment reference"
 if grep -Fq 'deployment-smoke-only' "$rendered" \
     || grep -Fq 'deployment-smoke-beta-only' "$rendered" \
     || grep -Fq 'deployment-smoke-modal-only' "$rendered" \
     || grep -Fq 'deployment-smoke-deepinfra-only' "$rendered" \
+    || grep -Fq 'deployment-smoke-deepinfra-glm-only' "$rendered" \
     || grep -Fq 'deployment-smoke-blackbox-only' "$rendered"; then
     die "rendered configuration resolved a secret value"
 fi
@@ -148,10 +151,9 @@ production_llama="$(
         "http://${published}/api/v1/models/meta-llama/llama-3.3-70b-instruct/endpoints"
 )"
 grep -Fq '"provider_name":"OpenRouter"' <<<"$production_llama" \
-    || die "production Llama catalog omitted the OpenRouter route"
-if grep -Fq '"provider_name":"DeepInfra"' <<<"$production_llama"; then
-    die "production Llama catalog exposed the beta-only DeepInfra route"
-fi
+    || die "production Llama catalog omitted the OpenRouter fallback"
+grep -Fq '"provider_name":"DeepInfra"' <<<"$production_llama" \
+    || die "production Llama catalog omitted the DeepInfra direct route"
 
 beta_llama="$(
     curl \
@@ -175,10 +177,11 @@ production_glm="$(
         "http://${published}/api/v1/models/z-ai/glm-5.2/endpoints"
 )"
 grep -Fq '"provider_name":"OpenRouter"' <<<"$production_glm" \
-    || die "production GLM catalog omitted the OpenRouter route"
-if grep -Fq '"provider_name":"Blackbox"' <<<"$production_glm"; then
-    die "production GLM catalog exposed the beta-only Blackbox route"
-fi
+    || die "production GLM catalog omitted the OpenRouter fallback"
+grep -Fq '"provider_name":"DeepInfra"' <<<"$production_glm" \
+    || die "production GLM catalog omitted the DeepInfra direct route"
+grep -Fq '"provider_name":"Blackbox"' <<<"$production_glm" \
+    || die "production GLM catalog omitted the Blackbox direct route"
 
 beta_glm="$(
     curl \
@@ -190,6 +193,8 @@ beta_glm="$(
 )"
 grep -Fq '"provider_name":"Blackbox"' <<<"$beta_glm" \
     || die "beta GLM catalog omitted the Blackbox direct route"
+grep -Fq '"provider_name":"DeepInfra"' <<<"$beta_glm" \
+    || die "beta GLM catalog omitted the DeepInfra direct route"
 grep -Fq '"provider_name":"OpenRouter"' <<<"$beta_glm" \
     || die "beta GLM catalog omitted the OpenRouter fallback"
 

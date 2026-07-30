@@ -23,7 +23,7 @@
     "completion_tokens_details": {
       "reasoning_tokens": 0
     },
-    "cost": 0.0000088000,
+    "cost": 0.0000022000,
     "prompt_tokens": 16,
     "total_tokens": 19
   }

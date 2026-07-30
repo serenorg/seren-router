@@ -32,7 +32,7 @@ Auth: seren-router validates the single static bearer key the Gateway forwards (
 
 ## Foundation: agentgateway
 
-seren-router is built on **agentgateway** (Linux Foundation, Rust, Apache-2.0) rather than from scratch — see `docs/09` for the verified evaluation. agentgateway supplies the streaming proxy, provider adapters (native + any OpenAI-compatible `baseUrl`), priority-tier failover with health eviction, P2C load balancing, retry policies, and a models.dev-synced pricing catalog. seren-router's own code is the thin layer that makes it OpenRouter-compatible and Seren-priced: the API surface below, the routing policies (`docs/02`), the registry compiler (`docs/03`), and `usage.cost` billing (`docs/04`).
+seren-router is built on **agentgateway** (Linux Foundation, Rust, Apache-2.0) rather than from scratch — see `docs/09` for the verified evaluation. agentgateway supplies the streaming proxy, provider adapters (native + any OpenAI-compatible `baseUrl`), priority-tier failover with health eviction, P2C load balancing, retry policies, and a models.dev-synced pricing catalog. seren-router's own code is the thin layer that makes it OpenRouter-compatible: the API surface below, the routing policies (`docs/02`), the registry compiler (`docs/03`), and exact served-provider `usage.cost` accounting (`docs/04`).
 
 ## Internal components
 
@@ -40,7 +40,7 @@ seren-router is built on **agentgateway** (Linux Foundation, Rust, Apache-2.0) r
 
 2. **Provider registry** — one declarative entry per inference host (Together, Fireworks, Blackbox, DeepInfra, …): base URL, auth style, which Seren key to use, and the slug → provider-model-id mapping. See `docs/03`.
 
-3. **Provider adapters** — per-host normalization shims. Most hosts are already OpenAI-compatible, so adapters are thin: translate request/response quirks and map native token usage into exact provider cost while the router reports the reviewed canonical sell subtotal at `usage.cost`.
+3. **Provider adapters** — per-host normalization shims. Most hosts are already OpenAI-compatible, so adapters are thin: translate request/response quirks and map native token usage into the exact provider cost reported at `usage.cost`.
 
 4. **Router core** — takes a model slug + routing preference, ranks candidate providers, picks the top healthy one, attaches Seren's key, streams the response, computes cost, and fails over to the next provider on error. See `docs/02`.
 

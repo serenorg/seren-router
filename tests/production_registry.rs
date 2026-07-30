@@ -8,14 +8,14 @@ use seren_router::config::RoutingConfig;
 use seren_router::policy::measurements::MeasurementStore;
 use seren_router::policy::routing::{CompletionEndpoint, RouteRequestError, RoutingPolicy};
 use seren_router::pricing::{
-    BillingPrices, ModelPrices, PriceTable, Usage, cost_usd, provider_cost_usd,
+    ModelPrices, PriceTable, ProviderPrices, Usage, cost_usd, provider_cost_usd,
 };
 use seren_router::registry::Registry;
 use seren_router::routing_profile::RoutingProfile;
 use seren_router::sidecar_config::{SidecarConfigOptions, compile};
 
 #[test]
-fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
+fn checked_registry_activates_reviewed_routes() {
     let registry = checked_registry();
     registry.validate().unwrap();
 
@@ -24,20 +24,20 @@ fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
         .iter()
         .filter(|provider| provider.enabled)
         .collect();
-    assert_eq!(enabled.len(), 4);
+    assert_eq!(enabled.len(), 5);
 
     let production_enabled: Vec<_> = enabled
         .iter()
         .copied()
         .filter(|provider| provider.supports(RoutingProfile::Production))
         .collect();
-    assert_eq!(production_enabled.len(), 2);
+    assert_eq!(production_enabled.len(), 5);
     let beta_enabled: Vec<_> = enabled
         .iter()
         .copied()
         .filter(|provider| provider.supports(RoutingProfile::Beta))
         .collect();
-    assert_eq!(beta_enabled.len(), 4);
+    assert_eq!(beta_enabled.len(), 5);
     let openrouter = production_enabled
         .iter()
         .copied()
@@ -121,11 +121,13 @@ fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
     assert!(deepinfra.enabled);
     assert_eq!(
         deepinfra.profiles,
-        [RoutingProfile::Beta].into_iter().collect()
+        [RoutingProfile::Production, RoutingProfile::Beta]
+            .into_iter()
+            .collect()
     );
     assert_eq!(deepinfra.base_url, "https://api.deepinfra.com/v1/openai");
     assert_eq!(deepinfra.secret_env, "SEREN_ROUTER_KEY_DEEPINFRA");
-    assert_eq!(deepinfra.priority, 0);
+    assert_eq!(deepinfra.priority, 1);
     assert_eq!(deepinfra.models.len(), 1);
     let deepinfra_llama = &deepinfra.models[0];
     assert_eq!(deepinfra_llama.slug, "meta-llama/llama-3.3-70b-instruct");
@@ -141,6 +143,43 @@ fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
         [CompletionEndpoint::Chat].into_iter().collect()
     );
 
+    let deepinfra_glm_provider = registry
+        .providers
+        .iter()
+        .find(|provider| provider.id == "deepinfra-glm")
+        .unwrap();
+    assert!(deepinfra_glm_provider.enabled);
+    assert_eq!(
+        deepinfra_glm_provider.profiles,
+        [RoutingProfile::Production, RoutingProfile::Beta]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        deepinfra_glm_provider.base_url,
+        "https://api.deepinfra.com/v1/openai"
+    );
+    assert_eq!(
+        deepinfra_glm_provider.secret_env,
+        "SEREN_ROUTER_KEY_DEEPINFRA_GLM"
+    );
+    assert_eq!(deepinfra_glm_provider.priority, 0);
+    assert_eq!(deepinfra_glm_provider.models.len(), 1);
+    let deepinfra_glm = &deepinfra_glm_provider.models[0];
+    assert_eq!(deepinfra_glm.slug, "z-ai/glm-5.2");
+    assert_eq!(deepinfra_glm.provider_model_id, "zai-org/GLM-5.2");
+    assert_eq!(deepinfra_glm.context_length, 1_048_576);
+    assert_eq!(deepinfra_glm.input_price_per_mtok, Decimal::new(75, 2));
+    assert_eq!(
+        deepinfra_glm.cached_input_price_per_mtok,
+        Some(Decimal::new(14, 2))
+    );
+    assert_eq!(deepinfra_glm.output_price_per_mtok, Decimal::new(240, 2));
+    assert_eq!(
+        deepinfra_glm.request_constraints.endpoints,
+        [CompletionEndpoint::Chat].into_iter().collect()
+    );
+
     let blackbox = registry
         .providers
         .iter()
@@ -149,11 +188,13 @@ fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
     assert!(blackbox.enabled);
     assert_eq!(
         blackbox.profiles,
-        [RoutingProfile::Beta].into_iter().collect()
+        [RoutingProfile::Production, RoutingProfile::Beta]
+            .into_iter()
+            .collect()
     );
     assert_eq!(blackbox.base_url, "https://api.blackbox.ai/v1");
     assert_eq!(blackbox.secret_env, "SEREN_ROUTER_KEY_BLACKBOX");
-    assert_eq!(blackbox.priority, 0);
+    assert_eq!(blackbox.priority, 1);
     assert_eq!(blackbox.models.len(), 1);
     let blackbox_glm = &blackbox.models[0];
     assert_eq!(blackbox_glm.slug, "z-ai/glm-5.2");
@@ -226,8 +267,8 @@ fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
                 "z-ai/glm-5.2",
                 "z-ai/glm-5.2",
                 1_048_576,
-                Decimal::new(70, 2),
-                Decimal::new(220, 2),
+                Decimal::new(6993, 4),
+                Decimal::new(21978, 4),
             ),
             (
                 "moonshotai/kimi-k3",
@@ -242,30 +283,22 @@ fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
     let prices = PriceTable::from_registry(&registry).unwrap();
     assert_eq!(
         prices.get("openrouter", "meta-llama/llama-3.3-70b-instruct"),
-        Some(&BillingPrices {
+        Some(&ProviderPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: Decimal::new(13, 2),
                 output_price_per_mtok: Decimal::new(40, 2),
             },
             provider_cached_input_price_per_mtok: None,
-            sell_price: ModelPrices {
-                input_price_per_mtok: Decimal::new(13, 2),
-                output_price_per_mtok: Decimal::new(40, 2),
-            },
         })
     );
     assert_eq!(
         prices.get("deepinfra", "meta-llama/llama-3.3-70b-instruct"),
-        Some(&BillingPrices {
+        Some(&ProviderPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: Decimal::new(10, 2),
                 output_price_per_mtok: Decimal::new(32, 2),
             },
             provider_cached_input_price_per_mtok: None,
-            sell_price: ModelPrices {
-                input_price_per_mtok: Decimal::new(13, 2),
-                output_price_per_mtok: Decimal::new(40, 2),
-            },
         })
     );
     assert!(
@@ -274,7 +307,27 @@ fn checked_registry_activates_reviewed_routes_and_isolates_beta_providers() {
     );
     assert!(
         prices.get("blackbox", "z-ai/glm-5.2").is_some(),
-        "the enabled Blackbox beta route must enter the live price table"
+        "the enabled Blackbox route must enter the live price table"
+    );
+    assert_eq!(
+        prices.get("deepinfra-glm", "z-ai/glm-5.2"),
+        Some(&ProviderPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: Decimal::new(75, 2),
+                output_price_per_mtok: Decimal::new(240, 2),
+            },
+            provider_cached_input_price_per_mtok: Some(Decimal::new(14, 2)),
+        })
+    );
+    assert_eq!(
+        prices.get("openrouter", "z-ai/glm-5.2"),
+        Some(&ProviderPrices {
+            provider_cost: ModelPrices {
+                input_price_per_mtok: Decimal::new(6993, 4),
+                output_price_per_mtok: Decimal::new(21978, 4),
+            },
+            provider_cached_input_price_per_mtok: Some(Decimal::new(12987, 5)),
+        })
     );
 }
 
@@ -292,16 +345,12 @@ fn kimi_cached_provider_cost_is_exact_and_provider_independent() {
     );
     assert_eq!(
         modal,
-        &BillingPrices {
+        &ProviderPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: Decimal::new(300, 2),
                 output_price_per_mtok: Decimal::new(1500, 2),
             },
             provider_cached_input_price_per_mtok: Some(Decimal::new(30, 2)),
-            sell_price: ModelPrices {
-                input_price_per_mtok: Decimal::new(300, 2),
-                output_price_per_mtok: Decimal::new(1500, 2),
-            },
         }
     );
 
@@ -310,7 +359,7 @@ fn kimi_cached_provider_cost_is_exact_and_provider_independent() {
         completion_tokens: 100,
     };
     assert_eq!(
-        cost_usd(&modal.sell_price, &usage).to_string(),
+        cost_usd(&modal.provider_cost, &usage).to_string(),
         "0.0045000000"
     );
     for provider in [openrouter, modal] {
@@ -348,14 +397,14 @@ fn routing_policy_selects_modal_in_both_profiles_and_rejects_provider_selection(
     assert_eq!(production_decision.selected_provider, "modal");
     assert_eq!(production["model"], "modal/moonshotai/kimi-k3");
     assert_eq!(
-        production_decision.fallback_model.as_deref(),
-        Some("openrouter/moonshotai/kimi-k3")
+        production_decision.fallback_models,
+        ["openrouter/moonshotai/kimi-k3".to_owned()]
     );
     assert_eq!(beta_decision.selected_provider, "modal");
     assert_eq!(beta["model"], "modal/moonshotai/kimi-k3");
     assert_eq!(
-        beta_decision.fallback_model.as_deref(),
-        Some("openrouter/moonshotai/kimi-k3")
+        beta_decision.fallback_models,
+        ["openrouter/moonshotai/kimi-k3".to_owned()]
     );
 
     for (endpoint, top_p) in [
@@ -374,7 +423,8 @@ fn routing_policy_selects_modal_in_both_profiles_and_rejects_provider_selection(
         assert_eq!(decision.selected_provider, "openrouter");
         assert_eq!(constrained["model"], "openrouter/moonshotai/kimi-k3");
         assert_eq!(
-            decision.fallback_model, None,
+            decision.fallback_models,
+            Vec::<String>::new(),
             "Modal was filtered, leaving no second compatible route"
         );
         assert!(!decision.has_alternatives);
@@ -395,7 +445,7 @@ fn routing_policy_selects_modal_in_both_profiles_and_rejects_provider_selection(
         .unwrap();
     assert_eq!(decision.selected_provider, "openrouter");
     assert_eq!(streaming["model"], "openrouter/moonshotai/kimi-k3");
-    assert_eq!(decision.fallback_model, None);
+    assert!(decision.fallback_models.is_empty());
     assert!(!decision.has_alternatives);
 
     let mut concrete_provider =
@@ -422,7 +472,7 @@ fn routing_policy_selects_modal_in_both_profiles_and_rejects_provider_selection(
 }
 
 #[test]
-fn routing_policy_selects_deepinfra_only_for_beta_with_openrouter_fallback() {
+fn routing_policy_selects_deepinfra_in_both_profiles_with_openrouter_fallback() {
     let registry = checked_registry();
     let routing = RoutingPolicy::from_registry(
         &registry,
@@ -437,20 +487,23 @@ fn routing_policy_selects_deepinfra_only_for_beta_with_openrouter_fallback() {
     let production_decision = routing
         .route(RoutingProfile::Production, &mut production)
         .unwrap();
-    assert_eq!(production_decision.selected_provider, "openrouter");
+    assert_eq!(production_decision.selected_provider, "deepinfra");
     assert_eq!(
         production["model"],
-        "openrouter/meta-llama/llama-3.3-70b-instruct"
+        "deepinfra/meta-llama/llama-3.3-70b-instruct"
     );
-    assert_eq!(production_decision.fallback_model, None);
-    assert!(!production_decision.has_alternatives);
+    assert_eq!(
+        production_decision.fallback_models,
+        ["openrouter/meta-llama/llama-3.3-70b-instruct".to_owned()]
+    );
+    assert!(production_decision.has_alternatives);
 
     let beta_decision = routing.route(RoutingProfile::Beta, &mut beta).unwrap();
     assert_eq!(beta_decision.selected_provider, "deepinfra");
     assert_eq!(beta["model"], "deepinfra/meta-llama/llama-3.3-70b-instruct");
     assert_eq!(
-        beta_decision.fallback_model.as_deref(),
-        Some("openrouter/meta-llama/llama-3.3-70b-instruct")
+        beta_decision.fallback_models,
+        ["openrouter/meta-llama/llama-3.3-70b-instruct".to_owned()]
     );
     assert!(beta_decision.has_alternatives);
 
@@ -462,10 +515,10 @@ fn routing_policy_selects_deepinfra_only_for_beta_with_openrouter_fallback() {
     let forged_decision = routing
         .route(RoutingProfile::Production, &mut production_forged)
         .unwrap();
-    assert_eq!(forged_decision.selected_provider, "openrouter");
+    assert_eq!(forged_decision.selected_provider, "deepinfra");
     assert_eq!(
         production_forged["model"],
-        "openrouter/meta-llama/llama-3.3-70b-instruct"
+        "deepinfra/meta-llama/llama-3.3-70b-instruct"
     );
 
     let mut legacy = json!({"model": slug, "provider": {"sort": "price"}});
@@ -481,30 +534,23 @@ fn routing_policy_selects_deepinfra_only_for_beta_with_openrouter_fallback() {
         legacy["model"],
         "openrouter/meta-llama/llama-3.3-70b-instruct"
     );
-    assert_eq!(legacy_decision.fallback_model, None);
+    assert!(legacy_decision.fallback_models.is_empty());
 }
 
 #[test]
-fn blackbox_glm_cost_is_exact_and_sell_price_remains_route_independent() {
+fn blackbox_glm_cost_is_exact() {
     let registry = checked_registry();
     let prices = PriceTable::from_registry(&registry).unwrap();
     let slug = "z-ai/glm-5.2";
     let blackbox = prices.get("blackbox", slug).unwrap();
-    let openrouter = prices.get("openrouter", slug).unwrap();
-
-    assert_eq!(blackbox.sell_price, openrouter.sell_price);
     assert_eq!(
         blackbox,
-        &BillingPrices {
+        &ProviderPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: Decimal::new(140, 2),
                 output_price_per_mtok: Decimal::new(440, 2),
             },
             provider_cached_input_price_per_mtok: Some(Decimal::new(14, 2)),
-            sell_price: ModelPrices {
-                input_price_per_mtok: Decimal::new(70, 2),
-                output_price_per_mtok: Decimal::new(220, 2),
-            },
         }
     );
 
@@ -519,8 +565,8 @@ fn blackbox_glm_cost_is_exact_and_sell_price_remains_route_independent() {
         "0.0000212400"
     );
     assert_eq!(
-        cost_usd(&blackbox.sell_price, &repeated_paid_probe).to_string(),
-        "0.0000207000"
+        cost_usd(&blackbox.provider_cost, &repeated_paid_probe).to_string(),
+        "0.0000414000"
     );
     assert_eq!(
         provider_cost_usd(blackbox, &repeated_paid_probe, None),
@@ -535,7 +581,7 @@ fn blackbox_glm_cost_is_exact_and_sell_price_remains_route_independent() {
 }
 
 #[test]
-fn routing_policy_selects_blackbox_only_for_default_beta_requests() {
+fn routing_policy_orders_deepinfra_blackbox_and_openrouter_for_glm() {
     let registry = checked_registry();
     let routing = RoutingPolicy::from_registry(
         &registry,
@@ -550,16 +596,25 @@ fn routing_policy_selects_blackbox_only_for_default_beta_requests() {
     let production_decision = routing
         .route(RoutingProfile::Production, &mut production)
         .unwrap();
-    assert_eq!(production_decision.selected_provider, "openrouter");
-    assert_eq!(production["model"], "openrouter/z-ai/glm-5.2");
-    assert_eq!(production_decision.fallback_model, None);
+    assert_eq!(production_decision.selected_provider, "deepinfra-glm");
+    assert_eq!(production["model"], "deepinfra-glm/z-ai/glm-5.2");
+    assert_eq!(
+        production_decision.fallback_models,
+        [
+            "blackbox/z-ai/glm-5.2".to_owned(),
+            "openrouter/z-ai/glm-5.2".to_owned(),
+        ]
+    );
 
     let beta_decision = routing.route(RoutingProfile::Beta, &mut beta).unwrap();
-    assert_eq!(beta_decision.selected_provider, "blackbox");
-    assert_eq!(beta["model"], "blackbox/z-ai/glm-5.2");
+    assert_eq!(beta_decision.selected_provider, "deepinfra-glm");
+    assert_eq!(beta["model"], "deepinfra-glm/z-ai/glm-5.2");
     assert_eq!(
-        beta_decision.fallback_model.as_deref(),
-        Some("openrouter/z-ai/glm-5.2")
+        beta_decision.fallback_models,
+        [
+            "blackbox/z-ai/glm-5.2".to_owned(),
+            "openrouter/z-ai/glm-5.2".to_owned(),
+        ]
     );
 
     let mut explicit_price = json!({
@@ -572,8 +627,11 @@ fn routing_policy_selects_blackbox_only_for_default_beta_requests() {
     assert_eq!(price_decision.selected_provider, "openrouter");
     assert_eq!(explicit_price["model"], "openrouter/z-ai/glm-5.2");
     assert_eq!(
-        price_decision.fallback_model.as_deref(),
-        Some("blackbox/z-ai/glm-5.2")
+        price_decision.fallback_models,
+        [
+            "deepinfra-glm/z-ai/glm-5.2".to_owned(),
+            "blackbox/z-ai/glm-5.2".to_owned(),
+        ]
     );
 
     let mut legacy = json!({"model": slug});
@@ -586,7 +644,7 @@ fn routing_policy_selects_blackbox_only_for_default_beta_requests() {
         .unwrap();
     assert_eq!(legacy_decision.selected_provider, "openrouter");
     assert_eq!(legacy["model"], "openrouter/z-ai/glm-5.2");
-    assert_eq!(legacy_decision.fallback_model, None);
+    assert!(legacy_decision.fallback_models.is_empty());
 
     let mut production_forged = json!({
         "model": slug,
@@ -595,8 +653,8 @@ fn routing_policy_selects_blackbox_only_for_default_beta_requests() {
     let forged_decision = routing
         .route(RoutingProfile::Production, &mut production_forged)
         .unwrap();
-    assert_eq!(forged_decision.selected_provider, "openrouter");
-    assert_eq!(production_forged["model"], "openrouter/z-ai/glm-5.2");
+    assert_eq!(forged_decision.selected_provider, "deepinfra-glm");
+    assert_eq!(production_forged["model"], "deepinfra-glm/z-ai/glm-5.2");
 }
 
 #[test]
@@ -667,7 +725,7 @@ fn compiled_sidecar_keeps_modal_internal_with_openrouter_fallback() {
 }
 
 #[test]
-fn compiled_sidecar_keeps_deepinfra_beta_only_with_openrouter_fallback() {
+fn compiled_sidecar_keeps_deepinfra_in_both_profiles_with_openrouter_fallback() {
     let registry = checked_registry();
     let compiled = compile(&registry, SidecarConfigOptions::default()).unwrap();
     let config: Value = serde_yaml::from_slice(&compiled).unwrap();
@@ -706,6 +764,8 @@ fn compiled_sidecar_keeps_deepinfra_beta_only_with_openrouter_fallback() {
         production["routing"]["failover"]["targets"],
         serde_yaml::from_str::<Value>(
             r#"
+- model: deepinfra/meta-llama/llama-3.3-70b-instruct
+  priority: 1
 - model: openrouter/meta-llama/llama-3.3-70b-instruct
   priority: 255
 "#
@@ -717,7 +777,7 @@ fn compiled_sidecar_keeps_deepinfra_beta_only_with_openrouter_fallback() {
         serde_yaml::from_str::<Value>(
             r#"
 - model: deepinfra/meta-llama/llama-3.3-70b-instruct
-  priority: 0
+  priority: 1
 - model: openrouter/meta-llama/llama-3.3-70b-instruct
   priority: 255
 "#
@@ -727,7 +787,7 @@ fn compiled_sidecar_keeps_deepinfra_beta_only_with_openrouter_fallback() {
 }
 
 #[test]
-fn compiled_sidecar_keeps_blackbox_beta_only_with_openrouter_fallback() {
+fn compiled_sidecar_keeps_blackbox_in_both_profiles_with_openrouter_fallback() {
     let registry = checked_registry();
     let compiled = compile(&registry, SidecarConfigOptions::default()).unwrap();
     let config: Value = serde_yaml::from_slice(&compiled).unwrap();
@@ -743,6 +803,22 @@ fn compiled_sidecar_keeps_blackbox_beta_only_with_openrouter_fallback() {
         direct["responseHeaders"]["set"]["x-seren-served-provider"],
         "blackbox"
     );
+    let deepinfra = named_entry(models, "deepinfra-glm/z-ai/glm-5.2");
+    assert_eq!(deepinfra["provider"], "openAI");
+    assert_eq!(
+        deepinfra["params"]["baseUrl"],
+        "https://api.deepinfra.com/v1/openai"
+    );
+    assert_eq!(deepinfra["params"]["model"], "zai-org/GLM-5.2");
+    assert_eq!(deepinfra["overrides"]["model"], "zai-org/GLM-5.2");
+    assert_eq!(
+        deepinfra["params"]["apiKey"],
+        "$SEREN_ROUTER_KEY_DEEPINFRA_GLM"
+    );
+    assert_eq!(
+        deepinfra["responseHeaders"]["set"]["x-seren-served-provider"],
+        "deepinfra-glm"
+    );
 
     let virtual_models = config["llm"]["virtualModels"].as_sequence().unwrap();
     let production = named_entry(virtual_models, "seren-profile-production/z-ai/glm-5.2");
@@ -751,6 +827,10 @@ fn compiled_sidecar_keeps_blackbox_beta_only_with_openrouter_fallback() {
         production["routing"]["failover"]["targets"],
         serde_yaml::from_str::<Value>(
             r#"
+- model: deepinfra-glm/z-ai/glm-5.2
+  priority: 0
+- model: blackbox/z-ai/glm-5.2
+  priority: 1
 - model: openrouter/z-ai/glm-5.2
   priority: 255
 "#
@@ -761,8 +841,10 @@ fn compiled_sidecar_keeps_blackbox_beta_only_with_openrouter_fallback() {
         beta["routing"]["failover"]["targets"],
         serde_yaml::from_str::<Value>(
             r#"
-- model: blackbox/z-ai/glm-5.2
+- model: deepinfra-glm/z-ai/glm-5.2
   priority: 0
+- model: blackbox/z-ai/glm-5.2
+  priority: 1
 - model: openrouter/z-ai/glm-5.2
   priority: 255
 "#
@@ -772,14 +854,13 @@ fn compiled_sidecar_keeps_blackbox_beta_only_with_openrouter_fallback() {
 }
 
 #[test]
-fn direct_and_fallback_routes_keep_one_reviewed_sell_price_and_separate_costs() {
+fn direct_and_fallback_routes_keep_exact_provider_costs() {
     let registry = checked_registry();
     let prices = PriceTable::from_registry(&registry).unwrap();
     let slug = "meta-llama/llama-3.3-70b-instruct";
     let fallback = prices.get("openrouter", slug).unwrap();
     let direct = prices.get("deepinfra", slug).unwrap();
 
-    assert_eq!(fallback.sell_price, direct.sell_price);
     assert_eq!(
         direct.provider_cost,
         ModelPrices {
@@ -787,23 +868,23 @@ fn direct_and_fallback_routes_keep_one_reviewed_sell_price_and_separate_costs() 
             output_price_per_mtok: Decimal::new(32, 2),
         }
     );
-    assert_eq!(fallback.provider_cost, fallback.sell_price);
+    assert_eq!(
+        fallback.provider_cost,
+        ModelPrices {
+            input_price_per_mtok: Decimal::new(13, 2),
+            output_price_per_mtok: Decimal::new(40, 2),
+        }
+    );
 
     let observed_usage = Usage {
         prompt_tokens: 3_962,
         completion_tokens: 214,
     };
-    let sell_subtotal = cost_usd(&direct.sell_price, &observed_usage);
     let direct_provider_cost = cost_usd(&direct.provider_cost, &observed_usage);
     let fallback_provider_cost = cost_usd(&fallback.provider_cost, &observed_usage);
 
-    assert_eq!(sell_subtotal.to_string(), "0.0006006600");
-    assert_eq!(fallback_provider_cost, sell_subtotal);
+    assert_eq!(fallback_provider_cost.to_string(), "0.0006006600");
     assert_eq!(direct_provider_cost.to_string(), "0.0004646800");
-    assert_eq!(
-        (sell_subtotal - direct_provider_cost).to_string(),
-        "0.0001359800"
-    );
 }
 
 fn checked_registry() -> Registry {
