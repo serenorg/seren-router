@@ -7,15 +7,9 @@ The core requirement: **adding a new provider must be a data + secret operation,
 
 ## Provider registry entry (declarative)
 
-Canonical sell prices and one config row per inference host are versioned in this
-repo:
+One config row per inference host is versioned in this repo:
 
 ```yaml
-sell_prices:
-  - slug: meta-llama/llama-3.3-70b-instruct
-    input_price_per_mtok: "0.13"
-    output_price_per_mtok: "0.40"
-
 providers:
   - id: deepinfra
     display_name: DeepInfra
@@ -23,7 +17,7 @@ providers:
     secret_env: SEREN_ROUTER_KEY_DEEPINFRA # name only — never the key
     enabled: true
     priority: 0
-    profiles: [beta]
+    profiles: [production, beta]
     models:
       - slug: meta-llama/llama-3.3-70b-instruct
         name: Meta Llama 3.3 70B Instruct
@@ -39,9 +33,8 @@ Key points:
 
 - **`secret_env` is a name, not a key.** The actual credential lives in the
   secrets manager (below). Rotating or adding a key never puts it in this file.
-- **Provider prices are cost, not customer price.** The top-level `sell_prices`
-  table owns the route-independent customer subtotal reported at `usage.cost`.
-  See `docs/04`.
+- **Provider prices are the reported cost.** `usage.cost` is computed from the exact
+  served-provider mapping so Gateway can apply its existing fee. See `docs/04`.
 - **Public aliases do not replace internal attribution.** Optional
   `public_display_name` and `public_tag` values must be configured together.
   Catalog endpoint and generation metadata responses use those aliases, while
@@ -50,15 +43,13 @@ Key points:
   `display_name` / `id` response behavior.
 - **Cached-input prices are explicit.** A model mapping may declare
   `cached_input_price_per_mtok` when the provider charges a distinct cache-hit
-  rate. The router always records the exact sell subtotal from total prompt and
-  completion usage. It requires the upstream usage object to report an exact
-  cached-token count to record provider cost; missing or invalid detail persists
-  `provider_cost_usd` as null rather than estimating it.
+  rate. When the provider does not return a trustworthy numeric cost, the router
+  requires the upstream usage object to report an exact cached-token count. Missing
+  or invalid detail fails closed rather than estimating a cost.
   Blackbox GLM 5.2 is a concrete example: repeated paid JSON responses on
-  2026-07-30 metered cache reads at `$0.14/MTok`, so the beta mapping pins that
+  2026-07-30 metered cache reads at `$0.14/MTok`, so the mapping pins that
   exact rate even though the public provider page currently displays `$0.26/MTok`.
-  The discrepancy remains a documented reconciliation item and never changes the
-  canonical sell row.
+  The discrepancy remains a documented reconciliation item.
 - **Request compatibility is declarative per provider/model.** Omitted
   `request_constraints` accepts both Chat Completions and legacy Completions, with
   streaming enabled and any numeric `top_p`. A narrower OpenAI-compatible route can
@@ -137,16 +128,15 @@ A scheduled task:
 3. Records that provider's cost, context window, and capabilities per slug.
 4. Rebuilds the **slug → providers index** that the router ranks over, and which backs `GET /api/v1/models`.
 
-Discovery never changes `sell_prices`. A new slug or customer-price change needs
-explicit owner review. Catalog `pricing` fields always come from the reviewed sell
-table, so provider discovery cannot silently alter customer billing.
+Discovery never changes a checked provider price without review. Endpoint catalog
+`pricing` fields come from each provider mapping; the canonical model row
+deterministically uses the cheapest enabled endpoint.
 
 ## Onboarding a provider — the happy path
 
-1. Add or review the canonical sell-price row.
-2. Add a provider registry row with exact provider costs.
-3. Drop the key into the secrets manager.
-4. Let the sync job discover its models.
+1. Add a provider registry row with exact provider costs.
+2. Drop the key into the secrets manager.
+3. Let the sync job discover its models.
 
 No deploy for standard hosts. A non-standard host additionally needs an adapter (code).
 

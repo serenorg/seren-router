@@ -983,7 +983,7 @@ mod tests {
 
         assert_eq!(stream.done_count, 1);
         assert_eq!(stream.events.len(), 4);
-        assert_eq!(stream.usage_cost, "0.0000088000".parse().unwrap());
+        assert_eq!(stream.usage_cost, "0.0000022000".parse().unwrap());
         assert!(stream_schema(&stream).len() >= 2);
     }
 

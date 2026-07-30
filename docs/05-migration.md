@@ -32,9 +32,8 @@ That makes seren-router an immediate *superset* of today's behavior. We can repo
 2. Enable it only if compatibility, cost, and reliability remain green.
 3. Re-evaluate Fireworks and Together after their documented no-go conditions
    change.
-4. Validate Blackbox GLM 5.2 through the credential-bound internal beta profile.
-   Keep production on OpenRouter while the standard-account commercial restriction
-   and negative gross margin remain.
+4. Validate Blackbox GLM 5.2 through the credential-bound beta profile, then enable
+   it for production after compatibility, cost, fallback, and rollback gates pass.
 5. … each move shifts more traffic off OpenRouter onto direct connections.
 
 When direct coverage reaches the models users actually call (checked against recent `seren-models` usage), OpenRouter's fallback share trends to zero — and we **delete that registry entry**. If the Stripe deal closes and OpenRouter's terms change mid-migration, we are already mostly off it.
@@ -52,13 +51,10 @@ When direct coverage reaches the models users actually call (checked against rec
 
 ## Pricing and cost gate
 
-Before and during migration, confirm that seren-router reports the reviewed
-route-independent sell subtotal at `usage.cost` for the same model and token counts.
-Then compare the separately stored `provider_cost_usd` across routes. A direct
-provider should ordinarily cost Seren less than the OpenRouter fallback while the
-customer sell price remains exactly the catalog price. If it does not, leave that slug
-on the production fallback; a bounded internal-beta route may still be useful for
-resilience testing when its audience and spend are explicitly constrained.
+Before and during migration, confirm that seren-router reports the serving provider's
+exact cost at `usage.cost` and stores the same value in `provider_cost_usd`. Compare
+price and measured throughput across compatible routes, while retaining OpenRouter as
+the concrete fallback.
 
 ## Other OpenRouter dependencies to absorb later
 

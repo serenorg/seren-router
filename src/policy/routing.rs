@@ -48,7 +48,7 @@ pub struct RouteDecision {
     pub profile: RoutingProfile,
     pub canonical_model: String,
     pub selected_provider: String,
-    pub fallback_model: Option<String>,
+    pub fallback_models: Vec<String>,
     pub has_alternatives: bool,
 }
 
@@ -184,22 +184,26 @@ impl RoutingPolicy {
             return Err(RouteRequestError::NoEligibleRoute);
         };
         let selected_provider = selected.provider_id().to_owned();
-        let fallback_candidates: Vec<_> = candidates
+        let mut fallback_candidates: Vec<_> = candidates
             .iter()
             .filter(|candidate| candidate.provider_id() != selected_provider)
             .cloned()
             .collect();
-        // Planning a fallback must not perturb the process RNG used for primary
+        // Planning fallbacks must not perturb the process RNG used for primary
         // traffic selection when the fallback is never exercised.
         let mut fallback_rng = StdRng::seed_from_u64(0x5e_e7_fa_11_ba_c0);
-        let fallback_model = select_route(
+        let mut fallback_models = Vec::with_capacity(fallback_candidates.len());
+        while let Some(candidate) = select_route(
             &fallback_candidates,
             parsed.preference,
             &self.config.policy(),
             &recent_share,
             &mut fallback_rng,
-        )
-        .map(|candidate| format!("{}/{}", candidate.provider_id(), parsed.canonical_model));
+        ) {
+            let provider_id = candidate.provider_id().to_owned();
+            fallback_models.push(format!("{provider_id}/{}", parsed.canonical_model));
+            fallback_candidates.retain(|candidate| candidate.provider_id() != provider_id);
+        }
         recent_share.record(selected_provider.clone());
         state.shares.insert(route_key, recent_share);
         drop(state);
@@ -208,10 +212,10 @@ impl RoutingPolicy {
 
         Ok(RouteDecision {
             profile,
-            fallback_model: fallback_model.clone(),
+            has_alternatives: !fallback_models.is_empty(),
+            fallback_models,
             canonical_model: parsed.canonical_model,
             selected_provider,
-            has_alternatives: fallback_model.is_some(),
         })
     }
 
@@ -367,7 +371,7 @@ mod tests {
                 profile: RoutingProfile::Production,
                 canonical_model: "vendor/model".to_owned(),
                 selected_provider: "fast".to_owned(),
-                fallback_model: Some("cheap/vendor/model".to_owned()),
+                fallback_models: vec!["cheap/vendor/model".to_owned()],
                 has_alternatives: true,
             }
         );
@@ -419,7 +423,6 @@ mod tests {
     #[test]
     fn provider_selection_and_share_state_are_profile_scoped() {
         let registry = Registry {
-            sell_prices: vec![],
             providers: vec![
                 provider_for("production-only", 0, "1.0", [RoutingProfile::Production]),
                 provider_for("beta-only", 0, "1.0", [RoutingProfile::Beta]),
@@ -483,8 +486,11 @@ mod tests {
 
             assert_eq!(decision.selected_provider, "constrained");
             assert_eq!(
-                decision.fallback_model.as_deref(),
-                Some("compatible-a/vendor/model")
+                decision.fallback_models,
+                [
+                    "compatible-a/vendor/model".to_owned(),
+                    "compatible-b/vendor/model".to_owned(),
+                ]
             );
             assert!(decision.has_alternatives);
         }
@@ -505,8 +511,8 @@ mod tests {
 
             assert_eq!(decision.selected_provider, "compatible-a");
             assert_eq!(
-                decision.fallback_model.as_deref(),
-                Some("compatible-b/vendor/model")
+                decision.fallback_models,
+                ["compatible-b/vendor/model".to_owned()]
             );
             assert!(decision.has_alternatives);
         }
@@ -526,8 +532,8 @@ mod tests {
             .unwrap();
         assert_eq!(decision.selected_provider, "compatible-a");
         assert_eq!(
-            decision.fallback_model.as_deref(),
-            Some("compatible-b/vendor/model")
+            decision.fallback_models,
+            ["compatible-b/vendor/model".to_owned()]
         );
         assert!(decision.has_alternatives);
     }
@@ -635,8 +641,8 @@ mod tests {
 
         assert_eq!(decision.selected_provider, "preferred");
         assert_eq!(
-            decision.fallback_model.as_deref(),
-            Some("eligible/vendor/model")
+            decision.fallback_models,
+            ["eligible/vendor/model".to_owned()]
         );
         assert!(decision.has_alternatives);
     }
@@ -654,10 +660,7 @@ mod tests {
     }
 
     fn routing_for_providers(providers: Vec<Provider>) -> RoutingPolicy {
-        let registry = Registry {
-            sell_prices: vec![],
-            providers,
-        };
+        let registry = Registry { providers };
         let config = RoutingConfig::new("10".parse().unwrap(), 0.1, Decimal::ONE, 100).unwrap();
         RoutingPolicy::from_registry_with_rng(
             &registry,

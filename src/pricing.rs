@@ -1,5 +1,5 @@
-// ABOUTME: Builds exact provider-cost and customer-sell lookups from the registry.
-// ABOUTME: Computes both USD amounts without floating-point arithmetic.
+// ABOUTME: Builds exact provider-cost lookups from the reviewed registry.
+// ABOUTME: Computes served-provider USD cost without floating-point arithmetic.
 
 use std::collections::HashMap;
 
@@ -19,10 +19,9 @@ pub struct ModelPrices {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BillingPrices {
+pub struct ProviderPrices {
     pub provider_cost: ModelPrices,
     pub provider_cached_input_price_per_mtok: Option<Decimal>,
-    pub sell_price: ModelPrices,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +32,7 @@ pub struct Usage {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PriceTable {
-    prices_by_provider: HashMap<String, HashMap<String, BillingPrices>>,
+    prices_by_provider: HashMap<String, HashMap<String, ProviderPrices>>,
 }
 
 #[derive(Debug, Eq, Error, PartialEq)]
@@ -90,19 +89,12 @@ impl PriceTable {
                     }
                 }
 
-                let sell_price = registry
-                    .sell_price(&model.slug)
-                    .expect("validated registry has a sell price for every model");
-                let model_prices = BillingPrices {
+                let model_prices = ProviderPrices {
                     provider_cost: ModelPrices {
                         input_price_per_mtok: model.input_price_per_mtok,
                         output_price_per_mtok: model.output_price_per_mtok,
                     },
                     provider_cached_input_price_per_mtok: model.cached_input_price_per_mtok,
-                    sell_price: ModelPrices {
-                        input_price_per_mtok: sell_price.input_price_per_mtok,
-                        output_price_per_mtok: sell_price.output_price_per_mtok,
-                    },
                 };
 
                 if provider_prices
@@ -120,7 +112,7 @@ impl PriceTable {
         Ok(Self { prices_by_provider })
     }
 
-    pub fn get(&self, provider_id: &str, canonical_slug: &str) -> Option<&BillingPrices> {
+    pub fn get(&self, provider_id: &str, canonical_slug: &str) -> Option<&ProviderPrices> {
         self.prices_by_provider
             .get(provider_id)
             .and_then(|provider_prices| provider_prices.get(canonical_slug))
@@ -135,7 +127,7 @@ pub fn cost_usd(prices: &ModelPrices, usage: &Usage) -> Decimal {
 }
 
 pub fn provider_cost_usd(
-    prices: &BillingPrices,
+    prices: &ProviderPrices,
     usage: &Usage,
     cached_prompt_tokens: Option<u64>,
 ) -> Option<Decimal> {
@@ -153,11 +145,20 @@ pub fn provider_cost_usd(
     Some(rounded_cost(prompt_cost + completion_cost))
 }
 
+pub fn normalize_cost_usd(cost: Decimal) -> Option<Decimal> {
+    if cost < Decimal::ZERO {
+        return None;
+    }
+
+    let mut normalized =
+        cost.round_dp_with_strategy(COST_SCALE, RoundingStrategy::MidpointAwayFromZero);
+    normalized.rescale(COST_SCALE);
+    Some(normalized)
+}
+
 fn rounded_cost(cost_per_million: Decimal) -> Decimal {
-    let mut cost = (cost_per_million / Decimal::from(TOKENS_PER_MILLION))
-        .round_dp_with_strategy(COST_SCALE, RoundingStrategy::MidpointAwayFromZero);
-    cost.rescale(COST_SCALE);
-    cost
+    normalize_cost_usd(cost_per_million / Decimal::from(TOKENS_PER_MILLION))
+        .expect("validated non-negative prices and usage produce a non-negative cost")
 }
 
 #[cfg(test)]
@@ -168,10 +169,6 @@ mod tests {
     use crate::registry::Registry;
 
     const PRICE_REGISTRY: &str = r#"
-sell_prices:
-  - slug: canonical/model
-    input_price_per_mtok: "1.00"
-    output_price_per_mtok: "2.00"
 providers:
   - id: enabled-provider
     display_name: Enabled Provider
@@ -208,16 +205,12 @@ providers:
 
         assert_eq!(
             table.get("enabled-provider", "canonical/model"),
-            Some(&BillingPrices {
+            Some(&ProviderPrices {
                 provider_cost: ModelPrices {
                     input_price_per_mtok: "0.1234500".parse().unwrap(),
                     output_price_per_mtok: "0.80".parse().unwrap(),
                 },
                 provider_cached_input_price_per_mtok: None,
-                sell_price: ModelPrices {
-                    input_price_per_mtok: "1.00".parse().unwrap(),
-                    output_price_per_mtok: "2.00".parse().unwrap(),
-                },
             })
         );
         assert_eq!(table.get("disabled-provider", "canonical/model"), None);
@@ -344,16 +337,12 @@ providers:
 
     #[test]
     fn cached_prompt_provider_cost_is_exact_and_requires_valid_usage() {
-        let prices = BillingPrices {
+        let prices = ProviderPrices {
             provider_cost: ModelPrices {
                 input_price_per_mtok: "3.00".parse().unwrap(),
                 output_price_per_mtok: "15.00".parse().unwrap(),
             },
             provider_cached_input_price_per_mtok: Some("0.30".parse().unwrap()),
-            sell_price: ModelPrices {
-                input_price_per_mtok: "4.00".parse().unwrap(),
-                output_price_per_mtok: "20.00".parse().unwrap(),
-            },
         };
         let usage = Usage {
             prompt_tokens: 100,
@@ -367,11 +356,22 @@ providers:
                 .to_string(),
             "0.0003420000"
         );
-        assert_eq!(
-            cost_usd(&prices.sell_price, &usage).to_string(),
-            "0.0006000000"
-        );
         assert_eq!(provider_cost_usd(&prices, &usage, None), None);
         assert_eq!(provider_cost_usd(&prices, &usage, Some(101)), None);
+    }
+
+    #[test]
+    fn provider_reported_cost_is_normalized_without_floating_point() {
+        assert_eq!(
+            normalize_cost_usd("0.00034092".parse().unwrap())
+                .unwrap()
+                .to_string(),
+            "0.0003409200"
+        );
+        assert_eq!(
+            normalize_cost_usd("-0.01".parse().unwrap()),
+            None,
+            "negative provider-reported cost must fail closed"
+        );
     }
 }

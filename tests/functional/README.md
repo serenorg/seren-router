@@ -214,9 +214,10 @@ account run showed that Modal completed an SSE request but omitted the terminal 
 object, so the registry makes `stream: true` ineligible for Modal and routes it to a
 compatible beta provider. No automatic third probe is allowed; review account billing
 and use a fresh review UUID before rerunning a failed gate.
-Both responses must preserve the reviewed customer sell subtotal and neutral public
-model/provider naming. A cold response without cache detail must persist provider cost
-as null; a response with exact detail must persist the exact gross provider cost.
+Both responses must preserve exact provider cost and neutral public model/provider
+naming. If no trustworthy upstream `usage.cost` exists, a response without exact cache
+detail must fail closed; a response with exact detail must persist the exact provider
+cost.
 The test also proves the database retains the internal provider ID while
 `/generation` returns only the neutral alias.
 

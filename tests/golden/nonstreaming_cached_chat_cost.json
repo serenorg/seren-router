@@ -14,7 +14,7 @@
   "object": "chat.completion",
   "usage": {
     "completion_tokens": 10,
-    "cost": 0.0006000000,
+    "cost": 0.0003420000,
     "prompt_tokens": 100,
     "prompt_tokens_details": {
       "cached_tokens": 40

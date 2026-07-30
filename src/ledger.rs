@@ -1,4 +1,4 @@
-// ABOUTME: Persists provider cost and customer sell subtotal for reconciliation.
+// ABOUTME: Persists exact served-provider cost for reconciliation.
 // ABOUTME: Serves OpenRouter-shaped generation metadata by provider response ID.
 
 use std::collections::BTreeMap;
@@ -95,10 +95,11 @@ impl Ledger {
             .bind(&generation.provider_id)
             .bind(generation.prompt_tokens)
             .bind(generation.completion_tokens)
-            // cost_usd remains a rollback-compatible mirror of sell_price_usd.
-            .bind(generation.sell_price_usd)
-            .bind(generation.provider_cost_usd)
-            .bind(generation.sell_price_usd)
+            // The historical sell_price_usd column stays null for new writes.
+            // cost_usd and provider_cost_usd both hold the metered provider cost.
+            .bind(generation.cost_usd)
+            .bind(generation.cost_usd)
+            .bind(Option::<Decimal>::None)
             .bind(generation.latency_ms)
             .bind(generation.status)
             .execute(&self.pool),
@@ -135,7 +136,10 @@ impl Ledger {
                     provider_id,
                     prompt_tokens,
                     completion_tokens,
-                    COALESCE(sell_price_usd, cost_usd) AS sell_price_usd,
+                    CASE
+                        WHEN sell_price_usd IS NOT NULL THEN sell_price_usd
+                        ELSE COALESCE(provider_cost_usd, cost_usd)
+                    END AS reported_cost_usd,
                     provider_cost_usd,
                     latency_ms
                 FROM generations
@@ -171,8 +175,7 @@ pub(crate) struct GenerationWrite {
     pub(crate) provider_id: String,
     pub(crate) prompt_tokens: i64,
     pub(crate) completion_tokens: i64,
-    pub(crate) provider_cost_usd: Option<Decimal>,
-    pub(crate) sell_price_usd: Decimal,
+    pub(crate) cost_usd: Decimal,
     pub(crate) latency_ms: i64,
     pub(crate) status: i16,
 }
@@ -185,7 +188,7 @@ struct Generation {
     provider_id: String,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
-    sell_price_usd: Option<Decimal>,
+    reported_cost_usd: Option<Decimal>,
     provider_cost_usd: Option<Decimal>,
     latency_ms: i64,
 }
@@ -229,7 +232,7 @@ pub(crate) async fn get_generation(
 
 fn generation_response(generation: Generation, provider_name: String) -> Response {
     let total_cost = generation
-        .sell_price_usd
+        .reported_cost_usd
         .map(decimal_value)
         .unwrap_or(Value::Null);
 
@@ -291,8 +294,7 @@ mod tests {
             provider_id: "provider-a".to_owned(),
             prompt_tokens: 12,
             completion_tokens: 5,
-            provider_cost_usd: Some("0.0000150000".parse().unwrap()),
-            sell_price_usd: "0.0000190000".parse().unwrap(),
+            cost_usd: "0.0000150000".parse().unwrap(),
             latency_ms: 321,
             status: 200,
         };
@@ -316,15 +318,15 @@ mod tests {
         assert_eq!(stored.provider_id, write.provider_id);
         assert_eq!(stored.prompt_tokens, Some(write.prompt_tokens));
         assert_eq!(stored.completion_tokens, Some(write.completion_tokens));
-        assert_eq!(stored.provider_cost_usd, write.provider_cost_usd);
-        assert_eq!(stored.sell_price_usd, Some(write.sell_price_usd));
+        assert_eq!(stored.provider_cost_usd, Some(write.cost_usd));
+        assert_eq!(stored.reported_cost_usd, Some(write.cost_usd));
         assert_eq!(
             sqlx::query_scalar::<_, Decimal>("SELECT cost_usd FROM generations WHERE id = $1")
                 .bind(&write.id)
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            write.sell_price_usd
+            write.cost_usd
         );
         assert_eq!(stored.latency_ms, write.latency_ms);
         assert_eq!(
@@ -360,7 +362,7 @@ mod tests {
         assert_eq!(found["data"]["tokens_completion"], write.completion_tokens);
         assert_eq!(
             found["data"]["total_cost"].as_number().unwrap().to_string(),
-            "0.0000190000"
+            "0.0000150000"
         );
         assert!(found["data"]["created_at"].as_str().is_some());
         assert_eq!(found["data"]["latency"], write.latency_ms);
@@ -409,49 +411,58 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(legacy.sell_price_usd, Some(Decimal::new(7, 10)));
+        assert_eq!(legacy.reported_cost_usd, Some(Decimal::new(7, 10)));
         assert_eq!(legacy.provider_cost_usd, None);
     }
 
     #[sqlx::test]
-    async fn unresolved_provider_cost_round_trips_with_exact_sell_price(pool: PgPool) {
+    async fn historical_sell_row_preserves_its_reported_cost(pool: PgPool) {
         let ledger = Ledger::new(pool.clone());
-        let write = GenerationWrite {
-            id: "chatcmpl-unresolved-provider-cost".to_owned(),
-            routing_profile: RoutingProfile::Beta,
-            canonical_slug: "canonical/cached-model".to_owned(),
-            provider_id: "provider-with-cache-pricing".to_owned(),
-            prompt_tokens: 1_000,
-            completion_tokens: 20,
-            provider_cost_usd: None,
-            sell_price_usd: "0.0033000000".parse().unwrap(),
-            latency_ms: 456,
-            status: 200,
-        };
-
-        ledger.insert(&write).await.unwrap();
-
+        sqlx::query(
+            r#"
+            INSERT INTO generations (
+                id,
+                routing_profile,
+                canonical_slug,
+                provider_id,
+                prompt_tokens,
+                completion_tokens,
+                cost_usd,
+                provider_cost_usd,
+                sell_price_usd,
+                latency_ms,
+                status
+            )
+            VALUES (
+                'chatcmpl-historical-sell',
+                'beta',
+                'canonical/model',
+                'historical-provider',
+                1000,
+                20,
+                0.0033000000,
+                0.0044000000,
+                0.0033000000,
+                456,
+                200
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let stored = ledger
-            .fetch(&write.id, RoutingProfile::Beta)
+            .fetch("chatcmpl-historical-sell", RoutingProfile::Beta)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.provider_cost_usd, None);
-        assert_eq!(stored.sell_price_usd, Some(write.sell_price_usd));
-
-        let persisted = sqlx::query_as::<_, (Option<Decimal>, Decimal, Decimal)>(
-            r#"
-            SELECT provider_cost_usd, sell_price_usd, cost_usd
-            FROM generations
-            WHERE id = $1
-            "#,
-        )
-        .bind(&write.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(persisted.0, None);
-        assert_eq!(persisted.1, write.sell_price_usd);
-        assert_eq!(persisted.2, write.sell_price_usd);
+        assert_eq!(
+            stored.provider_cost_usd,
+            Some("0.0044000000".parse().unwrap())
+        );
+        assert_eq!(
+            stored.reported_cost_usd,
+            Some("0.0033000000".parse().unwrap())
+        );
     }
 }

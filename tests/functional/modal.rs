@@ -23,7 +23,7 @@ use seren_router::config::RoutingConfig;
 use seren_router::gateway_auth::GatewayAuth;
 use seren_router::ledger::Ledger;
 use seren_router::policy::measurements::MeasurementStore;
-use seren_router::pricing::{BillingPrices, PriceTable, Usage, cost_usd, provider_cost_usd};
+use seren_router::pricing::{PriceTable, ProviderPrices, Usage, cost_usd, provider_cost_usd};
 use seren_router::proxy::ProxyState;
 use seren_router::registry::Registry;
 use seren_router::routes;
@@ -70,7 +70,7 @@ struct Settings {
     database_url: String,
     budget: Decimal,
     registry: Registry,
-    prices: BillingPrices,
+    prices: ProviderPrices,
     public_provider_name: String,
     public_provider_tag: String,
     private_markers: PrivateMarkers,
@@ -796,8 +796,7 @@ struct LedgerRow {
 struct UsageObservation {
     usage: Usage,
     cached_prompt_tokens: Option<u64>,
-    sell_price_usd: Decimal,
-    provider_cost_usd: Option<Decimal>,
+    cost_usd: Decimal,
 }
 
 struct SpendGuard {
@@ -872,7 +871,6 @@ async fn run_contract(settings: &Settings, pool: PgPool, cumulative_reserved_gro
     let prompt = deterministic_cache_prompt();
     let mut spend_guard = SpendGuard::new(settings);
     let mut resolved_gross_cost = Decimal::ZERO;
-    let mut observed_sell_price = Decimal::ZERO;
     let mut prompt_tokens = 0_u64;
     let mut completion_tokens = 0_u64;
     let mut cached_prompt_tokens = 0_u64;
@@ -891,8 +889,7 @@ async fn run_contract(settings: &Settings, pool: PgPool, cumulative_reserved_gro
     let json_usage = usage_observation(&json_body, &settings.prices, "JSON");
     let json_id = response_id(&json_body, "JSON");
     assert_generation_contract(&harness, settings, json_id, json_usage, "JSON").await;
-    resolved_gross_cost += json_usage.provider_cost_usd.unwrap_or(Decimal::ZERO);
-    observed_sell_price += json_usage.sell_price_usd;
+    resolved_gross_cost += json_usage.cost_usd;
     prompt_tokens += json_usage.usage.prompt_tokens;
     completion_tokens += json_usage.usage.completion_tokens;
     cached_prompt_tokens += json_usage.cached_prompt_tokens.unwrap_or_default();
@@ -917,9 +914,7 @@ async fn run_contract(settings: &Settings, pool: PgPool, cumulative_reserved_gro
                 "repeat JSON must report a positive cached-token count; automatic paid probes are capped, so review provider billing and use a fresh {BILLING_REVIEW_ID_ENV} before any rerun"
             )
         });
-    let repeat_provider_cost = repeat_json_usage
-        .provider_cost_usd
-        .expect("repeat JSON cached usage must resolve an exact provider cost");
+    let repeat_provider_cost = repeat_json_usage.cost_usd;
     assert_eq!(
         repeat_json_usage.usage.prompt_tokens, json_usage.usage.prompt_tokens,
         "the two identical prompts must have the same prompt-token count"
@@ -934,14 +929,13 @@ async fn run_contract(settings: &Settings, pool: PgPool, cumulative_reserved_gro
     )
     .await;
     resolved_gross_cost += repeat_provider_cost;
-    observed_sell_price += repeat_json_usage.sell_price_usd;
     prompt_tokens += repeat_json_usage.usage.prompt_tokens;
     completion_tokens += repeat_json_usage.usage.completion_tokens;
     cached_prompt_tokens += repeat_cached_prompt_tokens;
     spend_guard.assert_complete();
 
     println!(
-        "modal_beta_contract logical_requests={} reserved_attempt_ceiling={RESERVED_ATTEMPT_CEILING} errors=0 json_ms={:.3} repeat_json_ms={:.3} prompt_tokens={prompt_tokens} cached_prompt_tokens={cached_prompt_tokens} completion_tokens={completion_tokens} resolved_gross_provider_cost={resolved_gross_cost} reserved_gross_provider_cost_ceiling={} cumulative_reserved_gross_provider_cost={} cumulative_approved_spend={} sell_subtotal={observed_sell_price} run_budget={}",
+        "modal_beta_contract logical_requests={} reserved_attempt_ceiling={RESERVED_ATTEMPT_CEILING} errors=0 json_ms={:.3} repeat_json_ms={:.3} prompt_tokens={prompt_tokens} cached_prompt_tokens={cached_prompt_tokens} completion_tokens={completion_tokens} resolved_gross_provider_cost={resolved_gross_cost} reserved_gross_provider_cost_ceiling={} cumulative_reserved_gross_provider_cost={} cumulative_approved_spend={} run_budget={}",
         spend_guard.logical_requests_started,
         milliseconds(json_response.elapsed),
         milliseconds(repeat_json_response.elapsed),
@@ -1084,28 +1078,16 @@ async fn assert_generation_contract(
         Some(i64::try_from(usage.usage.completion_tokens).unwrap()),
         "{context} completion tokens"
     );
-    match usage.provider_cost_usd {
-        Some(expected_provider_cost) => {
-            assert!(
-                expected_provider_cost > Decimal::ZERO,
-                "{context} resolved provider cost must be positive"
-            );
-            assert_eq!(
-                row.provider_cost_usd,
-                Some(expected_provider_cost),
-                "{context} exact provider cost"
-            );
-        }
-        None => assert_eq!(
-            row.provider_cost_usd, None,
-            "{context} unresolved cold-cache provider cost must remain NULL, never a guessed zero"
-        ),
-    }
-    assert_eq!(
-        row.sell_price_usd,
-        Some(usage.sell_price_usd),
-        "{context} exact customer sell price"
+    assert!(
+        usage.cost_usd > Decimal::ZERO,
+        "{context} resolved provider cost must be positive"
     );
+    assert_eq!(
+        row.provider_cost_usd,
+        Some(usage.cost_usd),
+        "{context} exact provider cost"
+    );
+    assert_eq!(row.sell_price_usd, None, "{context} historical sell column");
     assert_eq!(row.status, 200, "{context} ledger status");
 
     let public = harness.public_generation(id).await;
@@ -1135,12 +1117,12 @@ async fn assert_generation_contract(
     );
     assert_eq!(
         decimal_at(&body["data"]["total_cost"], "generation total_cost"),
-        usage.sell_price_usd,
-        "{context} public generation sell price"
+        usage.cost_usd,
+        "{context} public generation provider cost"
     );
 }
 
-fn usage_observation(value: &Value, prices: &BillingPrices, context: &str) -> UsageObservation {
+fn usage_observation(value: &Value, prices: &ProviderPrices, context: &str) -> UsageObservation {
     let usage_value = value
         .get("usage")
         .and_then(Value::as_object)
@@ -1179,7 +1161,8 @@ fn usage_observation(value: &Value, prices: &BillingPrices, context: &str) -> Us
         );
     }
 
-    let sell_price_usd = cost_usd(&prices.sell_price, &usage);
+    let provider_cost_usd = provider_cost_usd(prices, &usage, cached_prompt_tokens)
+        .unwrap_or_else(|| panic!("{context} provider cost requires exact cached-token telemetry"));
     assert_eq!(
         decimal_at(
             usage_value
@@ -1187,27 +1170,23 @@ fn usage_observation(value: &Value, prices: &BillingPrices, context: &str) -> Us
                 .expect("usage.cost must be injected"),
             "usage.cost"
         ),
-        sell_price_usd,
-        "{context} exact customer sell cost"
+        provider_cost_usd,
+        "{context} exact provider cost"
     );
-    let provider_cost_usd = provider_cost_usd(prices, &usage, cached_prompt_tokens);
     let uncached_provider_cost_upper_bound_usd = cost_usd(&prices.provider_cost, &usage);
-    if let Some(provider_cost_usd) = provider_cost_usd {
-        assert!(
-            provider_cost_usd > Decimal::ZERO,
-            "{context} resolved provider cost must be positive"
-        );
-        assert!(
-            provider_cost_usd <= uncached_provider_cost_upper_bound_usd,
-            "{context} cached provider cost exceeds the uncached upper bound"
-        );
-    }
+    assert!(
+        provider_cost_usd > Decimal::ZERO,
+        "{context} resolved provider cost must be positive"
+    );
+    assert!(
+        provider_cost_usd <= uncached_provider_cost_upper_bound_usd,
+        "{context} cached provider cost exceeds the uncached upper bound"
+    );
 
     UsageObservation {
         usage,
         cached_prompt_tokens,
-        sell_price_usd,
-        provider_cost_usd,
+        cost_usd: provider_cost_usd,
     }
 }
 

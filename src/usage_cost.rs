@@ -1,5 +1,5 @@
-// ABOUTME: Resolves reviewed provider-cost and customer sell prices for one request.
-// ABOUTME: Injects only the exact sell subtotal into OpenAI-compatible usage.cost.
+// ABOUTME: Resolves the served provider's reviewed prices for one request.
+// ABOUTME: Injects only exact provider cost into OpenAI-compatible usage.cost.
 
 use std::fmt;
 use std::str::FromStr;
@@ -7,14 +7,13 @@ use std::str::FromStr;
 use serde_json::{Number, Value};
 
 use crate::attribution::ServedProvider;
-use crate::pricing::{BillingPrices, PriceTable, Usage, cost_usd, provider_cost_usd};
+use crate::pricing::{PriceTable, ProviderPrices, Usage, normalize_cost_usd, provider_cost_usd};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CostedUsage {
     pub(crate) response_id: Option<String>,
     pub(crate) usage: Usage,
-    pub(crate) provider_cost_usd: Option<rust_decimal::Decimal>,
-    pub(crate) sell_price_usd: rust_decimal::Decimal,
+    pub(crate) cost_usd: rust_decimal::Decimal,
 }
 
 pub(crate) struct CostedResponse {
@@ -27,7 +26,9 @@ pub(crate) enum CostOmission {
     InvalidJson,
     MissingUsage,
     InvalidUsage,
+    InvalidProviderCost,
     UnknownPrice,
+    UnresolvedProviderCost,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +56,13 @@ impl fmt::Display for CostOmission {
             Self::InvalidJson => formatter.write_str("response is not valid JSON"),
             Self::MissingUsage => formatter.write_str("response usage object is missing"),
             Self::InvalidUsage => formatter.write_str("response token usage is invalid"),
+            Self::InvalidProviderCost => {
+                formatter.write_str("provider-reported usage cost is invalid")
+            }
             Self::UnknownPrice => formatter.write_str("provider/model price is unknown"),
+            Self::UnresolvedProviderCost => {
+                formatter.write_str("provider cost requires exact cached-token usage")
+            }
         }
     }
 }
@@ -64,7 +71,7 @@ pub(crate) fn prices_for_request<'a>(
     requested_model: &str,
     served_provider: &ServedProvider,
     price_table: &'a PriceTable,
-) -> Result<&'a BillingPrices, CostOmission> {
+) -> Result<&'a ProviderPrices, CostOmission> {
     let canonical_slug = canonical_slug(requested_model, served_provider.as_str());
     price_table
         .get(served_provider.as_str(), canonical_slug)
@@ -89,7 +96,7 @@ pub(crate) fn inject_usage_cost(
 
 pub(crate) fn inject_usage_cost_value(
     response: &mut Value,
-    prices: &BillingPrices,
+    prices: &ProviderPrices,
 ) -> Result<CostedUsage, CostOmission> {
     let response_id = response
         .get("id")
@@ -114,17 +121,26 @@ pub(crate) fn inject_usage_cost_value(
         .and_then(Value::as_object)
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64);
-    let provider_cost = provider_cost_usd(prices, &token_usage, cached_prompt_tokens);
-    let sell_price = cost_usd(&prices.sell_price, &token_usage);
-    let cost_number = Number::from_str(&sell_price.to_string())
+    let provider_cost = match usage.get("cost") {
+        None | Some(Value::Null) => provider_cost_usd(prices, &token_usage, cached_prompt_tokens)
+            .ok_or(CostOmission::UnresolvedProviderCost)?,
+        Some(Value::Number(cost)) => {
+            let serialized = cost.to_string();
+            let cost = rust_decimal::Decimal::from_str(&serialized)
+                .or_else(|_| rust_decimal::Decimal::from_scientific(&serialized))
+                .map_err(|_| CostOmission::InvalidProviderCost)?;
+            normalize_cost_usd(cost).ok_or(CostOmission::InvalidProviderCost)?
+        }
+        Some(_) => return Err(CostOmission::InvalidProviderCost),
+    };
+    let cost_number = Number::from_str(&provider_cost.to_string())
         .expect("Decimal always serializes as a JSON number");
     usage.insert("cost".to_owned(), Value::Number(cost_number));
 
     Ok(CostedUsage {
         response_id,
         usage: token_usage,
-        provider_cost_usd: provider_cost,
-        sell_price_usd: sell_price,
+        cost_usd: provider_cost,
     })
 }
 
