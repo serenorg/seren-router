@@ -7,8 +7,8 @@ use serde_json::Value;
 use crate::pricing::ModelPrices;
 use crate::pricing::ProviderPrices;
 use crate::usage_cost::{
-    CostedUsage, inject_usage_cost_value, sanitize_public_completion_value,
-    strip_provider_specific_fields,
+    CostedUsage, ProviderReportedCostPolicy, inject_usage_cost_value_with_policy,
+    sanitize_public_completion_value, strip_provider_specific_fields,
 };
 
 pub(crate) struct UsageCostTransformer {
@@ -16,6 +16,7 @@ pub(crate) struct UsageCostTransformer {
     prices: Option<ProviderPrices>,
     response_model: Option<String>,
     costed_usage: Option<CostedUsage>,
+    provider_cost_policy: ProviderReportedCostPolicy,
     closed: bool,
 }
 
@@ -26,6 +27,7 @@ impl UsageCostTransformer {
             prices: Some(prices),
             response_model: None,
             costed_usage: None,
+            provider_cost_policy: ProviderReportedCostPolicy::UsageCostOnly,
             closed: false,
         }
     }
@@ -37,12 +39,21 @@ impl UsageCostTransformer {
             prices: None,
             response_model: Some(response_model.to_owned()),
             costed_usage: None,
+            provider_cost_policy: ProviderReportedCostPolicy::UsageCostOnly,
             closed: false,
         }
     }
 
     pub(crate) fn with_response_model(mut self, response_model: &str) -> Self {
         self.response_model = Some(response_model.to_owned());
+        self
+    }
+
+    pub(crate) fn with_provider_cost_policy(
+        mut self,
+        provider_cost_policy: ProviderReportedCostPolicy,
+    ) -> Self {
+        self.provider_cost_policy = provider_cost_policy;
         self
     }
 
@@ -131,11 +142,23 @@ impl UsageCostTransformer {
         if sanitize_public_completion_value(&mut value, response_model).is_err() {
             return self.close_with_generic_error(response_model);
         }
-        let costed_usage = self.prices.as_ref().and_then(|prices| {
-            is_terminal_usage_event(&value)
-                .then(|| inject_usage_cost_value(&mut value, prices).ok())
-                .flatten()
-        });
+        let costed_usage = if is_terminal_usage_event(&value) {
+            match self.prices.as_ref() {
+                Some(prices) => {
+                    match inject_usage_cost_value_with_policy(
+                        &mut value,
+                        prices,
+                        self.provider_cost_policy,
+                    ) {
+                        Ok(costed_usage) => Some(costed_usage),
+                        Err(_) => return self.close_with_generic_error(response_model),
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
         let Ok(json) = serde_json::to_vec(&value) else {
             return self.close_with_generic_error(response_model);
@@ -165,7 +188,14 @@ impl UsageCostTransformer {
         let sanitized = strip_provider_specific_fields(&mut value);
         let costed_usage = self.prices.as_ref().and_then(|prices| {
             is_terminal_usage_event(&value)
-                .then(|| inject_usage_cost_value(&mut value, prices).ok())
+                .then(|| {
+                    inject_usage_cost_value_with_policy(
+                        &mut value,
+                        prices,
+                        self.provider_cost_policy,
+                    )
+                    .ok()
+                })
                 .flatten()
         });
         if costed_usage.is_none() && !sanitized {
@@ -383,6 +413,119 @@ mod tests {
     }
 
     #[test]
+    fn deepinfra_terminal_estimated_cost_is_normalized_across_every_boundary() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl-deepinfra\",\"object\":\"chat.completion.chunk\",",
+            "\"model\":\"zai-org/GLM-5.2\",\"choices\":[],\"usage\":",
+            "{\"prompt_tokens\":21,\"completion_tokens\":16,",
+            "\"prompt_tokens_details\":null,",
+            "\"estimated_cost\":0.000054149999999999995}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[],\"id\":\"chatcmpl-deepinfra\",",
+            "\"model\":\"z-ai/glm-5.2\",\"object\":\"chat.completion.chunk\",",
+            "\"usage\":{\"completion_tokens\":16,\"cost\":0.0000541500,",
+            "\"prompt_tokens\":21,\"prompt_tokens_details\":null}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_policy(
+            input.as_bytes(),
+            expected.as_bytes(),
+            Some(CostedUsage {
+                response_id: Some("chatcmpl-deepinfra".to_owned()),
+                usage: crate::pricing::Usage {
+                    prompt_tokens: 21,
+                    completion_tokens: 16,
+                },
+                cost_usd: "0.0000541500".parse().unwrap(),
+            }),
+            cached_test_prices(),
+            Some("z-ai/glm-5.2"),
+            ProviderReportedCostPolicy::DeepInfraEstimatedCost,
+        );
+    }
+
+    #[test]
+    fn deepinfra_terminal_usage_cost_precedes_conflicting_estimated_cost() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl-deepinfra\",\"object\":\"chat.completion.chunk\",",
+            "\"model\":\"zai-org/GLM-5.2\",\"choices\":[],\"usage\":",
+            "{\"prompt_tokens\":21,\"completion_tokens\":16,\"cost\":0.00005415,",
+            "\"estimated_cost\":-1}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[],\"id\":\"chatcmpl-deepinfra\",",
+            "\"model\":\"z-ai/glm-5.2\",\"object\":\"chat.completion.chunk\",",
+            "\"usage\":{\"completion_tokens\":16,\"cost\":0.0000541500,",
+            "\"prompt_tokens\":21}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_policy(
+            input.as_bytes(),
+            expected.as_bytes(),
+            Some(CostedUsage {
+                response_id: Some("chatcmpl-deepinfra".to_owned()),
+                usage: crate::pricing::Usage {
+                    prompt_tokens: 21,
+                    completion_tokens: 16,
+                },
+                cost_usd: "0.0000541500".parse().unwrap(),
+            }),
+            cached_test_prices(),
+            Some("z-ai/glm-5.2"),
+            ProviderReportedCostPolicy::DeepInfraEstimatedCost,
+        );
+    }
+
+    #[test]
+    fn deepinfra_terminal_invalid_or_missing_cost_fails_closed() {
+        let expected = concat!(
+            "data: {\"error\":{\"code\":\"upstream_error\",",
+            "\"message\":\"upstream request failed\",",
+            "\"metadata\":{\"model\":\"z-ai/glm-5.2\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        for (name, usage) in [
+            (
+                "missing estimated cost",
+                "{\"prompt_tokens\":21,\"completion_tokens\":16}",
+            ),
+            (
+                "nonnumeric estimated cost",
+                "{\"prompt_tokens\":21,\"completion_tokens\":16,\"estimated_cost\":\"0.00005415\"}",
+            ),
+            (
+                "negative estimated cost",
+                "{\"prompt_tokens\":21,\"completion_tokens\":16,\"estimated_cost\":-0.00005415}",
+            ),
+            (
+                "invalid usage cost despite a valid estimate",
+                "{\"prompt_tokens\":21,\"completion_tokens\":16,\"cost\":\"invalid\",\
+                 \"estimated_cost\":0.00005415}",
+            ),
+        ] {
+            let input = format!(
+                "data: {{\"id\":\"chatcmpl-deepinfra\",\"object\":\"chat.completion.chunk\",\
+                 \"model\":\"zai-org/GLM-5.2\",\"choices\":[],\"usage\":{usage}}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            assert_every_boundary_with_policy(
+                input.as_bytes(),
+                expected.as_bytes(),
+                None,
+                cached_test_prices(),
+                Some("z-ai/glm-5.2"),
+                ProviderReportedCostPolicy::DeepInfraEstimatedCost,
+            );
+            assert!(!expected.contains("estimated_cost"), "{name}");
+        }
+    }
+
+    #[test]
     fn public_stream_keeps_standard_fields_and_strips_private_metadata() {
         let input = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\",",
@@ -580,8 +723,26 @@ mod tests {
         prices: ProviderPrices,
         response_model: Option<&str>,
     ) {
+        assert_every_boundary_with_policy(
+            input,
+            expected,
+            expected_usage,
+            prices,
+            response_model,
+            ProviderReportedCostPolicy::UsageCostOnly,
+        );
+    }
+
+    fn assert_every_boundary_with_policy(
+        input: &[u8],
+        expected: &[u8],
+        expected_usage: Option<CostedUsage>,
+        prices: ProviderPrices,
+        response_model: Option<&str>,
+        provider_cost_policy: ProviderReportedCostPolicy,
+    ) {
         for split in 0..=input.len() {
-            let transformer = transformer(prices.clone(), response_model);
+            let transformer = transformer(prices.clone(), response_model, provider_cost_policy);
             let (transformer, first, first_usage) = transformer.transform(&input[..split]);
             let (transformer, second, second_usage) = transformer.transform(&input[split..]);
             let mut output = first;
@@ -596,7 +757,7 @@ mod tests {
             );
         }
 
-        let mut transformer = transformer(prices, response_model);
+        let mut transformer = transformer(prices, response_model, provider_cost_policy);
         let mut output = Vec::new();
         let mut completed = None;
         for byte in input {
@@ -617,12 +778,16 @@ mod tests {
         );
     }
 
-    fn transformer(prices: ProviderPrices, response_model: Option<&str>) -> UsageCostTransformer {
+    fn transformer(
+        prices: ProviderPrices,
+        response_model: Option<&str>,
+        provider_cost_policy: ProviderReportedCostPolicy,
+    ) -> UsageCostTransformer {
+        let transformer =
+            UsageCostTransformer::new(prices).with_provider_cost_policy(provider_cost_policy);
         match response_model {
-            Some(response_model) => {
-                UsageCostTransformer::new(prices).with_response_model(response_model)
-            }
-            None => UsageCostTransformer::new(prices),
+            Some(response_model) => transformer.with_response_model(response_model),
+            None => transformer,
         }
     }
 

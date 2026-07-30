@@ -22,6 +22,12 @@ pub(crate) struct CostedResponse {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderReportedCostPolicy {
+    UsageCostOnly,
+    DeepInfraEstimatedCost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CostOmission {
     InvalidJson,
     MissingUsage,
@@ -88,15 +94,20 @@ pub(crate) fn inject_usage_cost(
         serde_json::from_slice(body).map_err(|_| CostOmission::InvalidJson)?;
     strip_provider_specific_fields(&mut response);
     let prices = prices_for_request(requested_model, served_provider, price_table)?;
-    let usage = inject_usage_cost_value(&mut response, prices)?;
+    let usage = inject_usage_cost_value_with_policy(
+        &mut response,
+        prices,
+        provider_reported_cost_policy(served_provider),
+    )?;
     let body = serde_json::to_vec(&response).map_err(|_| CostOmission::InvalidJson)?;
 
     Ok(CostedResponse { body, usage })
 }
 
-pub(crate) fn inject_usage_cost_value(
+pub(crate) fn inject_usage_cost_value_with_policy(
     response: &mut Value,
     prices: &ProviderPrices,
+    provider_cost_policy: ProviderReportedCostPolicy,
 ) -> Result<CostedUsage, CostOmission> {
     let response_id = response
         .get("id")
@@ -121,27 +132,60 @@ pub(crate) fn inject_usage_cost_value(
         .and_then(Value::as_object)
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64);
-    let provider_cost = match usage.get("cost") {
-        None | Some(Value::Null) => provider_cost_usd(prices, &token_usage, cached_prompt_tokens)
-            .ok_or(CostOmission::UnresolvedProviderCost)?,
-        Some(Value::Number(cost)) => {
-            let serialized = cost.to_string();
-            let cost = rust_decimal::Decimal::from_str(&serialized)
-                .or_else(|_| rust_decimal::Decimal::from_scientific(&serialized))
-                .map_err(|_| CostOmission::InvalidProviderCost)?;
-            normalize_cost_usd(cost).ok_or(CostOmission::InvalidProviderCost)?
+    let provider_cost = match reported_cost(usage.get("cost"))? {
+        Some(cost) => cost,
+        None => {
+            let estimated_cost =
+                if provider_cost_policy == ProviderReportedCostPolicy::DeepInfraEstimatedCost {
+                    reported_cost(usage.get("estimated_cost"))?
+                } else {
+                    None
+                };
+            estimated_cost
+                .or_else(|| provider_cost_usd(prices, &token_usage, cached_prompt_tokens))
+                .ok_or(CostOmission::UnresolvedProviderCost)?
         }
-        Some(_) => return Err(CostOmission::InvalidProviderCost),
     };
     let cost_number = Number::from_str(&provider_cost.to_string())
         .expect("Decimal always serializes as a JSON number");
     usage.insert("cost".to_owned(), Value::Number(cost_number));
+    if provider_cost_policy == ProviderReportedCostPolicy::DeepInfraEstimatedCost {
+        usage.remove("estimated_cost");
+    }
 
     Ok(CostedUsage {
         response_id,
         usage: token_usage,
         cost_usd: provider_cost,
     })
+}
+
+pub(crate) fn provider_reported_cost_policy(
+    served_provider: &ServedProvider,
+) -> ProviderReportedCostPolicy {
+    match served_provider.as_str() {
+        "deepinfra" | "deepinfra-glm" => ProviderReportedCostPolicy::DeepInfraEstimatedCost,
+        _ => ProviderReportedCostPolicy::UsageCostOnly,
+    }
+}
+
+fn reported_cost(value: Option<&Value>) -> Result<Option<rust_decimal::Decimal>, CostOmission> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Value::Number(cost) = value else {
+        return Err(CostOmission::InvalidProviderCost);
+    };
+    let serialized = cost.to_string();
+    let cost = rust_decimal::Decimal::from_str(&serialized)
+        .or_else(|_| rust_decimal::Decimal::from_scientific(&serialized))
+        .map_err(|_| CostOmission::InvalidProviderCost)?;
+    normalize_cost_usd(cost)
+        .map(Some)
+        .ok_or(CostOmission::InvalidProviderCost)
 }
 
 pub(crate) fn sanitize_public_completion_value(

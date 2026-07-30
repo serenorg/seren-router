@@ -50,6 +50,21 @@ count as zero, charge all prompt tokens at one rate, or write an unresolved gene
 row. A trustworthy upstream-reported cost does not require the router to reconstruct
 cache usage.
 
+## Provider-reported cost fields
+
+The standard provider cost field is `usage.cost`. The two checked DeepInfra routes
+(`deepinfra` and `deepinfra-glm`) instead return their authenticated billing estimate
+at numeric `usage.estimated_cost`. For those exact internal provider IDs only, the
+router accepts a finite, nonnegative numeric estimate when `usage.cost` is absent,
+rounds it to the ledger's ten-decimal USD scale, moves it to public `usage.cost`, and
+removes `estimated_cost` from the response.
+
+If both fields are present, valid `usage.cost` wins. An invalid `usage.cost` is never
+rescued by `estimated_cost`. A missing DeepInfra estimate falls through to the normal
+registry calculation only when the response has enough exact token and cache detail;
+otherwise the response fails closed. Nonnumeric or negative estimates fail closed
+immediately. No other provider may use `usage.estimated_cost`.
+
 ## Registry and catalog
 
 Each provider/model mapping in `registry/providers.yaml` contains that route's exact
