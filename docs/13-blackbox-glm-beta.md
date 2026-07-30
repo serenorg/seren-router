@@ -84,6 +84,42 @@ The 2026-07-30 direct preflight made exactly three bounded requests with the
 
 The first JSON request completed in 2.310 seconds and the SSE request in 1.461
 seconds. The probes proved the API surface and exact cached meter without exhausting
-the bounded credential. Deployment still requires the checked registry, pinned
-AgentGateway validation, beta/production catalog proof, generation-ledger attribution,
-a bounded routed canary, OpenRouter failover, and rollback/restore evidence.
+the bounded credential.
+
+## Deployed beta evidence
+
+The guarded beta rollout completed on 2026-07-30 at router source
+`b67c0cfccfd81810197117e90a8a753b0f5c3a37`, GitOps revision
+`a1474eca1e88bba3cf166c58528e05aad1f6ee13`, and immutable ARM64 image digest
+`sha256:5e77fce577b6a2de4149fa1cb91d029313ab31e30fc5e9448ced25c3eb0868ce`.
+Argo applied only the router Deployment, registry ConfigMap, ExternalSecret, PDB,
+and database keep-warm CronJob.
+
+The routed live gate made ten bounded requests: five JSON and five SSE. All ten
+succeeded and were attributed to `blackbox` in the raw generation ledger. Together
+they used 197 prompt tokens, including 45 cached tokens, and 112 completion tokens.
+Every SSE response included terminal usage followed by exactly one `[DONE]`, and no
+response exposed Blackbox's nested `provider_specific_fields`.
+
+The ten raw ledger rows reconciled exactly:
+
+```text
+gross provider cost = $0.0007119000
+canonical sell cost = $0.0003843000
+mean ledger latency = 3,484 ms
+```
+
+The production catalog continued to expose only OpenRouter for GLM 5.2. A production
+credential with forged beta fields stayed on OpenRouter, while beta
+`provider.sort: price` also selected the cheaper OpenRouter route. The default beta
+route selected Blackbox.
+
+Rollback to GitOps revision `6fb0aae0d616e672fa33f99bc88d15a6c67bbe2e`
+restored the previous image, removed the Blackbox registry row and runtime secret,
+and made the next beta request fall back to OpenRouter. Restoring the approved
+revision returned the next default beta request to Blackbox.
+
+The final runtime had two Ready replicas in separate availability zones, zero
+restarts, two serving EndpointSlices, a healthy PDB, a successful keep-warm job,
+public live/readiness status 200, database availability metric `1`, and no serious
+router or AgentGateway log lines or router Warning events.

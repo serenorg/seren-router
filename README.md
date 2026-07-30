@@ -55,7 +55,9 @@ rollback/restore gates passed on 2026-07-30. Blackbox GLM 5.2 is enabled only fo
 the credential-bound internal beta profile with OpenRouter fallback. Its standard
 account terms and negative gross margin prohibit customer-facing production routing;
 the checked route records exact paid-meter prices while preserving the canonical
-customer sell price.
+customer sell price. Its funded 10-request JSON/SSE canary, exact cached-token
+accounting, production isolation, price override, and rollback/restore gates passed
+on 2026-07-30.
 
 ## Service development
 
