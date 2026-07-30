@@ -79,6 +79,7 @@ pub(crate) fn inject_usage_cost(
 ) -> Result<CostedResponse, CostOmission> {
     let mut response: Value =
         serde_json::from_slice(body).map_err(|_| CostOmission::InvalidJson)?;
+    strip_provider_specific_fields(&mut response);
     let prices = prices_for_request(requested_model, served_provider, price_table)?;
     let usage = inject_usage_cost_value(&mut response, prices)?;
     let body = serde_json::to_vec(&response).map_err(|_| CostOmission::InvalidJson)?;
@@ -156,6 +157,9 @@ pub(crate) fn sanitize_public_completion_value(
         return Err(PublicResponseRejection::UnrecognizedShape);
     }
 
+    for value in response.values_mut() {
+        strip_provider_specific_fields(value);
+    }
     response.retain(|field, _| {
         matches!(
             field.as_str(),
@@ -173,6 +177,26 @@ pub(crate) fn sanitize_public_completion_value(
         Value::String(canonical_model.to_owned()),
     );
     Ok(())
+}
+
+pub(crate) fn strip_provider_specific_fields(value: &mut Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut removed = object.remove("provider_specific_fields").is_some();
+            for child in object.values_mut() {
+                removed |= strip_provider_specific_fields(child);
+            }
+            removed
+        }
+        Value::Array(array) => {
+            let mut removed = false;
+            for child in array {
+                removed |= strip_provider_specific_fields(child);
+            }
+            removed
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn canonical_slug<'a>(requested_model: &'a str, served_provider: &str) -> &'a str {

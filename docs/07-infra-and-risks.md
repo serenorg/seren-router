@@ -34,7 +34,14 @@ ABOUTME: Covers the stack decision, deployment shape, and the risks of owning th
 
 3. **Slug/catalog curation** is the ongoing moat *and* the ongoing cost (`docs/03`). **Mitigation:** unmapped provider models are surfaced for review, never silently dropped.
 
-4. **Data privacy & ToS.** Going direct means Seren must vet each provider's data-retention/training policy and confirm their ToS permits reselling inference under Seren's brand. **Verify per provider — do not assume.** Blackbox AI in particular could not be confirmed as an OpenRouter provider during design, so it is both a genuine additive win *and* an unvetted ToS/data question.
+4. **Data privacy & ToS.** Going direct means Seren must vet each provider's
+   data-retention/training policy and confirm their ToS permits reselling inference
+   under Seren's brand. **Verify per provider — do not assume.** Blackbox's standard
+   Terms prohibit reselling, commercially exploiting, or making the service available
+   to third parties. Its Pro privacy page advertises zero data retention and no
+   training, while enterprise service is separately contracted. The standard account
+   is therefore restricted to Seren's credential-bound internal beta profile; written
+   Blackbox permission or an enterprise agreement is required before customer routing.
 
 5. **Feature-parity scope.** OpenRouter also does prompt caching passthrough, structured outputs, moderation, vision/PDF handling, tool-call normalization quirks. Decide which reach parity in the MVP vs later. **Mitigation:** the OpenRouter fallback covers any feature not yet reimplemented, so parity can be incremental.
 

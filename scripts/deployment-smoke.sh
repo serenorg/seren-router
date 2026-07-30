@@ -97,10 +97,13 @@ grep -Fq '$SEREN_ROUTER_KEY_MODAL' "$rendered" \
     || die "rendered configuration omitted the Modal environment reference"
 grep -Fq '$SEREN_ROUTER_KEY_DEEPINFRA' "$rendered" \
     || die "rendered configuration omitted the DeepInfra environment reference"
+grep -Fq '$SEREN_ROUTER_KEY_BLACKBOX' "$rendered" \
+    || die "rendered configuration omitted the Blackbox environment reference"
 if grep -Fq 'deployment-smoke-only' "$rendered" \
     || grep -Fq 'deployment-smoke-beta-only' "$rendered" \
     || grep -Fq 'deployment-smoke-modal-only' "$rendered" \
-    || grep -Fq 'deployment-smoke-deepinfra-only' "$rendered"; then
+    || grep -Fq 'deployment-smoke-deepinfra-only' "$rendered" \
+    || grep -Fq 'deployment-smoke-blackbox-only' "$rendered"; then
     die "rendered configuration resolved a secret value"
 fi
 
@@ -162,6 +165,33 @@ grep -Fq '"provider_name":"DeepInfra"' <<<"$beta_llama" \
     || die "beta Llama catalog omitted the DeepInfra direct route"
 grep -Fq '"provider_name":"OpenRouter"' <<<"$beta_llama" \
     || die "beta Llama catalog omitted the OpenRouter fallback"
+
+production_glm="$(
+    curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        --header 'Authorization: Bearer deployment-smoke-only' \
+        "http://${published}/api/v1/models/z-ai/glm-5.2/endpoints"
+)"
+grep -Fq '"provider_name":"OpenRouter"' <<<"$production_glm" \
+    || die "production GLM catalog omitted the OpenRouter route"
+if grep -Fq '"provider_name":"Blackbox"' <<<"$production_glm"; then
+    die "production GLM catalog exposed the beta-only Blackbox route"
+fi
+
+beta_glm="$(
+    curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        --header 'Authorization: Bearer deployment-smoke-beta-only' \
+        "http://${published}/api/v1/models/z-ai/glm-5.2/endpoints"
+)"
+grep -Fq '"provider_name":"Blackbox"' <<<"$beta_glm" \
+    || die "beta GLM catalog omitted the Blackbox direct route"
+grep -Fq '"provider_name":"OpenRouter"' <<<"$beta_glm" \
+    || die "beta GLM catalog omitted the OpenRouter fallback"
 
 renderer_id="$(
     docker compose \

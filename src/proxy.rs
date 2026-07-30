@@ -1162,8 +1162,43 @@ mod tests {
 
     #[test]
     fn aliased_non_streaming_response_keeps_standard_fields_and_strips_private_metadata() {
-        let body = Bytes::from_static(
-            br#"{"id":"chatcmpl-private","object":"chat.completion","created":7,"choices":[{"index":0,"message":{"role":"assistant","content":"preserved"}}],"usage":{"prompt_tokens":2,"completion_tokens":1},"service_tier":"default","system_fingerprint":"public-fingerprint","provider":"private-vendor","account":{"id":"private-account"},"metadata":{"endpoint":"private-endpoint"}}"#,
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-private",
+                "object": "chat.completion",
+                "created": 7,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "preserved",
+                        "refusal": null,
+                        "reasoning": "preserved reasoning",
+                        "annotations": [{"type": "public-annotation"}],
+                        "audio": {"id": "public-audio"},
+                        "tool_calls": [{
+                            "id": "public-call",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"}
+                        }],
+                        "provider_specific_fields": {
+                            "provider_metadata": {
+                                "gateway": {
+                                    "provider": "private-nested-vendor",
+                                    "request_id": "private-request"
+                                }
+                            }
+                        }
+                    }
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                "service_tier": "default",
+                "system_fingerprint": "public-fingerprint",
+                "provider": "private-vendor",
+                "account": {"id": "private-account"},
+                "metadata": {"endpoint": "private-endpoint"}
+            }))
+            .unwrap(),
         );
 
         let sanitized = sanitize_aliased_json_response(body, "canonical/model").unwrap();
@@ -1173,6 +1208,27 @@ mod tests {
         assert_eq!(sanitized["object"], "chat.completion");
         assert_eq!(sanitized["model"], "canonical/model");
         assert_eq!(sanitized["choices"][0]["message"]["content"], "preserved");
+        assert_eq!(
+            sanitized["choices"][0]["message"]["reasoning"],
+            "preserved reasoning"
+        );
+        assert_eq!(
+            sanitized["choices"][0]["message"]["annotations"][0]["type"],
+            "public-annotation"
+        );
+        assert_eq!(
+            sanitized["choices"][0]["message"]["audio"]["id"],
+            "public-audio"
+        );
+        assert_eq!(
+            sanitized["choices"][0]["message"]["tool_calls"][0]["id"],
+            "public-call"
+        );
+        assert!(
+            sanitized["choices"][0]["message"]
+                .get("provider_specific_fields")
+                .is_none()
+        );
         assert_eq!(sanitized["service_tier"], "default");
         assert_eq!(sanitized["system_fingerprint"], "public-fingerprint");
         for private_field in ["provider", "account", "metadata"] {
@@ -1182,9 +1238,59 @@ mod tests {
             );
         }
         let serialized = sanitized.to_string();
-        for private_value in ["private-vendor", "private-account", "private-endpoint"] {
+        for private_value in [
+            "private-vendor",
+            "private-account",
+            "private-endpoint",
+            "private-nested-vendor",
+            "private-request",
+        ] {
             assert!(!serialized.contains(private_value));
         }
+    }
+
+    #[test]
+    fn priced_non_streaming_response_strips_nested_provider_specific_fields() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-private",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "preserved",
+                    "provider_specific_fields": {
+                        "provider_metadata": {
+                            "gateway": {
+                                "resolved_provider": "private-provider",
+                                "request_id": "private-request"
+                            }
+                        }
+                    }
+                }
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+        }))
+        .unwrap();
+
+        let transformed = inject_usage_cost(
+            &body,
+            "local/functional-model",
+            &served_provider("local"),
+            &test_price_table(),
+        )
+        .unwrap();
+        let transformed: Value = serde_json::from_slice(&transformed.body).unwrap();
+
+        assert_eq!(transformed["choices"][0]["message"]["content"], "preserved");
+        assert!(
+            transformed["choices"][0]["message"]
+                .get("provider_specific_fields")
+                .is_none()
+        );
+        let serialized = transformed.to_string();
+        assert!(!serialized.contains("private-provider"));
+        assert!(!serialized.contains("private-request"));
     }
 
     #[test]

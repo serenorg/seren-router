@@ -28,6 +28,7 @@ The cutover is deliberately invisible: because the whole Seren stack already spe
 | [`docs/10-deployment.md`](docs/10-deployment.md) | Validated two-container pod boundary, image pin, probes, and local production smoke |
 | [`docs/11-first-direct-provider.md`](docs/11-first-direct-provider.md) | First direct-provider selection, evidence, and activation gates |
 | [`docs/12`](docs/12-modal-kimi-beta.md) | Kimi K3 beta inference contract, neutral naming, and activation gates |
+| [`docs/13`](docs/13-blackbox-glm-beta.md) | Blackbox GLM 5.2 internal-beta contract, metered pricing, and rollout boundary |
 | [`docs/plans/20260724_plan_seren_router_build.md`](docs/plans/20260724_plan_seren_router_build.md) | The build plan: zero-context, task-by-task implementation guide (M0–M7) with tests and commit points |
 
 ## Status
@@ -50,7 +51,11 @@ fallback in both profiles. DeepInfra Llama 3.3 70B is enabled only for the
 credential-bound beta profile with OpenRouter as its immediate fallback; production
 Llama remains OpenRouter-only. Its funded 10-request JSON/SSE canary, exact
 provider/sell accounting, production isolation, OpenRouter failover, and
-rollback/restore gates passed on 2026-07-30.
+rollback/restore gates passed on 2026-07-30. Blackbox GLM 5.2 is enabled only for
+the credential-bound internal beta profile with OpenRouter fallback. Its standard
+account terms and negative gross margin prohibit customer-facing production routing;
+the checked route records exact paid-meter prices while preserving the canonical
+customer sell price.
 
 ## Service development
 
@@ -92,7 +97,8 @@ above are required. The router deliberately has no unreviewed production default
 the price ceiling, hysteresis, provider max share, or rolling share-window size.
 The AgentGateway sidecar requires `SEREN_ROUTER_KEY_OPENROUTER` while the checked-in
 OpenRouter fallback provider is enabled. The enabled direct routes also require
-`SEREN_ROUTER_KEY_MODAL` and `SEREN_ROUTER_KEY_DEEPINFRA`. Inject all provider
+`SEREN_ROUTER_KEY_MODAL`, `SEREN_ROUTER_KEY_DEEPINFRA`, and
+`SEREN_ROUTER_KEY_BLACKBOX`. Inject all provider
 credentials from the deployment secret manager into AgentGateway only; never store
 their values in the registry, rendered configuration, or seren-router app container.
 Startup opens a lazy PostgreSQL pool, binds the HTTP listener without waiting for the
