@@ -142,7 +142,11 @@ impl UsageCostTransformer {
         if sanitize_public_completion_value(&mut value, response_model).is_err() {
             return self.close_with_generic_error(response_model);
         }
-        let costed_usage = if is_terminal_usage_event(&value) {
+        let defer_usage = is_deepinfra_preliminary_usage(&value, self.provider_cost_policy);
+        if defer_usage {
+            value["usage"] = Value::Null;
+        }
+        let costed_usage = if !defer_usage && is_terminal_usage_event(&value) {
             match self.prices.as_ref() {
                 Some(prices) => {
                     match inject_usage_cost_value_with_policy(
@@ -186,8 +190,12 @@ impl UsageCostTransformer {
             return (event.to_vec(), None);
         };
         let sanitized = strip_provider_specific_fields(&mut value);
+        let defer_usage = is_deepinfra_preliminary_usage(&value, self.provider_cost_policy);
+        if defer_usage {
+            value["usage"] = Value::Null;
+        }
         let costed_usage = self.prices.as_ref().and_then(|prices| {
-            is_terminal_usage_event(&value)
+            (!defer_usage && is_terminal_usage_event(&value))
                 .then(|| {
                     inject_usage_cost_value_with_policy(
                         &mut value,
@@ -198,7 +206,7 @@ impl UsageCostTransformer {
                 })
                 .flatten()
         });
-        if costed_usage.is_none() && !sanitized {
+        if costed_usage.is_none() && !sanitized && !defer_usage {
             return (event.to_vec(), None);
         }
 
@@ -246,6 +254,28 @@ fn generic_upstream_error_event(canonical_model: &str) -> Vec<u8> {
 
 fn is_terminal_usage_event(value: &Value) -> bool {
     value.get("usage").is_some_and(Value::is_object)
+}
+
+fn is_deepinfra_preliminary_usage(
+    value: &Value,
+    provider_cost_policy: ProviderReportedCostPolicy,
+) -> bool {
+    if provider_cost_policy != ProviderReportedCostPolicy::DeepInfraEstimatedCost
+        || value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return false;
+    }
+
+    value
+        .get("usage")
+        .and_then(Value::as_object)
+        .is_some_and(|usage| {
+            usage.get("cost").is_none_or(Value::is_null)
+                && usage.get("estimated_cost").is_none_or(Value::is_null)
+        })
 }
 
 fn next_event_end(bytes: &[u8]) -> Option<usize> {
@@ -416,17 +446,26 @@ mod tests {
     fn deepinfra_terminal_estimated_cost_is_normalized_across_every_boundary() {
         let input = concat!(
             "data: {\"id\":\"chatcmpl-deepinfra\",\"object\":\"chat.completion.chunk\",",
+            "\"model\":\"zai-org/GLM-5.2\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"ready\"},\"finish_reason\":\"length\"}],\"usage\":",
+            "{\"prompt_tokens\":17,\"completion_tokens\":4,",
+            "\"prompt_tokens_details\":null,\"estimated_cost\":null}}\n\n",
+            "data: {\"id\":\"chatcmpl-deepinfra\",\"object\":\"chat.completion.chunk\",",
             "\"model\":\"zai-org/GLM-5.2\",\"choices\":[],\"usage\":",
-            "{\"prompt_tokens\":21,\"completion_tokens\":16,",
+            "{\"prompt_tokens\":17,\"completion_tokens\":4,",
             "\"prompt_tokens_details\":null,",
-            "\"estimated_cost\":0.000054149999999999995}}\n\n",
+            "\"estimated_cost\":0.00002235}}\n\n",
             "data: [DONE]\n\n"
         );
         let expected = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ready\"},",
+            "\"finish_reason\":\"length\",\"index\":0}],\"id\":\"chatcmpl-deepinfra\",",
+            "\"model\":\"z-ai/glm-5.2\",\"object\":\"chat.completion.chunk\",",
+            "\"usage\":null}\n\n",
             "data: {\"choices\":[],\"id\":\"chatcmpl-deepinfra\",",
             "\"model\":\"z-ai/glm-5.2\",\"object\":\"chat.completion.chunk\",",
-            "\"usage\":{\"completion_tokens\":16,\"cost\":0.0000541500,",
-            "\"prompt_tokens\":21,\"prompt_tokens_details\":null}}\n\n",
+            "\"usage\":{\"completion_tokens\":4,\"cost\":0.0000223500,",
+            "\"prompt_tokens\":17,\"prompt_tokens_details\":null}}\n\n",
             "data: [DONE]\n\n"
         );
 
@@ -436,14 +475,74 @@ mod tests {
             Some(CostedUsage {
                 response_id: Some("chatcmpl-deepinfra".to_owned()),
                 usage: crate::pricing::Usage {
-                    prompt_tokens: 21,
-                    completion_tokens: 16,
+                    prompt_tokens: 17,
+                    completion_tokens: 4,
                 },
-                cost_usd: "0.0000541500".parse().unwrap(),
+                cost_usd: "0.0000223500".parse().unwrap(),
             }),
             cached_test_prices(),
             Some("z-ai/glm-5.2"),
             ProviderReportedCostPolicy::DeepInfraEstimatedCost,
+        );
+        assert_eq!(expected.matches("\"usage\":{").count(), 1);
+        assert_eq!(expected.matches("data: [DONE]").count(), 1);
+    }
+
+    #[test]
+    fn deepinfra_preliminary_usage_without_final_estimate_fails_closed() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl-deepinfra\",\"object\":\"chat.completion.chunk\",",
+            "\"model\":\"zai-org/GLM-5.2\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"ready\"},\"finish_reason\":\"length\"}],\"usage\":",
+            "{\"prompt_tokens\":17,\"completion_tokens\":4,",
+            "\"prompt_tokens_details\":null,\"estimated_cost\":null}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ready\"},",
+            "\"finish_reason\":\"length\",\"index\":0}],\"id\":\"chatcmpl-deepinfra\",",
+            "\"model\":\"z-ai/glm-5.2\",\"object\":\"chat.completion.chunk\",",
+            "\"usage\":null}\n\n",
+            "data: {\"error\":{\"code\":\"upstream_error\",",
+            "\"message\":\"upstream request failed\",",
+            "\"metadata\":{\"model\":\"z-ai/glm-5.2\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_policy(
+            input.as_bytes(),
+            expected.as_bytes(),
+            None,
+            cached_test_prices(),
+            Some("z-ai/glm-5.2"),
+            ProviderReportedCostPolicy::DeepInfraEstimatedCost,
+        );
+    }
+
+    #[test]
+    fn non_deepinfra_preliminary_usage_does_not_receive_deferred_trust() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl-other\",\"object\":\"chat.completion.chunk\",",
+            "\"model\":\"private/model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"ready\"},\"finish_reason\":\"length\"}],\"usage\":",
+            "{\"prompt_tokens\":17,\"completion_tokens\":4,",
+            "\"prompt_tokens_details\":null,\"estimated_cost\":null}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"error\":{\"code\":\"upstream_error\",",
+            "\"message\":\"upstream request failed\",",
+            "\"metadata\":{\"model\":\"canonical/model\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_policy(
+            input.as_bytes(),
+            expected.as_bytes(),
+            None,
+            cached_test_prices(),
+            Some("canonical/model"),
+            ProviderReportedCostPolicy::UsageCostOnly,
         );
     }
 
