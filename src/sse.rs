@@ -6,7 +6,10 @@ use serde_json::Value;
 use crate::pricing::BillingPrices;
 #[cfg(test)]
 use crate::pricing::ModelPrices;
-use crate::usage_cost::{CostedUsage, inject_usage_cost_value, sanitize_public_completion_value};
+use crate::usage_cost::{
+    CostedUsage, inject_usage_cost_value, sanitize_public_completion_value,
+    strip_provider_specific_fields,
+};
 
 pub(crate) struct UsageCostTransformer {
     pending: Vec<u8>,
@@ -158,19 +161,22 @@ impl UsageCostTransformer {
         let Ok(mut value) = serde_json::from_slice::<Value>(data) else {
             return (event.to_vec(), None);
         };
+        let sanitized = strip_provider_specific_fields(&mut value);
         let costed_usage = self.prices.as_ref().and_then(|prices| {
             is_terminal_usage_event(&value)
                 .then(|| inject_usage_cost_value(&mut value, prices).ok())
                 .flatten()
         });
-        let Some(costed_usage) = costed_usage else {
+        if costed_usage.is_none() && !sanitized {
             return (event.to_vec(), None);
-        };
+        }
 
         let Ok(json) = serde_json::to_vec(&value) else {
             return (event.to_vec(), None);
         };
-        self.costed_usage = Some(costed_usage);
+        if let Some(costed_usage) = costed_usage {
+            self.costed_usage = Some(costed_usage);
+        }
         let mut transformed = Vec::with_capacity(data_prefix.len() + json.len() + separator.len());
         transformed.extend_from_slice(data_prefix);
         transformed.extend_from_slice(&json);
@@ -208,15 +214,7 @@ fn generic_upstream_error_event(canonical_model: &str) -> Vec<u8> {
 }
 
 fn is_terminal_usage_event(value: &Value) -> bool {
-    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-        return false;
-    };
-    choices.is_empty()
-        || choices.iter().any(|choice| {
-            choice
-                .get("finish_reason")
-                .is_some_and(|reason| !reason.is_null())
-        })
+    value.get("usage").is_some_and(Value::is_object)
 }
 
 fn next_event_end(bytes: &[u8]) -> Option<usize> {
@@ -365,7 +363,9 @@ mod tests {
     #[test]
     fn public_stream_keeps_standard_fields_and_strips_private_metadata() {
         let input = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}],",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\",",
+            "\"provider_specific_fields\":{\"provider\":\"private-nested-vendor\"}},",
+            "\"index\":0}],",
             "\"id\":\"chatcmpl-private\",\"object\":\"chat.completion.chunk\",",
             "\"provider\":\"private-vendor\",\"account\":\"private-account\"}\n\n",
             "data: {\"choices\":[],\"id\":\"chatcmpl-private\",",
@@ -396,9 +396,49 @@ mod tests {
             Some("canonical/model"),
         );
         let output = String::from_utf8(expected.as_bytes().to_vec()).unwrap();
-        for private_identifier in ["private-vendor", "private-account", "private-endpoint"] {
+        for private_identifier in [
+            "private-vendor",
+            "private-account",
+            "private-endpoint",
+            "private-nested-vendor",
+        ] {
             assert!(!output.contains(private_identifier));
         }
+    }
+
+    #[test]
+    fn priced_internal_stream_strips_nested_provider_specific_fields() {
+        let input = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\",",
+            "\"provider_specific_fields\":{\"provider\":\"private-provider\"}},",
+            "\"index\":0}],\"id\":\"chatcmpl-private\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0}],",
+            "\"id\":\"chatcmpl-private\",",
+            "\"object\":\"chat.completion.chunk\",\"usage\":",
+            "{\"completion_tokens\":3,\"prompt_tokens\":16}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let expected = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}],",
+            "\"id\":\"chatcmpl-private\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0}],",
+            "\"id\":\"chatcmpl-private\",",
+            "\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,",
+            "\"cost\":0.0000088000,\"prompt_tokens\":16}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_every_boundary_with_prices(
+            input.as_bytes(),
+            expected.as_bytes(),
+            Some(CostedUsage {
+                response_id: Some("chatcmpl-private".to_owned()),
+                ..test_usage()
+            }),
+            test_prices(),
+        );
+        assert!(!String::from_utf8_lossy(expected.as_bytes()).contains("private-provider"));
     }
 
     #[test]
