@@ -1348,6 +1348,7 @@ mod tests {
                 secret_env: "TEST_ONLY".to_owned(),
                 enabled: true,
                 priority: 0,
+                catalog_url: None,
                 profiles: BTreeSet::from([RoutingProfile::Production]),
                 models: vec![ModelMapping {
                     slug: "functional-model".to_owned(),

@@ -720,6 +720,7 @@ fn functional_provider_for(
         secret_env: secret_env.to_owned(),
         enabled: true,
         priority,
+        catalog_url: None,
         profiles: BTreeSet::from_iter(profiles),
         models: vec![ModelMapping {
             slug: slug.to_owned(),

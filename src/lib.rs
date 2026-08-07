@@ -16,4 +16,5 @@ pub mod routing_profile;
 pub mod server;
 pub mod sidecar_config;
 mod sse;
+pub mod upstream_catalog;
 mod usage_cost;

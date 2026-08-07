@@ -30,6 +30,11 @@ pub struct Provider {
     pub enabled: bool,
     #[serde(default)]
     pub priority: u8,
+    /// Upstream OpenRouter-shaped `/models` endpoint whose catalog extends this
+    /// provider's coverage at startup. Explicit `models` entries stay
+    /// authoritative; discovery only adds slugs this file does not review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_url: Option<String>,
     #[serde(default = "default_profiles")]
     pub profiles: BTreeSet<RoutingProfile>,
     pub models: Vec<ModelMapping>,
@@ -269,6 +274,9 @@ fn is_true(value: &bool) -> bool {
 mod tests {
     use super::*;
 
+    // editorconfig-checker-disable
+    // YAML nesting inside this fixture is two-space by definition; the Rust
+    // four-space rule does not apply to the embedded document.
     const TWO_PROVIDER_YAML: &str = r#"
 providers:
   - id: openrouter
@@ -296,6 +304,7 @@ providers:
         input_price_per_mtok: "0.90"
         output_price_per_mtok: "0.90"
 "#;
+    // editorconfig-checker-enable
 
     #[test]
     fn two_provider_yaml_round_trips() {

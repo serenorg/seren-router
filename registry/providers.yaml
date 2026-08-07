@@ -10,6 +10,11 @@ providers:
     enabled: true
     priority: 255
     profiles: [production, beta]
+    # docs/05 specifies this provider as the catch-all fallback: it must serve
+    # every slug no direct provider covers, so its coverage is discovered from
+    # the upstream catalog. The reviewed mappings below stay authoritative for
+    # the slugs they name.
+    catalog_url: https://openrouter.ai/api/v1/models
     models:
       - slug: openai/gpt-5.6-luna
         name: OpenAI GPT-5.6 Luna
