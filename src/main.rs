@@ -9,10 +9,10 @@ use seren_router::{
     pricing::PriceTable,
     proxy::ProxyState,
     registry::Registry,
-    routes, server,
+    routes, server, upstream_catalog,
 };
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -57,7 +57,8 @@ async fn dispatch(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()
         Command::RenderSidecarConfig { output_path } => {
             let registry_path =
                 registry_path_from_env().context("invalid registry configuration")?;
-            deployment::render_sidecar_config(&registry_path, &output_path)
+            let registry = load_registry(&registry_path).await?;
+            deployment::write_sidecar_config(&registry, &output_path)
                 .context("failed to render AgentGateway configuration")?;
             tracing::info!(
                 registry = %registry_path.display(),
@@ -69,27 +70,82 @@ async fn dispatch(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()
     }
 }
 
+/// Read the reviewed registry and extend every enabled provider that declares a
+/// `catalog_url` with its upstream coverage.
+///
+/// The sidecar renderer and the service both load through here so a slug that is
+/// advertised and routed always has a matching generated sidecar route.
+async fn load_registry(registry_path: &Path) -> anyhow::Result<Registry> {
+    let registry_bytes = std::fs::read(registry_path).with_context(|| {
+        format!(
+            "failed to read provider registry {}",
+            registry_path.display()
+        )
+    })?;
+    let mut registry: Registry = serde_yaml::from_slice(&registry_bytes).with_context(|| {
+        format!(
+            "failed to parse provider registry {}",
+            registry_path.display()
+        )
+    })?;
+    hydrate_upstream_coverage(&mut registry).await;
+    registry
+        .validate()
+        .context("provider registry validation failed")?;
+    Ok(registry)
+}
+
+/// An unreachable upstream must not take the service down: coverage falls back
+/// to the reviewed registry, which is exactly the pre-hydration behaviour.
+async fn hydrate_upstream_coverage(registry: &mut Registry) {
+    let sources: Vec<(String, String)> = registry
+        .providers
+        .iter()
+        .filter(|provider| provider.enabled)
+        .filter_map(|provider| {
+            provider
+                .catalog_url
+                .clone()
+                .map(|url| (provider.id.clone(), url))
+        })
+        .collect();
+
+    for (provider_id, url) in sources {
+        match upstream_catalog::fetch_catalog(&url).await {
+            Ok(catalog) => {
+                let advertised = catalog.advertised;
+                let priced = catalog.mappings.len();
+                let outcome =
+                    upstream_catalog::hydrate_provider(registry, &provider_id, catalog.mappings);
+                tracing::info!(
+                    provider = %provider_id,
+                    catalog_url = %url,
+                    advertised,
+                    priced,
+                    added = outcome.added,
+                    reviewed = outcome.explicit_retained,
+                    "extended provider coverage from upstream catalog"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    provider = %provider_id,
+                    catalog_url = %url,
+                    error = %error,
+                    "upstream catalog unavailable; serving reviewed registry coverage only"
+                );
+            }
+        }
+    }
+}
+
 async fn run_service() -> anyhow::Result<()> {
     let config = RouterConfig::from_env().context("invalid router configuration")?;
     let auth = match config.beta_gateway_key() {
         Some(beta_key) => GatewayAuth::new(config.gateway_key()).with_beta_key(beta_key),
         None => GatewayAuth::new(config.gateway_key()),
     };
-    let registry_bytes = std::fs::read(config.registry_path()).with_context(|| {
-        format!(
-            "failed to read provider registry {}",
-            config.registry_path().display()
-        )
-    })?;
-    let registry: Registry = serde_yaml::from_slice(&registry_bytes).with_context(|| {
-        format!(
-            "failed to parse provider registry {}",
-            config.registry_path().display()
-        )
-    })?;
-    registry
-        .validate()
-        .context("provider registry validation failed")?;
+    let registry = load_registry(config.registry_path()).await?;
     let catalog = Catalog::from_registry(&registry);
     let price_table =
         PriceTable::from_registry(&registry).context("provider registry pricing is invalid")?;

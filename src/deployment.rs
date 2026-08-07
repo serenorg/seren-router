@@ -51,10 +51,6 @@ pub fn render_sidecar_config(
     if output_path.as_os_str().is_empty() || output_path.file_name().is_none() {
         return Err(RenderSidecarConfigError::InvalidOutputPath);
     }
-    let parent = output_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
     let registry_bytes =
         fs::read(registry_path).map_err(|source| RenderSidecarConfigError::ReadRegistry {
             path: registry_path.to_owned(),
@@ -66,7 +62,23 @@ pub fn render_sidecar_config(
             source,
         }
     })?;
-    let rendered = compile(&registry, SidecarConfigOptions::default())?;
+    write_sidecar_config(&registry, output_path)
+}
+
+/// Compile an already-loaded registry so callers that extend provider coverage
+/// before rendering emit routes for every model they will also advertise.
+pub fn write_sidecar_config(
+    registry: &Registry,
+    output_path: &Path,
+) -> Result<(), RenderSidecarConfigError> {
+    if output_path.as_os_str().is_empty() || output_path.file_name().is_none() {
+        return Err(RenderSidecarConfigError::InvalidOutputPath);
+    }
+    let parent = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let rendered = compile(registry, SidecarConfigOptions::default())?;
     let temporary_path = parent.join(format!(".seren-router-sidecar-{}.tmp", Uuid::new_v4()));
     let mut temporary = TemporaryOutput::create(&temporary_path, output_path)?;
     temporary.write_all(&rendered, output_path)?;

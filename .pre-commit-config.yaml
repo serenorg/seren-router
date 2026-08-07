@@ -46,8 +46,9 @@ repos:
     hooks:
       - id: conventional-pre-commit
         stages: [commit-msg]
-        args: [--strict, .git/COMMIT_EDITMSG]
-        pass_filenames: false
+        # The runner supplies the message file. A literal `.git/COMMIT_EDITMSG`
+        # cannot be opened from a linked worktree, where `.git` is a pointer file.
+        args: [--strict]
 
   # Rust formatting (staged files only)
   - repo: local

@@ -690,6 +690,7 @@ mod tests {
             secret_env: format!("KEY_{}", id.to_uppercase()),
             enabled: true,
             priority,
+            catalog_url: None,
             profiles: BTreeSet::from_iter(profiles),
             models: vec![ModelMapping {
                 slug: "vendor/model".to_owned(),
